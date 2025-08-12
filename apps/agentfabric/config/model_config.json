@@ -43,6 +43,18 @@
             "top_p": 0.8
         }
     },
+    "deepseek-v3": {
+        "type": "dashscope",
+        "model": "deepseek-v3",
+        "length_constraint": {
+            "knowledge": 32000,
+            "input": 32000
+        },
+        "generate_cfg": {
+            "use_raw_prompt": true,
+            "top_p": 0.8
+        }
+    },
     "qwen1.5-72b-chat": {
         "type": "dashscope",
         "model": "qwen1.5-72b-chat",
