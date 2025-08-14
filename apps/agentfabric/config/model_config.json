@@ -1,20 +1,4 @@
 {
-    "qwen-turbo": {
-        "type": "dashscope",
-        "model": "qwen-turbo",
-        "generate_cfg": {
-            "use_raw_prompt": true,
-            "top_p": 0.8
-        }
-    },
-    "qwen-plus": {
-        "type": "dashscope",
-        "model": "qwen-plus",
-        "generate_cfg": {
-            "use_raw_prompt": true,
-            "top_p": 0.8
-        }
-    },
     "qwen-max": {
         "type": "dashscope",
         "model": "qwen-max",
@@ -39,13 +23,17 @@
             "top_p": 0.8
         }
     },
-    "qwen-max-longcontext": {
+    "qwen-plus": {
         "type": "dashscope",
-        "model": "qwen-max-longcontext",
-        "length_constraint": {
-            "knowledge": 28000,
-            "input": 30000
-        },
+        "model": "qwen-plus",
+        "generate_cfg": {
+            "use_raw_prompt": true,
+            "top_p": 0.8
+        }
+    },
+    "qwen-turbo": {
+        "type": "dashscope",
+        "model": "qwen-turbo",
         "generate_cfg": {
             "use_raw_prompt": true,
             "top_p": 0.8
