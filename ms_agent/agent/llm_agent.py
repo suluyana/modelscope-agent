@@ -317,9 +317,30 @@ class LLMAgent(Agent):
             ]
         return messages
 
-    async def do_rag(self, messages: List[Message]):
-        if self.rag is not None:
-            messages[1].content = await self.rag.query(messages[1].content)
+    async def do_rag(self, messages: List[Message], knowledge_filters: Dict[str, Any] = {}):
+        if self.rag is None:
+            return
+        last_user_index = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].role == "user":
+                last_user_index = i
+                break
+        if last_user_index is not None:
+            rag_content: str = await self.rag.query(messages[last_user_index].content, **knowledge_filters)
+            rag_prompt = "Relevant Knowledge:\n" + rag_content
+
+            if len(messages) > 0 and messages[0].role == "system":
+                new_system = Message(
+                    role="system",
+                    content=messages[0].content + "\n" + rag_prompt
+                )
+                return [new_system] + messages[1:]
+            else:
+                system_prompt = (
+                        "You are a helpful assistant. Use the following knowledge to assist the user.\n"
+                        + rag_prompt
+                )
+                return [Message(role="system", content=system_prompt)] + messages
 
     async def load_memory(self):
         """Initialize and append memory tool instances based on the configuration provided in the global config.
@@ -346,7 +367,8 @@ class LLMAgent(Agent):
                 assert rag.name in rag_mapping, (
                     f'{rag.name} not in rag_mapping, '
                     f'which supports: {list(rag_mapping.keys())}')
-                self.rag: RAG = rag_mapping(rag.name)(self.config)
+                self.rag: RAG = rag_mapping[rag.name](self.config)
+                await self.rag.load_index()
 
     async def condense_memory(self, messages: List[Message]) -> List[Message]:
         """
@@ -619,7 +641,7 @@ class LLMAgent(Agent):
             if self.runtime.round == 0:
                 # 0 means no history
                 messages = await self.create_messages(messages)
-                await self.do_rag(messages)
+                messages = await self.do_rag(messages, kwargs.get('knowledge_filters', {}))
                 await self.on_task_begin(messages)
 
             for message in messages:

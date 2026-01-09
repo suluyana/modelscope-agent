@@ -1,6 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from abc import ABC, abstractmethod
-from typing import Any, List
+from typing import Any, List, Dict
 
 
 class RAG(ABC):
@@ -22,11 +22,12 @@ class RAG(ABC):
         pass
 
     @abstractmethod
-    async def query(self, query: str) -> str:
+    async def query(self, query: str, **filters) -> str:
         """Search documents
 
         Args:
             query(`str`): The query to search for
+            **filters: Any extra filters
         Returns:
             The query result
         """
