@@ -1,6 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from abc import ABC, abstractmethod
-from typing import Any, List, Dict
+from typing import Any, Dict, List
 
 
 class RAG(ABC):

@@ -1,31 +1,31 @@
-import os
+import asyncio
 import copy
+import os
 import shutil
-from typing import Any, List, Optional, Dict
+from typing import Any, Dict, List, Optional
 
 from ms_agent.utils import assert_package_exist
+from ms_agent.utils.constants import get_service_config
+from ms_agent.utils.logger import logger
 from omegaconf import DictConfig, OmegaConf
 
 from modelscope import snapshot_download
 from ..llm import LLM, Message
 from .base import RAG
-from ms_agent.utils.constants import get_service_config
-from ms_agent.utils.logger import logger
 
 
 def _parse_llamaindex_filters(filters):
-    from llama_index.core.vector_stores import (
-        MetadataFilter,
-        MetadataFilters,
-        FilterOperator
-    )
+    from llama_index.core.vector_stores import (MetadataFilter,
+                                                MetadataFilters,
+                                                FilterOperator,
+                                                FilterCondition)
 
     op_map = {
-        "eq": FilterOperator.EQ,
-        "ge": FilterOperator.GTE,
-        "le": FilterOperator.LTE,
-        "gt": FilterOperator.GT,
-        "lt": FilterOperator.LT,
+        'eq': FilterOperator.EQ,
+        'ge': FilterOperator.GTE,
+        'le': FilterOperator.LTE,
+        'gt': FilterOperator.GT,
+        'lt': FilterOperator.LT,
     }
     filter_list = []
 
@@ -36,38 +36,30 @@ def _parse_llamaindex_filters(filters):
         if isinstance(value, dict):
             for op, val in value.items():
                 if op not in op_map:
-                    raise ValueError(f"Unsupported operator: {op}")
+                    raise ValueError(f'Unsupported operator: {op}')
                 filter_list.append(
-                    MetadataFilter(
-                        key=key,
-                        value=val,
-                        operator=op_map[op]
-                    )
-                )
+                    MetadataFilter(key=key, value=val, operator=op_map[op]))
 
         # case 2: multi values OR（list）
         # eg： source=["wiki", "arxiv"]
         elif isinstance(value, (list, tuple, set)):
+            or_filters = []
             for val in value:
-                filter_list.append(
+                or_filters.append(
                     MetadataFilter(
-                        key=key,
-                        value=val,
-                        operator=FilterOperator.EQ
-                    )
-                )
+                        key=key, value=val, operator=FilterOperator.EQ))
+
+            filter_list.append(
+                MetadataFilters(
+                    filters=or_filters, condition=FilterCondition.OR))
 
         # case 3: single value EQ
         else:
             filter_list.append(
                 MetadataFilter(
-                    key=key,
-                    value=value,
-                    operator=FilterOperator.EQ
-                )
-            )
+                    key=key, value=value, operator=FilterOperator.EQ))
 
-    return MetadataFilters(filters=filter_list)
+    return MetadataFilters(filters=filter_list, condition=FilterCondition.AND)
 
 
 def is_scanned_pdf(path):
@@ -80,7 +72,10 @@ def is_scanned_pdf(path):
             return False
 
         # sampling
-        sample_indices = sorted({0, total_pages // 4, total_pages // 2, 3 * total_pages // 4, total_pages - 1})
+        sample_indices = sorted({
+            0, total_pages // 4, total_pages // 2, 3 * total_pages // 4,
+            total_pages - 1
+        })
 
         image_pages = 0
         for idx in sample_indices:
@@ -88,7 +83,11 @@ def is_scanned_pdf(path):
             if page.get_images():
                 image_pages += 1
         return image_pages / len(sample_indices) > 0.5
-    except:
+    except Exception as e:
+        import traceback
+        logger.warning(
+            f'Scanning pdf failed, using default PDFReader. path: {path},'
+            f'details: {e}, traceback: {traceback.format_exc()}')
         return False
 
 
@@ -102,13 +101,20 @@ def pdf_supports_text(path):
             return False
 
         # sampling
-        sample_indices = sorted({0, total_pages // 4, total_pages // 2, 3 * total_pages // 4, total_pages - 1})
+        sample_indices = sorted({
+            0, total_pages // 4, total_pages // 2, 3 * total_pages // 4,
+            total_pages - 1
+        })
 
-        text = ""
+        text = ''
         for idx in sample_indices:
             text += doc[idx].get_text()
         return len(text.strip()) > 20
-    except:
+    except Exception as e:
+        import traceback
+        logger.warning(
+            f'Analyze pdf supports text failed, using default PDFReader. path: {path},'
+            f'details: {e}, traceback: {traceback.format_exc()}')
         return False
 
 
@@ -120,7 +126,7 @@ def load_single_file(file_path: str):
     from llama_index.core.readers import SimpleDirectoryReader
     from llama_index.readers.paddle_ocr.base import PDFPaddleOCRReader
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
+    if ext == '.pdf':
         if is_scanned_pdf(file_path):
             reader = PDFPaddleOCRReader()
         elif pdf_supports_text(file_path):
@@ -131,9 +137,9 @@ def load_single_file(file_path: str):
 
         for d in docs:
             d.metadata = d.metadata or {}
-            d.metadata["source_file"] = os.path.basename(file_path)
-            d.metadata["source_path"] = os.path.abspath(file_path)
-            d.metadata["file_type"] = os.path.splitext(file_path)[1].lower()
+            d.metadata['source_file'] = os.path.basename(file_path)
+            d.metadata['source_path'] = os.path.abspath(file_path)
+            d.metadata['file_type'] = os.path.splitext(file_path)[1].lower()
     else:
         if os.path.isfile(file_path):
             reader = SimpleDirectoryReader(input_files=[file_path])
@@ -170,15 +176,16 @@ class LlamaIndexRAG(RAG):
         self.storage_dir = getattr(config.rag, 'storage_dir', './llama_index')
         self._validate_requirements()
 
-        embedder_cfg = getattr(config, "embedder", OmegaConf.create({}))
+        embedder_cfg = getattr(config, 'embedder', OmegaConf.create({}))
         service = getattr(embedder_cfg, 'service', 'modelscope')
         self.embedding_api_key = getattr(embedder_cfg, 'api_key', None) \
-            or os.getenv(f"{service.upper()}_API_KEY")
+            or os.getenv(f'{service.upper()}_API_KEY')
 
-        self.embedding_model_name = getattr(embedder_cfg, 'model', 'Qwen/Qwen3-Embedding-8B')
+        self.embedding_model_name = getattr(embedder_cfg, 'model',
+                                            'Qwen/Qwen3-Embedding-8B')
         self.embedding_dims = getattr(embedder_cfg, 'embedding_dims', 1536)
 
-        self.embedding_base_url = getattr(embedder_cfg, "openai_base_url",
+        self.embedding_base_url = getattr(embedder_cfg, 'openai_base_url',
                                           get_service_config(service).base_url)
 
         self.llm_model = getattr(config.rag, 'llm', None)
@@ -263,24 +270,28 @@ class LlamaIndexRAG(RAG):
 
     def _setup_embedding_model(self, config: DictConfig):
         from llama_index.core import Settings
-        from llama_index.embeddings.openai import OpenAIEmbedding
 
         try:
             if self.embedding_api_key is None:
-                raise RuntimeError("RAG embedding API key未提供")
+                logger.info('RAG embedding API key未提供, 尝试下载模型本地运行')
 
-            Settings.embed_model = OpenAIEmbedding(
-                model_name=self.embedding_model_name,
-                api_base=self.embedding_base_url,
-                api_key=self.embedding_api_key,
-                dimensions=self.embedding_dims,
-            )
+                from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+                self.embedding_model = snapshot_download(self.embedding_model)
+                Settings.embed_model = HuggingFaceEmbedding(
+                    model_name=self.embedding_model, device='cpu')
+            else:
+                from llama_index.embeddings.openai import OpenAIEmbedding
+                Settings.embed_model = OpenAIEmbedding(
+                    model_name=self.embedding_model_name,
+                    api_base=self.embedding_base_url,
+                    api_key=self.embedding_api_key,
+                    dimensions=self.embedding_dims,
+                )
 
             self.embedding_model = Settings.embed_model
 
         except Exception as e:
-            raise RuntimeError(f"Failed to load OpenAI embedding model: {e}")
-
+            raise RuntimeError(f'Failed to load embedding model: {e}')
 
     async def add_documents(self, documents: List[str]):
         if not documents:
@@ -309,14 +320,15 @@ class LlamaIndexRAG(RAG):
         if not self.retrieve_only:
             await self._setup_query_engine()
 
-    def get_index(self, documents = None, persist_dir: str = None):
+    def get_index(self, documents=None, persist_dir: str = None):
         from llama_index.core import StorageContext, VectorStoreIndex
         storage_context = None
         if getattr(self.vector_store, 'service', 'milvus'):
             from llama_index.vector_stores.milvus import MilvusVectorStore
             uri = getattr(self.vector_store, 'url', 'http://localhost:19530')
             token = getattr(self.vector_store, 'token', None)
-            collection_name = getattr(self.vector_store, 'collection_name', 'rag_collection_test')
+            collection_name = getattr(self.vector_store, 'collection_name',
+                                      'rag_collection_test')
             db_name = getattr(self.vector_store, 'db_name', 'rag_test')
 
             vector_store = MilvusVectorStore(
@@ -329,12 +341,16 @@ class LlamaIndexRAG(RAG):
                 overwrite=False  # overwrite exist collection or not
             )
             if not documents:
-                return VectorStoreIndex.from_vector_store(vector_store=vector_store)
+                return VectorStoreIndex.from_vector_store(
+                    vector_store=vector_store)
 
-            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            storage_context = StorageContext.from_defaults(
+                vector_store=vector_store)
         if storage_context is None:
-            storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
-        return VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+            storage_context = StorageContext.from_defaults(
+                persist_dir=persist_dir)
+        return VectorStoreIndex.from_documents(
+            documents, storage_context=storage_context)
 
     async def _setup_query_engine(self):
         if self.index is None:
@@ -359,14 +375,12 @@ class LlamaIndexRAG(RAG):
         if not query.strip():
             return []
 
-        metadata_filters = None if not filters else _parse_llamaindex_filters(**filters)
+        metadata_filters = None if not filters else _parse_llamaindex_filters(
+            **filters)
 
         from llama_index.core.retrievers import VectorIndexRetriever
         retriever = VectorIndexRetriever(
-            index=self.index,
-            similarity_top_k=limit,
-            filters=metadata_filters
-        )
+            index=self.index, similarity_top_k=limit, filters=metadata_filters)
 
         nodes = retriever.retrieve(query)
 
@@ -479,26 +493,24 @@ class LlamaIndexRAG(RAG):
                     'Query engine not initialized, please add documents and set LLM first'
                 )
 
-        metadata_filters = None if not filters else _parse_llamaindex_filters(filters)
+        try:
+            metadata_filters = None if not filters else _parse_llamaindex_filters(
+                filters)
 
-        # deepcopy for support 并发调用
-        retriever = copy.deepcopy(self.query_engine._retriever)
-        response_synthesizer = self.query_engine._response_synthesizer
+            # deepcopy for support 并发调用
+            retriever = copy.deepcopy(self.query_engine._retriever)
+            response_synthesizer = self.query_engine._response_synthesizer
 
-        if metadata_filters:
-            retriever._filters=metadata_filters
-        nodes = retriever.retrieve(query)
+            if metadata_filters:
+                retriever._filters = metadata_filters
+            nodes = retriever.retrieve(query)
 
-        # 使用 synthesizer 构建最终回答
-        response = response_synthesizer.synthesize(query, nodes)
+            # 使用 synthesizer 构建最终回答
+            response = response_synthesizer.synthesize(query, nodes)
 
-        return str(response)
-
-        # try:
-        #     response = self.query_engine.query(query)
-        #     return str(response)
-        # except Exception as e:
-        #     return f'Query failed, error: {e}'
+            return str(response)
+        except Exception as e:
+            return f'Query failed, error: {e}'
 
     async def save_index(self, persist_dir: Optional[str] = None):
         """Save index"""
@@ -515,7 +527,9 @@ class LlamaIndexRAG(RAG):
         load_dir = persist_dir or self.storage_dir
 
         if not os.path.exists(load_dir):
-            logger.info(f'Index directory does not exist: {load_dir}, try load from remote vector store.')
+            logger.info(
+                f'Index directory does not exist: {load_dir}, try load from remote vector store.'
+            )
 
         self.index = self.get_index(persist_dir=load_dir)
 
@@ -524,7 +538,8 @@ class LlamaIndexRAG(RAG):
             await self._setup_query_engine()
 
     def get_index_by_filters(self, filters: Dict[str, Any] = None):
-        metadata_filters = None if not filters else _parse_llamaindex_filters(filters)
+        metadata_filters = None if not filters else _parse_llamaindex_filters(
+            filters)
 
         json_result = list()
         result = self.index.vector_store.get_nodes(filters=metadata_filters)
@@ -536,16 +551,106 @@ class LlamaIndexRAG(RAG):
             })
         return json_result
 
-    def delete(self, filters: Dict[str, Any] = None, node_ids: List[str] = None):
+    def copy(self,
+             filters: Dict[str, Any] = None,
+             config: OmegaConf = None) -> 'LlamaIndexRAG':
+        """
+        Efficient copy:
+        - Directly copies nodes (text + metadata + embedding)
+        - No re-embedding, no re-indexing
+        """
+
+        new_config = OmegaConf.create(copy.deepcopy(
+            self.config)) if config is None else config
+        new_rag = LlamaIndexRAG(new_config)
+
+        metadata_filters = None if not filters else _parse_llamaindex_filters(
+            filters)
+        source_nodes = self.index.vector_store.get_nodes(
+            filters=metadata_filters)
+
+        if not source_nodes:
+            logger.warning('copy(): no matching nodes found')
+            return new_rag
+
+        new_rag.index = new_rag.get_index()
         try:
-            if filters is not None:
-                res = self.get_index_by_filters(filters)
-                node_ids.extend([item['id'] for item in res])
-            self.index.delete(node_ids)
-            return True
+            new_rag.index.docstore.add_documents(source_nodes)
         except Exception as e:
-            logger.warning(f'delete RAG nodes failed: node_ids: {node_ids}, filters: {filters}, fail details: {e}')
-            return False
+            logger.warning(f'docstore add failed: {e}')
+
+        try:
+            new_rag.index.vector_store.add(nodes=source_nodes)
+        except Exception as e:
+            logger.warning(f'vector_store add failed: {e}')
+
+        if not new_rag.retrieve_only:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(new_rag._setup_query_engine())
+            else:
+                loop.run_until_complete(new_rag._setup_query_engine())
+
+        return new_rag
+
+    def delete(self, filters: Dict[str, Any] = None):
+        """
+        Correct delete:
+        - Chunk nodes removed from vector_store & index
+        - Parent document nodes removed from docstore
+        """
+        chunk_ids = set()
+        doc_ids = set()
+        if filters:
+            metadata_filters = None if not filters else _parse_llamaindex_filters(
+                filters)
+            result = self.index.vector_store.get_nodes(
+                filters=metadata_filters)
+
+            for node in result:
+                # chunk node_id
+                nid = node.id_
+                if nid:
+                    chunk_ids.add(nid)
+
+                # parent doc node_id from relationships.SOURCE
+                rel = node.relationships
+                source_rel = rel.get('SOURCE', None)
+                if source_rel:
+                    parent_id = source_rel.node_id
+                    if parent_id:
+                        doc_ids.add(parent_id)
+
+        chunk_ids = list(chunk_ids)
+        doc_ids = list(doc_ids)
+
+        if not chunk_ids:
+            logger.warning('delete(): no chunk ids to delete')
+            return True
+        try:
+            self.index.vector_store.delete_nodes(chunk_ids)
+        except Exception as e:
+            raise ValueError(f'vector_store.delete failed: {e}')
+
+        try:
+            self.index.delete(chunk_ids)
+        except Exception as e:
+            raise ValueError(f'index.delete failed: {e}')
+
+        ds = self.index.docstore
+        try:
+            if hasattr(ds, 'delete_document'):
+                for doc_id in doc_ids:
+                    ds.delete_document(doc_id)
+            elif hasattr(ds, 'delete_documents'):
+                ds.delete_documents(doc_ids)
+            elif hasattr(ds, '_docs'):
+                for doc_id in doc_ids:
+                    ds._docs.pop(doc_id, None)
+        except Exception as e:
+            raise ValueError(f'docstore delete failed: {e}')
+
+        return True
 
     def get_index_info(self) -> dict:
         """Get index information"""
