@@ -187,13 +187,6 @@ class LlamaIndexRAG(RAG):
 
         self.embedding_base_url = getattr(embedder_cfg, 'openai_base_url',
                                           get_service_config(service).base_url)
-
-        self.llm_model = getattr(config.rag, 'llm', None)
-        self.chunk_size = getattr(config.rag, 'chunk_size', 512)
-        self.chunk_overlap = getattr(config.rag, 'chunk_overlap', 50)
-        self.retrieve_only = getattr(config.rag, 'retrieve_only', False)
-        self.storage_dir = getattr(config.rag, 'storage_dir', './llama_index')
-
         self.vector_store = getattr(config.rag, 'vector_store', None)
 
         self._validate_requirements()
