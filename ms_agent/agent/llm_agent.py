@@ -128,6 +128,9 @@ class LLMAgent(Agent):
         self._last_skill_result = None
         self._skill_mode_active = False
 
+        self._trajectory_collector = None
+        self._trajectory_adapter = None
+
     def _get_skills_config(self) -> Optional[DictConfig]:
         """Get skills configuration from agent config."""
         if hasattr(self.config, 'skills') and self.config.skills:
@@ -582,6 +585,12 @@ class LLMAgent(Agent):
 
     async def cleanup_tools(self):
         """Cleanup resources used by the tool manager."""
+        if self._trajectory_adapter is not None:
+            self._trajectory_adapter.detach()
+            self._trajectory_adapter = None
+        if self._trajectory_collector is not None:
+            self._trajectory_collector.close()
+            self._trajectory_collector = None
         if self.task_manager is not None:
             self.task_manager.kill_all()
         await self.tool_manager.cleanup()
@@ -1152,6 +1161,42 @@ class LLMAgent(Agent):
             for tool in self.tool_manager.extra_tools:
                 if hasattr(tool, 'set_task_manager'):
                     tool.set_task_manager(self.task_manager)
+
+            if self._trajectory_adapter is not None:
+                self._trajectory_adapter.detach()
+                self._trajectory_adapter = None
+            if self._trajectory_collector is not None:
+                self._trajectory_collector.close()
+                self._trajectory_collector = None
+
+            traj_cfg = getattr(self.config, 'trajectory', None)
+            if traj_cfg and bool(getattr(traj_cfg, 'enabled', False)):
+                import uuid as _uuid
+
+                from ms_agent.tools.agent_tool import AgentTool
+                from ms_agent.trajectory import (
+                    MsAgentAdapter,
+                    TrajectoryCollector,
+                )
+
+                out = getattr(traj_cfg, 'output_dir', None) or self.output_dir
+                if out is None:
+                    out = './output'
+                rid = getattr(traj_cfg, 'run_id', None) or self.tag
+                if not rid:
+                    rid = _uuid.uuid4().hex[:16]
+                self._trajectory_collector = TrajectoryCollector(
+                    str(rid), str(out), agent_tag=self.tag)
+                agent_tools = [
+                    t for t in self.tool_manager.extra_tools
+                    if isinstance(t, AgentTool)
+                ]
+                self._trajectory_adapter = MsAgentAdapter.wire(
+                    agent_tools, self.task_manager, self._trajectory_collector
+                )
+            else:
+                self._trajectory_collector = None
+                self._trajectory_adapter = None
 
             if messages is None:
                 messages = self.query

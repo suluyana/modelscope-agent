@@ -199,6 +199,7 @@ class AgentTool(ToolBase):
         self._specs: Dict[str, _AgentToolSpec] = {}
         self._server_tools: Dict[str, List[Tool]] = {}
         self._chunk_cb: Optional[Callable[..., Any]] = None
+        self._trajectory_collector: Optional[Any] = None
         self._active_processes: Dict[str, mp.Process] = {}
         self._active_processes_lock = threading.Lock()
         self._task_manager = None
@@ -447,7 +448,23 @@ class AgentTool(ToolBase):
     def set_chunk_callback(self, cb: Optional[Callable[..., Any]]) -> None:
         self._chunk_cb = cb
 
+    def set_trajectory_collector(self, collector: Optional[Any]) -> None:
+        self._trajectory_collector = collector
+
     def _emit_chunk_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        col = self._trajectory_collector
+        if col is not None and event_type in ('start', 'end'):
+            try:
+                tn = data.get('tool_name') or ''
+                cid = data.get('call_id')
+                if cid is not None and not isinstance(cid, str):
+                    cid = str(cid)
+                if event_type == 'start':
+                    col.emit_agent_start(None, tn, cid)
+                else:
+                    col.emit_agent_end(None, tn, 'completed', cid)
+            except Exception as exc:  # noqa
+                logger.warning('Trajectory collector failed: %s', exc)
         if not self._chunk_cb:
             return
         try:
@@ -924,7 +941,7 @@ class AgentTool(ToolBase):
                 runtime_agent = self._build_agent(spec)
                 runtime_agent_tag = getattr(runtime_agent, 'tag', None)
                 runtime_agent_type = getattr(runtime_agent, 'AGENT_NAME', None)
-            if self._chunk_cb or _writer is not None:
+            if self._chunk_cb or _writer is not None or self._trajectory_collector:
                 result = await runtime_agent.run(payload, stream=True)
             else:
                 result = await runtime_agent.run(payload)
@@ -987,7 +1004,7 @@ class AgentTool(ToolBase):
             result_queue = ctx.Queue(maxsize=1)
             # Create event_queue when either chunk_cb or stream writer is active
             # so that sub-agent progress can be forwarded to both sinks.
-            need_events = self._chunk_cb is not None or _writer is not None
+            need_events = (self._chunk_cb is not None or _writer is not None or self._trajectory_collector is not None)
             event_queue = ctx.Queue(maxsize=128) if need_events else None
             proc: Optional[mp.Process] = None
             run_id = f'{call_id or "agent_tool"}-{uuid.uuid4().hex[:8]}'
@@ -1008,7 +1025,7 @@ class AgentTool(ToolBase):
                     _writer.on_chunk(history)
 
             try:
-                if self._chunk_cb:
+                if self._chunk_cb or self._trajectory_collector:
                     self._emit_chunk_event('start', {
                         'call_id': call_id,
                         'tool_name': spec.tool_name,
@@ -1056,14 +1073,14 @@ class AgentTool(ToolBase):
                 restored = self._restore_process_result(result_payload)
                 streamed_chunks = int(
                     result_payload.get('streamed_chunks', 0) or 0)
-                if self._chunk_cb:
-                    if streamed_chunks <= 0:
-                        self._emit_chunk_event(
-                            'chunk', {
-                                'call_id': call_id,
-                                'tool_name': spec.tool_name,
-                                'history': restored,
-                            })
+                if self._chunk_cb and streamed_chunks <= 0:
+                    self._emit_chunk_event(
+                        'chunk', {
+                            'call_id': call_id,
+                            'tool_name': spec.tool_name,
+                            'history': restored,
+                        })
+                if self._chunk_cb or self._trajectory_collector:
                     self._emit_chunk_event(
                         'end', {
                             'call_id': call_id,

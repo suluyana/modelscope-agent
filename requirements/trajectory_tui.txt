@@ -1,0 +1,2 @@
+# Optional: live trajectory dashboard (``python -m ms_agent.trajectory tui``)
+textual>=0.47.0
