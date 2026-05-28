@@ -1,11 +1,12 @@
 import inspect
 from typing import Any, Dict
 
-from ms_agent.self_improve.schemas import IncidentSignal
+from ms_agent.self_improve.schemas import EvidenceKind, IncidentSignal
 from ms_agent.self_improve.ledger import RunLedger
 from ms_agent.self_improve.collector import ArtifactCollector
 from ms_agent.self_improve.classifier import FailureClassifier
 from ms_agent.self_improve.capability_miner import CapabilityGapMiner
+from ms_agent.self_improve import trajectory_analyzer
 from ms_agent.self_improve.decision_engine import DecisionEngine
 from ms_agent.self_improve.planner import RepairPlanner
 from ms_agent.self_improve.executor import RepairExecutor, FileGuard
@@ -84,7 +85,26 @@ class SelfImproveOrchestrator:
             # 2. COLLECT_ARTIFACTS
             collector = ArtifactCollector(self.adapter.output_dir)
             evidences = collector.collect()
-            
+
+            # 2.5 TRAJECTORY ANALYSIS
+            traj_analysis = None
+            for ev in evidences:
+                if ev.kind == EvidenceKind.AGENT_STDOUT:
+                    try:
+                        from pathlib import Path
+                        stdout_text = Path(ev.path).read_text(encoding="utf-8", errors="replace")
+                        traj_analysis = trajectory_analyzer.analyze(stdout_text)
+                        print(
+                            f"[Orchestrator] Trajectory: {traj_analysis.total_turns} turns, "
+                            f"{len(traj_analysis.tool_calls)} tool calls, "
+                            f"state={traj_analysis.final_state}, "
+                            f"patterns={len(traj_analysis.repeated_failure_patterns)}"
+                        )
+                    except Exception as e:
+                        print(f"[Orchestrator] Trajectory analysis failed: {e}")
+                    break
+            run_context = {**run_context, "trajectory_analysis": traj_analysis}
+
             # 3. CLASSIFY_FAILURE
             incidents = self.classifier.classify(evidences, run_context)
             adapter_context = self.adapter.get_context()
@@ -97,7 +117,8 @@ class SelfImproveOrchestrator:
                 exit_code=run_context.get("exit_code"),
                 reward=run_context.get("reward"),
                 incidents=incidents,
-                evidence_index=evidences
+                evidence_index=evidences,
+                trajectory_analysis=traj_analysis,
             )
             
             primary = signal.primary_incident

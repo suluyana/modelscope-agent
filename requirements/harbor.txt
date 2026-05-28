@@ -1,0 +1,20 @@
+# Terminal-Bench Harbor runtime deps (no MCP; TB agent yaml sets mcp: false).
+# PyPI ms-agent is installed with --no-deps, then these satisfy imports for TB.
+aiohttp
+dotenv
+edge_tts
+faiss-cpu
+json5
+markdown
+matplotlib
+modelscope
+moviepy
+numpy
+omegaconf
+openai
+pandas
+pillow
+pyyaml
+requests
+sentence-transformers
+typing_extensions

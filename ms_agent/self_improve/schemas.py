@@ -19,6 +19,8 @@ class SymptomClass(str, enum.Enum):
     EXECUTION_TIMEOUT = "execution_timeout"
     TOOL_OR_PROTOCOL_ERROR = "tool_or_protocol_error"
     ENVIRONMENT_FAILURE = "environment_failure"
+    STUCK_LOOP = "stuck_loop"
+    TOOL_REPEATED_FAILURE = "tool_repeated_failure"
     UNKNOWN = "unknown"
 
 
@@ -82,6 +84,7 @@ class IncidentSignal(BaseModel):
     
     incidents: List[IncidentDetail] = Field(default_factory=list)
     evidence_index: List[EvidenceRef] = Field(default_factory=list)
+    trajectory_analysis: Optional["TrajectoryAnalysis"] = None
 
     @property
     def primary_incident(self) -> Optional[IncidentDetail]:
@@ -165,3 +168,6 @@ class TrajectoryAnalysis(BaseModel):
     total_turns: int = 0
     unique_tools_used: List[str] = Field(default_factory=list)
     repeated_failure_patterns: List[str] = Field(default_factory=list)
+
+
+IncidentSignal.model_rebuild()
