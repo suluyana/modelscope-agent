@@ -1,4 +1,5 @@
 import hashlib
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -60,12 +61,21 @@ class CapabilityGapMiner:
             cluster_cfg.get("target_source_paths", [])
         )
 
+        # Auto-derive target paths from evidence when trajectory signals
+        # are strong but known_clusters has no configured paths.
+        trajectory_confirmed = self._is_trajectory_confirmed(traj, symptom)
+        if not target_source_paths and trajectory_confirmed:
+            target_source_paths = self._auto_target_paths_from_evidence(
+                signal.evidence_index
+            )
+
         repair_allowed = self._repair_allowed(
             incident_class=incident_class,
             improvement=improvement,
             support_count=support_count,
             min_support=min_support,
             target_source_paths=target_source_paths,
+            trajectory_confirmed=trajectory_confirmed,
         )
 
         return self._signal(
@@ -90,6 +100,7 @@ class CapabilityGapMiner:
         support_count: int,
         min_support: int,
         target_source_paths: List[str],
+        trajectory_confirmed: bool = False,
     ) -> bool:
         if improvement == ImprovementType.NONE:
             return False
@@ -103,6 +114,10 @@ class CapabilityGapMiner:
             return False
         if not target_source_paths:
             return False
+        # Trajectory-confirmed patterns (stuck loop, repeated tool failures)
+        # are framework-level by nature — allow repair without cross-case gate.
+        if trajectory_confirmed and target_source_paths:
+            return True
         if support_count >= min_support:
             return True
         return self.allow_single_case_framework_gap and support_count == 1
@@ -321,6 +336,59 @@ class CapabilityGapMiner:
             return SymptomClass.ENVIRONMENT_FAILURE
 
         return SymptomClass.UNKNOWN
+
+    def _is_trajectory_confirmed(
+        self,
+        traj: Optional[TrajectoryAnalysis],
+        symptom: SymptomClass,
+    ) -> bool:
+        """Return True when trajectory analysis strongly confirms a framework gap."""
+        if traj is None:
+            return False
+        return symptom in {
+            SymptomClass.STUCK_LOOP,
+            SymptomClass.TOOL_REPEATED_FAILURE,
+        } or (
+            symptom == SymptomClass.EXECUTION_TIMEOUT
+            and traj.total_turns >= 8
+        )
+
+    _SOURCE_PATH_RE = re.compile(r"\b(ms_agent/[A-Za-z0-9_./-]+\.py)\b")
+
+    def _auto_target_paths_from_evidence(
+        self,
+        evidence_refs: Iterable[EvidenceRef],
+    ) -> List[str]:
+        """Extract framework source paths mentioned in evidence files."""
+        hits: dict[str, int] = {}
+        for ev in evidence_refs:
+            try:
+                content = Path(ev.path).read_text(
+                    encoding="utf-8", errors="replace"
+                )[-6000:]
+            except Exception:
+                continue
+            for match in self._SOURCE_PATH_RE.findall(content):
+                norm = str(Path(match))
+                if norm.startswith("ms_agent/self_improve/"):
+                    continue
+                hits[norm] = hits.get(norm, 0) + 1
+
+        paths = self._safe_source_paths(
+            sorted(hits, key=lambda p: hits[p], reverse=True)[:5]
+        )
+        # Fallback: if no specific paths found, target tool execution layer
+        if not paths:
+            defaults = [
+                "ms_agent/tools/code_execution.py",
+                "ms_agent/tools/tool_manager.py",
+                "ms_agent/agent/agent.py",
+            ]
+            paths = [
+                p for p in defaults
+                if (Path.cwd() / p).is_file()
+            ]
+        return paths
 
     def _cluster_key(
         self,
