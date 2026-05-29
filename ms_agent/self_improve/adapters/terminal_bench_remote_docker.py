@@ -338,6 +338,10 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
         self.sync_code_to_remote()
 
         work_dir_suffix = f"si_remote_{self.task_name}"
+        # Clean previous results to avoid polling stale result.json
+        remote_work_dir = f"{self.remote_repo_dir}/outputs/{work_dir_suffix}"
+        self._ssh(f"rm -rf {remote_work_dir}/trials", timeout=15)
+
         result = self._run_evalscope_remote(
             [self.task_name], work_dir_suffix
         )
@@ -390,6 +394,9 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
 
         self.sync_code_to_remote()
         work_dir_suffix = "si_remote_regression"
+        # Clean previous results to avoid finding stale result.json
+        remote_work_dir = f"{self.remote_repo_dir}/outputs/{work_dir_suffix}"
+        self._ssh(f"rm -rf {remote_work_dir}/trials", timeout=15)
         self._run_evalscope_remote(regression, work_dir_suffix)
 
         results: Dict[str, float] = {}
