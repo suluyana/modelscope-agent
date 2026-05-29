@@ -119,49 +119,82 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
             )
         print("[RemoteAdapter] Remote synced successfully.")
 
+    def _write_launcher_script(
+        self, remote_work_dir: str, task_names: List[str]
+    ) -> str:
+        """Write a launcher script on the remote and return its path."""
+        tasks_str = ",".join(task_names)
+        batch_size = len(task_names)
+        script_file = f"{remote_work_dir}/run.sh"
+
+        script_lines = [
+            "#!/bin/bash",
+            f"cd {self.remote_repo_dir}",
+            "export PATH=/root/miniconda3/bin:/usr/local/bin:/usr/bin:/bin",
+            "source /root/.bashrc",
+            "export TERMINAL_BENCH_VERSION=2.1",
+            "export TERMINAL_BENCH_REGISTRY_PATH=/root/bench_workspace/datasets/terminal-bench-2.1-registry.json",
+            "export TERMINAL_BENCH_MODEL=qwen3.6-plus",
+            f"export TERMINAL_BENCH_TASK_NAMES='{tasks_str}'",
+            f"export TERMINAL_BENCH_LIMIT={len(task_names)}",
+            f"export TERMINAL_BENCH_EVAL_BATCH_SIZE={batch_size}",
+            f"export EVALSCOPE_WORK_DIR={remote_work_dir}",
+            "export EVALSCOPE_NO_TIMESTAMP=true",
+            f"export MS_AGENT_SOURCE_ROOT={self.remote_repo_dir}",
+            "exec python3 scripts/run_terminal_bench_ms_agent_smoke.py",
+        ]
+
+        # Upload via scp from a temp file
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sh", delete=False
+        ) as f:
+            f.write("\n".join(script_lines) + "\n")
+            local_script = f.name
+
+        try:
+            self._ssh(f"mkdir -p {remote_work_dir}", timeout=10)
+            subprocess.run(
+                [
+                    "scp", "-o", "StrictHostKeyChecking=no",
+                    local_script,
+                    f"{self.remote_host}:{script_file}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self._ssh(f"chmod +x {script_file}", timeout=10)
+        finally:
+            os.unlink(local_script)
+
+        return script_file
+
     def _run_evalscope_remote(
         self, task_names: List[str], work_dir_suffix: str
     ) -> subprocess.CompletedProcess[str]:
         """Run EvalScope on remote via nohup, poll for result.json.
 
-        Launches the script in the background on the remote server so we are
-        not vulnerable to SSH timeout. Polls every 30s for the result.json
-        files to appear (one per task).
+        Uploads a launcher script, runs it via nohup so SSH returns
+        immediately with the PID, then polls for result.json.
         """
         import time
 
         tasks_str = ",".join(task_names)
-        batch_size = len(task_names)
         remote_work_dir = (
             f"{self.remote_repo_dir}/outputs/{work_dir_suffix}"
         )
         log_file = f"{remote_work_dir}/evalscope_run.log"
         pid_file = f"{remote_work_dir}/evalscope_run.pid"
-        env_exports = (
-            f"export PATH=/root/miniconda3/bin:/usr/local/bin:/usr/bin:/bin && "
-            f"export DASHSCOPE_API_KEY=$(grep DASHSCOPE_API_KEY /root/.bashrc | cut -d= -f2) && "
-            f"export TERMINAL_BENCH_VERSION=2.1 && "
-            f"export TERMINAL_BENCH_REGISTRY_PATH="
-            f"/root/bench_workspace/datasets/terminal-bench-2.1-registry.json && "
-            f"export TERMINAL_BENCH_MODEL=qwen3.6-plus && "
-            f"export TERMINAL_BENCH_TASK_NAMES='{tasks_str}' && "
-            f"export TERMINAL_BENCH_LIMIT={len(task_names)} && "
-            f"export TERMINAL_BENCH_EVAL_BATCH_SIZE={batch_size} && "
-            f"export EVALSCOPE_WORK_DIR={remote_work_dir} && "
-            f"export EVALSCOPE_NO_TIMESTAMP=true && "
-            f"export MS_AGENT_SOURCE_ROOT={self.remote_repo_dir}"
-        )
-        launch_cmd = (
-            f"mkdir -p {remote_work_dir} && "
-            f"cd {self.remote_repo_dir} && {env_exports} && "
-            f"nohup python3 scripts/run_terminal_bench_ms_agent_smoke.py "
-            f"> {log_file} 2>&1 & echo $!"
-        )
+
+        script_file = self._write_launcher_script(remote_work_dir, task_names)
+
+        launch_cmd = f"nohup bash {script_file} > {log_file} 2>&1 & echo $!"
         print(
             f"[RemoteAdapter] Launching EvalScope on remote (nohup): "
             f"tasks={tasks_str} work_dir={remote_work_dir}"
         )
-        launch_result = self._ssh(launch_cmd, timeout=60)
+        launch_result = self._ssh(launch_cmd, timeout=30)
         if launch_result.returncode != 0:
             print(f"[RemoteAdapter] Failed to launch: {launch_result.stderr}")
             return launch_result
