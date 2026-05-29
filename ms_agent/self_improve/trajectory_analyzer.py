@@ -34,25 +34,52 @@ def _strip_prefix(line: str) -> str:
 
 
 def _try_parse_json_block(lines: List[str], start: int) -> tuple[dict | None, int]:
-    """Try to parse a JSON object starting at *start*, spanning multiple lines."""
-    depth = 0
+    """Try to parse a JSON object starting at *start*, spanning multiple lines.
+
+    Strategy:
+    1. Try ``json.JSONDecoder.raw_decode`` on each accumulated line — handles
+       brackets inside string values correctly.
+    2. Fall back to ``{}`` brace depth counting (ignoring ``[]`` which often
+       appear in embedded command output).  Caps scan at 80 lines.
+    """
+    max_scan = min(start + 80, len(lines))
     buf: list[str] = []
-    for i in range(start, len(lines)):
+    decoder = json.JSONDecoder()
+
+    # Pass 1: try raw_decode (correct for well-formed JSON)
+    for i in range(start, max_scan):
         stripped = _strip_prefix(lines[i]).strip()
-        # skip agent prefix like "[Agent-default] "
         agent_match = re.match(r"\[Agent-\w+\]\s*", stripped)
         if agent_match:
             stripped = stripped[agent_match.end():]
         buf.append(stripped)
+        text = "\n".join(buf)
+        try:
+            obj, _ = decoder.raw_decode(text)
+            if isinstance(obj, dict):
+                return obj, i
+        except json.JSONDecodeError:
+            continue
+
+    # Pass 2: brace-only depth counting (handles multi-line strings with
+    # literal newlines that raw_decode rejects)
+    depth = 0
+    buf2: list[str] = []
+    for i in range(start, max_scan):
+        stripped = _strip_prefix(lines[i]).strip()
+        agent_match = re.match(r"\[Agent-\w+\]\s*", stripped)
+        if agent_match:
+            stripped = stripped[agent_match.end():]
+        buf2.append(stripped)
         depth += stripped.count("{") - stripped.count("}")
-        depth += stripped.count("[") - stripped.count("]")
-        if depth <= 0 and buf:
-            text = "\n".join(buf)
+        if depth <= 0 and buf2:
+            text = "\n".join(buf2)
             try:
                 return json.loads(text), i
             except json.JSONDecodeError:
                 return None, i
-    return None, len(lines) - 1
+
+    return None, min(start + max(len(buf), len(buf2), 1) - 1, len(lines) - 1)
 
 
 def _summarize(text: str, max_len: int = 200) -> str:
