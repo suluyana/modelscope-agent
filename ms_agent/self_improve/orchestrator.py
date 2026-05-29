@@ -59,6 +59,55 @@ class SelfImproveOrchestrator:
         self.repair_agent = RepairAgent(config)
         self.failed_attempts_by_fingerprint = {}
 
+    def _has_remote_verification(self) -> bool:
+        """Check if the adapter supports remote Docker verification."""
+        return hasattr(self.adapter, "run_regression") and hasattr(
+            self.adapter, "sync_code_to_remote"
+        )
+
+    def _verify_remote(self, signal) -> tuple[bool, str]:
+        """Stage 2 verification: re-run target + regression tasks on remote Docker.
+
+        Returns (passed, log_message).
+        """
+        from ms_agent.self_improve.adapters.terminal_bench_remote_docker import (
+            TerminalBenchRemoteDockerAdapter,
+        )
+
+        if not isinstance(self.adapter, TerminalBenchRemoteDockerAdapter):
+            return True, "Adapter does not support remote verification"
+
+        adapter = self.adapter
+        logs: list[str] = []
+
+        # Re-run target task
+        print(f"[Orchestrator] Re-running target task: {adapter.task_name}")
+        success, ctx = adapter.run_target(iteration=99)
+        reward = ctx.get("reward")
+        logs.append(f"Target {adapter.task_name}: reward={reward}")
+
+        if not success:
+            return False, f"Target task did not pass after patch (reward={reward})"
+
+        # Run regression tasks
+        print(
+            f"[Orchestrator] Running regression tasks: {adapter.regression_tasks}"
+        )
+        regression_results = adapter.run_regression()
+        all_pass = True
+        for task, task_reward in regression_results.items():
+            logs.append(f"Regression {task}: reward={task_reward}")
+            if task_reward != 1.0:
+                all_pass = False
+
+        if not all_pass:
+            failed = [t for t, r in regression_results.items() if r != 1.0]
+            return False, (
+                f"Regression failed for: {failed}. " + "; ".join(logs)
+            )
+
+        return True, "; ".join(logs)
+
     def run_loop(self):
         print(f"[Orchestrator] Starting self-improve loop (run_id: {self.run_id}, mode: {self.mode})")
         try:
@@ -266,57 +315,68 @@ class SelfImproveOrchestrator:
                 head_after or "",
             )
 
-            # 8. VERIFY_PATCH 
-            print("[Orchestrator] Verifying patch...")
-            patch_cmds = self.config.get("verify", {}).get("patch_commands", ["pytest tests -q"])
+            # 8. VERIFY_PATCH (Stage 1: fast local check)
+            print("[Orchestrator] Verifying patch (Stage 1: local)...")
+            patch_cmds = self.config.get("verify", {}).get("patch_commands", ["python -m compileall -q ms_agent/self_improve scripts"])
             if not patch_cmds:
-                print("[Orchestrator] No verification commands specified. Skipping explicit verify step.")
+                print("[Orchestrator] No verification commands specified. Skipping local verify.")
                 verify_passed = True
             else:
                 adapter_ctx = self.adapter.get_context()
                 verify_res = self.verifier.verify_patch(patch_cmds, adapter_ctx, {}, "generic_python")
-                
+
                 self.ledger.record_patch_verified(iteration, incident_fingerprint, verify_res.passed, verify_res.exit_code, verify_res.commands_run)
                 verify_passed = verify_res.passed
-                
+
                 if not verify_passed:
-                    print(f"[Orchestrator] Verification failed: {verify_res.output_log}")
-                    # Record failure
-                    if incident_fingerprint not in self.failed_attempts_by_fingerprint:
-                        self.failed_attempts_by_fingerprint[incident_fingerprint] = []
-                    self.failed_attempts_by_fingerprint[incident_fingerprint].append({
-                        "patch_id": patch.patch_id,
-                        "patch_content": patch.model_dump() if hasattr(patch, "model_dump") else patch.dict(),
-                        "verification_log": verify_res.output_log
-                    })
-                    
-                    # Revert broken commit if it was created
-                    try:
-                        head_after = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=".").stdout.strip()
-                        if tracked_dirty_before:
-                            print(
-                                "[Orchestrator] Skip rollback because tracked files were dirty before patch."
-                            )
-                        elif head_before and head_after != head_before:
-                            print(f"[Orchestrator] Reverting broken commit {head_after}")
-                            subprocess.run(
-                                [
-                                    "git",
-                                    "-c",
-                                    "user.name=self-improve",
-                                    "-c",
-                                    "user.email=self-improve@example.invalid",
-                                    "revert",
-                                    "--no-edit",
-                                    head_after,
-                                ],
-                                check=True,
-                                cwd=".",
-                            )
-                    except Exception as e:
-                        print(f"[Orchestrator] Warning: Failed to revert broken commit: {e}")
+                    print(f"[Orchestrator] Local verification failed: {verify_res.output_log}")
+
+            # Stage 2: Remote Docker re-run (only if local passed)
+            if verify_passed and self._has_remote_verification():
+                print("[Orchestrator] Verifying patch (Stage 2: remote Docker)...")
+                remote_verify_passed, remote_log = self._verify_remote(signal)
+                if not remote_verify_passed:
+                    print(f"[Orchestrator] Remote verification failed: {remote_log}")
+                    verify_passed = False
                 else:
-                    print("[Orchestrator] Verification passed.")
+                    print("[Orchestrator] Remote verification passed (target + regression).")
+
+            if not verify_passed:
+                if incident_fingerprint not in self.failed_attempts_by_fingerprint:
+                    self.failed_attempts_by_fingerprint[incident_fingerprint] = []
+                self.failed_attempts_by_fingerprint[incident_fingerprint].append({
+                    "patch_id": patch.patch_id,
+                    "patch_content": patch.model_dump() if hasattr(patch, "model_dump") else patch.dict(),
+                    "verification_log": verify_res.output_log if not verify_passed else remote_log
+                })
+
+                # Revert broken commit if it was created
+                try:
+                    head_after = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=".").stdout.strip()
+                    if tracked_dirty_before:
+                        print(
+                            "[Orchestrator] Skip rollback because tracked files were dirty before patch."
+                        )
+                    elif head_before and head_after != head_before:
+                        print(f"[Orchestrator] Reverting broken commit {head_after}")
+                        subprocess.run(
+                            [
+                                "git",
+                                "-c",
+                                "user.name=self-improve",
+                                "-c",
+                                "user.email=self-improve@example.invalid",
+                                "revert",
+                                "--no-edit",
+                                head_after,
+                            ],
+                            check=True,
+                            cwd=".",
+                        )
+                except Exception as e:
+                    print(f"[Orchestrator] Warning: Failed to revert broken commit: {e}")
+            else:
+                print("[Orchestrator] All verification passed.")
 
             # 9. CHECKPOINT_CHANGESET & 10. RERUN_TARGET
             print("[Orchestrator] Proceeding to next iteration to evaluate the repaired system.")

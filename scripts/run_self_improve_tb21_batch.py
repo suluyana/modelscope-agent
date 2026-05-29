@@ -25,6 +25,9 @@ from ms_agent.self_improve.adapters.terminal_bench_fast_local import (
 from ms_agent.self_improve.adapters.terminal_bench_evalscope import (
     TerminalBenchEvalScopeAdapter,
 )
+from ms_agent.self_improve.adapters.terminal_bench_remote_docker import (
+    TerminalBenchRemoteDockerAdapter,
+)
 from ms_agent.self_improve.cluster_builder import build_known_clusters_from_root
 from ms_agent.self_improve.orchestrator import SelfImproveOrchestrator
 
@@ -264,7 +267,17 @@ def _build_adapter(
     task_name: str,
     bench_base: str,
     evalscope_work_dir: str | None = None,
-) -> TerminalBenchFastLocalAdapter | TerminalBenchEvalScopeAdapter:
+    remote_host: str | None = None,
+    remote_repo_dir: str | None = None,
+    regression_tasks: list[str] | None = None,
+) -> TerminalBenchFastLocalAdapter | TerminalBenchEvalScopeAdapter | TerminalBenchRemoteDockerAdapter:
+    if adapter_type == "remote_docker":
+        return TerminalBenchRemoteDockerAdapter(
+            task_name,
+            remote_host=remote_host or "root@47.254.25.238",
+            remote_repo_dir=remote_repo_dir or "/root/bench_workspace/modelscope-agent-si",
+            regression_tasks=regression_tasks,
+        )
     if adapter_type == "evalscope":
         work_dir = evalscope_work_dir
         if not work_dir:
@@ -290,8 +303,15 @@ def _run_task_sequential(task_name: str, args: argparse.Namespace, bench_base: s
         getattr(args, "resolved_capability_clusters", {})
         or _load_capability_clusters(args.capability_clusters_json),
     )
+    regression = [t.strip() for t in args.regression_tasks.split(",") if t.strip()]
     adapter = _build_adapter(
-        args.adapter, task_name, bench_base, args.evalscope_work_dir
+        args.adapter,
+        task_name,
+        bench_base,
+        args.evalscope_work_dir,
+        remote_host=args.remote_host,
+        remote_repo_dir=args.remote_repo_dir,
+        regression_tasks=regression,
     )
     orchestrator = SelfImproveOrchestrator(run_id, adapter, config)
     try:
@@ -481,13 +501,28 @@ def main() -> None:
     parser.add_argument(
         "--adapter",
         default="fast_local",
-        choices=["fast_local", "evalscope"],
-        help="Execution adapter: fast_local (default) or evalscope (Docker via EvalScope)",
+        choices=["fast_local", "evalscope", "remote_docker"],
+        help="Execution adapter: fast_local (default), evalscope (local Docker), or remote_docker (SSH+Docker)",
     )
     parser.add_argument(
         "--evalscope-work-dir",
         default=None,
         help="EvalScope work directory (only used with --adapter evalscope)",
+    )
+    parser.add_argument(
+        "--remote-host",
+        default="root@47.254.25.238",
+        help="Remote SSH host (only used with --adapter remote_docker)",
+    )
+    parser.add_argument(
+        "--remote-repo-dir",
+        default="/root/bench_workspace/modelscope-agent-si",
+        help="Remote repo directory (only used with --adapter remote_docker)",
+    )
+    parser.add_argument(
+        "--regression-tasks",
+        default="fix-git,build-pmars,hf-model-inference,polyglot-c-py",
+        help="Comma-separated regression tasks for remote verification",
     )
     args = parser.parse_args()
 
