@@ -21,7 +21,7 @@ TASK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _DEFAULT_REMOTE_HOST = "root@47.254.25.238"
 _DEFAULT_REMOTE_REPO = "/root/bench_workspace/modelscope-agent-si"
 _DEFAULT_BRANCH = "feat/self_improve"
-_DEFAULT_TIMEOUT_SEC = 1800
+_DEFAULT_TIMEOUT_SEC = 3600
 _DEFAULT_REGRESSION_TASKS = [
     "fix-git",
     "build-pmars",
@@ -122,12 +122,21 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
     def _run_evalscope_remote(
         self, task_names: List[str], work_dir_suffix: str
     ) -> subprocess.CompletedProcess[str]:
-        """Run EvalScope on remote for given tasks. Blocks until done."""
+        """Run EvalScope on remote via nohup, poll for result.json.
+
+        Launches the script in the background on the remote server so we are
+        not vulnerable to SSH timeout. Polls every 30s for the result.json
+        files to appear (one per task).
+        """
+        import time
+
         tasks_str = ",".join(task_names)
         batch_size = len(task_names)
         remote_work_dir = (
             f"{self.remote_repo_dir}/outputs/{work_dir_suffix}"
         )
+        log_file = f"{remote_work_dir}/evalscope_run.log"
+        pid_file = f"{remote_work_dir}/evalscope_run.pid"
         env_exports = (
             f"export TERMINAL_BENCH_VERSION=2.1 && "
             f"export TERMINAL_BENCH_REGISTRY_PATH="
@@ -141,15 +150,95 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
             f"export MS_AGENT_SOURCE_ROOT={self.remote_repo_dir} && "
             f"source /root/.bashrc"
         )
-        run_cmd = (
+        launch_cmd = (
+            f"mkdir -p {remote_work_dir} && "
             f"cd {self.remote_repo_dir} && {env_exports} && "
-            f"python3 scripts/run_terminal_bench_ms_agent_smoke.py"
+            f"nohup python3 scripts/run_terminal_bench_ms_agent_smoke.py "
+            f"> {log_file} 2>&1 & echo $!"
         )
         print(
-            f"[RemoteAdapter] Running EvalScope on remote: "
+            f"[RemoteAdapter] Launching EvalScope on remote (nohup): "
             f"tasks={tasks_str} work_dir={remote_work_dir}"
         )
-        return self._ssh(run_cmd, timeout=self.timeout_sec)
+        launch_result = self._ssh(launch_cmd, timeout=30)
+        if launch_result.returncode != 0:
+            print(f"[RemoteAdapter] Failed to launch: {launch_result.stderr}")
+            return launch_result
+
+        remote_pid = launch_result.stdout.strip().split("\n")[-1]
+        print(f"[RemoteAdapter] Remote PID: {remote_pid}")
+
+        # Write PID to file for tracking
+        self._ssh(f"echo {remote_pid} > {pid_file}", timeout=10)
+
+        # Poll for completion: check if result.json appears for all tasks
+        poll_interval = 30
+        elapsed = 0
+        while elapsed < self.timeout_sec:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            # Check if all tasks have result.json
+            all_done = True
+            for task in task_names:
+                check_cmd = (
+                    f"find {remote_work_dir}/trials -maxdepth 1 -type d "
+                    f"-name '{task}__*' -exec test -f {{}}/result.json \\; "
+                    f"-print 2>/dev/null | head -1"
+                )
+                r = self._ssh(check_cmd, timeout=15)
+                if not r.stdout.strip():
+                    all_done = False
+                    break
+
+            if all_done:
+                print(
+                    f"[RemoteAdapter] All {len(task_names)} task(s) completed "
+                    f"after {elapsed}s."
+                )
+                # Read the log for return value
+                log_result = self._ssh(f"cat {log_file}", timeout=30)
+                return subprocess.CompletedProcess(
+                    args=["ssh", "evalscope"],
+                    returncode=0,
+                    stdout=log_result.stdout,
+                    stderr=log_result.stderr,
+                )
+
+            # Check if process is still alive
+            alive_check = self._ssh(
+                f"kill -0 {remote_pid} 2>/dev/null && echo alive || echo dead",
+                timeout=10,
+            )
+            if "dead" in alive_check.stdout:
+                print(
+                    f"[RemoteAdapter] Remote process {remote_pid} exited "
+                    f"after {elapsed}s."
+                )
+                log_result = self._ssh(f"cat {log_file}", timeout=30)
+                return subprocess.CompletedProcess(
+                    args=["ssh", "evalscope"],
+                    returncode=1,
+                    stdout=log_result.stdout,
+                    stderr=log_result.stderr,
+                )
+
+            if elapsed % 60 == 0:
+                print(
+                    f"[RemoteAdapter] Waiting... ({elapsed}s / "
+                    f"{self.timeout_sec}s)"
+                )
+
+        # Timeout
+        print(f"[RemoteAdapter] Timeout ({self.timeout_sec}s). Killing remote PID {remote_pid}.")
+        self._ssh(f"kill {remote_pid} 2>/dev/null", timeout=10)
+        log_result = self._ssh(f"cat {log_file}", timeout=30)
+        return subprocess.CompletedProcess(
+            args=["ssh", "evalscope"],
+            returncode=-1,
+            stdout=log_result.stdout,
+            stderr=f"Timed out after {self.timeout_sec}s\n{log_result.stderr}",
+        )
 
     def _find_remote_trial_dir(self, work_dir_suffix: str) -> Optional[str]:
         """Find the trial directory on remote matching task_name."""
@@ -167,7 +256,7 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
     def _download_result(
         self, remote_trial_dir: str, iteration: int
     ) -> Optional[str]:
-        """Download result.json from remote trial dir to local."""
+        """Download result.json and agent artifacts from remote trial dir."""
         local_trial_dir = os.path.join(
             self._local_output_dir, f"iter_{iteration}"
         )
@@ -175,10 +264,28 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
         remote_result = f"{remote_trial_dir}/result.json"
         local_result = os.path.join(local_trial_dir, "result.json")
 
-        if self._scp_from_remote(remote_result, local_result):
-            self._trial_dir = local_trial_dir
-            return local_result
-        return None
+        if not self._scp_from_remote(remote_result, local_result):
+            return None
+
+        self._trial_dir = local_trial_dir
+
+        # Download agent_stdout.txt for trajectory analysis
+        agent_dir = os.path.join(local_trial_dir, "agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        self._scp_from_remote(
+            f"{remote_trial_dir}/agent/agent_stdout.txt",
+            os.path.join(agent_dir, "agent_stdout.txt"),
+        )
+
+        # Download verifier output
+        verifier_dir = os.path.join(local_trial_dir, "verifier")
+        os.makedirs(verifier_dir, exist_ok=True)
+        self._scp_from_remote(
+            f"{remote_trial_dir}/verifier/test-stdout.txt",
+            os.path.join(verifier_dir, "test-stdout.txt"),
+        )
+
+        return local_result
 
     def _parse_reward(self, result_json_path: str) -> Optional[float]:
         try:

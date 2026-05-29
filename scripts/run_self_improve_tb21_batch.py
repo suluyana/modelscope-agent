@@ -19,6 +19,15 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Load .env if DASHSCOPE_API_KEY not already in environment
+if not os.environ.get("DASHSCOPE_API_KEY"):
+    _env_path = Path(__file__).resolve().parents[1] / ".env"
+    if _env_path.exists():
+        for _line in _env_path.read_text().splitlines():
+            if _line.startswith("DASHSCOPE_API_KEY="):
+                os.environ["DASHSCOPE_API_KEY"] = _line.split("=", 1)[1].strip()
+                break
+
 from ms_agent.self_improve.adapters.terminal_bench_fast_local import (
     TerminalBenchFastLocalAdapter,
 )
