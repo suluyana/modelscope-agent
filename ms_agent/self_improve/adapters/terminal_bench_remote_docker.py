@@ -138,6 +138,8 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
         log_file = f"{remote_work_dir}/evalscope_run.log"
         pid_file = f"{remote_work_dir}/evalscope_run.pid"
         env_exports = (
+            f"export PATH=/root/miniconda3/bin:/usr/local/bin:/usr/bin:/bin && "
+            f"export DASHSCOPE_API_KEY=$(grep DASHSCOPE_API_KEY /root/.bashrc | cut -d= -f2) && "
             f"export TERMINAL_BENCH_VERSION=2.1 && "
             f"export TERMINAL_BENCH_REGISTRY_PATH="
             f"/root/bench_workspace/datasets/terminal-bench-2.1-registry.json && "
@@ -147,8 +149,7 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
             f"export TERMINAL_BENCH_EVAL_BATCH_SIZE={batch_size} && "
             f"export EVALSCOPE_WORK_DIR={remote_work_dir} && "
             f"export EVALSCOPE_NO_TIMESTAMP=true && "
-            f"export MS_AGENT_SOURCE_ROOT={self.remote_repo_dir} && "
-            f"source /root/.bashrc"
+            f"export MS_AGENT_SOURCE_ROOT={self.remote_repo_dir}"
         )
         launch_cmd = (
             f"mkdir -p {remote_work_dir} && "
@@ -160,7 +161,7 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
             f"[RemoteAdapter] Launching EvalScope on remote (nohup): "
             f"tasks={tasks_str} work_dir={remote_work_dir}"
         )
-        launch_result = self._ssh(launch_cmd, timeout=30)
+        launch_result = self._ssh(launch_cmd, timeout=60)
         if launch_result.returncode != 0:
             print(f"[RemoteAdapter] Failed to launch: {launch_result.stderr}")
             return launch_result
