@@ -18,9 +18,10 @@ from ms_agent.tools.code import CodeExecutionTool, LocalCodeExecutionTool
 from ms_agent.tools.filesystem_tool import FileSystemTool
 from ms_agent.tools.image_generator import ImageGenerator
 try:
-    from ms_agent.tools.mcp_client import MCPClient
+    from ms_agent.tools.mcp_client import MCPClient, MCP_AVAILABLE
 except ImportError:
     MCPClient = None
+    MCP_AVAILABLE = False
 from ms_agent.tools.search.localsearch_tool import LocalSearchTool
 from ms_agent.tools.search.sirchmunk_search import \
     effective_localsearch_settings
@@ -203,9 +204,13 @@ class ToolManager:
             self.servers = self.mcp_client
             await self.servers.add_mcp_config(self.mcp_config)
             self.mcp_config = self.servers.mcp_config
-        elif MCPClient is not None:
+        elif MCPClient is not None and MCP_AVAILABLE:
             self.servers = MCPClient(self.mcp_config, self.config)
             await self.servers.connect()
+        elif MCPClient is not None and not MCP_AVAILABLE:
+            logger.warning_once(
+                'mcp package not installed; MCP tools disabled for this run'
+            )
         for tool in self.extra_tools:
             await tool.connect()
         await self.reindex_tool()
@@ -309,6 +314,39 @@ class ToolManager:
                             tool_name, self.TOOL_SPLITER),
                         tool_args=call_args),
                     timeout=wait_sec)
+
+                # Truncate excessively long tool outputs to prevent context window explosion
+                # which leads to slow inference and agent timeouts.
+                max_len = int(os.getenv('MAX_TOOL_OUTPUT_LEN', 20000))
+                if isinstance(response, str) and len(response) > max_len:
+                    try:
+                        data = json.loads(response)
+                        if isinstance(data, dict):
+                            did_truncate = False
+                            for k, v in list(data.items()):
+                                if isinstance(v, str) and len(v) > max_len:
+                                    half = max_len // 2
+                                    data[k] = (
+                                        v[:half] +
+                                        f"\n\n...[SYSTEM: Output truncated, {len(v)} chars total, showing first and last {half} chars]...\n\n" +
+                                        v[-half:]
+                                    )
+                                    did_truncate = True
+                            if did_truncate:
+                                data['_system_truncated'] = True
+                                response = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+                            else:
+                                raise ValueError
+                        else:
+                            raise ValueError
+                    except Exception:
+                        half = max_len // 2
+                        response = (
+                            response[:half] +
+                            f"\n\n...[SYSTEM: Output truncated, {len(response)} chars total, showing first and last {half} chars]...\n\n" +
+                            response[-half:]
+                        )
+
                 return response
             except asyncio.TimeoutError:
                 import traceback
