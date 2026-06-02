@@ -350,18 +350,50 @@ class ToolManager:
                 return response
             except asyncio.TimeoutError:
                 import traceback
-                logger.warning(traceback.format_exc())
+                tb_str = traceback.format_exc()
+                logger.warning(tb_str)
                 tn = tool_info.get('tool_name', '(unknown)')
-                return (
-                    f'Tool call timed out after {wait_sec:.0f}s (tool: {tn}). '
-                    f'Default limit is {self.tool_call_timeout:.0f}s; '
-                    f'set numeric field "timeout" in the tool arguments to wait longer '
-                    f'(seconds, maximum {self.tool_call_timeout_max:.0f}s). '
-                    f'Original call (truncated): {brief_info}')
+                return json.dumps({
+                    'success': False,
+                    'error': 'timeout',
+                    'tool_name': tn,
+                    'message': (
+                        f'Tool call timed out after {wait_sec:.0f}s (tool: {tn}). '
+                        f'Default limit is {self.tool_call_timeout:.0f}s; '
+                        f'set numeric field "timeout" in the tool arguments to wait longer '
+                        f'(seconds, maximum {self.tool_call_timeout_max:.0f}s). '
+                        f'Original call (truncated): {brief_info}'
+                    ),
+                    'recovery_hint': (
+                        'The tool took too long. Try: (1) add "timeout" field with a larger value in seconds '
+                        f'(max {self.tool_call_timeout_max:.0f}s), (2) break the task into smaller steps, '
+                        'or (3) simplify the command/input.'
+                    ),
+                }, ensure_ascii=False)
             except Exception as e:
                 import traceback
-                logger.warning(traceback.format_exc())
-                return f'Tool calling failed: {brief_info}, details: {str(e)}'
+                tb_str = traceback.format_exc()
+                logger.warning(tb_str)
+                exc_type_name = type(e).__name__
+                exc_msg = str(e) or '(no error message)'
+                tn = tool_info.get('tool_name', '(unknown)')
+                # Provide last lines of traceback for agent visibility
+                tb_lines = tb_str.strip().splitlines()
+                tb_tail = '\n'.join(tb_lines[-6:]) if len(tb_lines) > 6 else '\n'.join(tb_lines)
+                return json.dumps({
+                    'success': False,
+                    'error': exc_type_name,
+                    'tool_name': tn,
+                    'message': f'{exc_type_name}: {exc_msg}',
+                    'call_info': brief_info,
+                    'traceback_tail': tb_tail,
+                    'recovery_hint': (
+                        f'The tool "{tn}" raised {exc_type_name}. '
+                        'Review the error and traceback above, check your input parameters, '
+                        'verify prerequisites (files, dependencies, running services), '
+                        'and retry with corrected arguments or a different approach.'
+                    ),
+                }, ensure_ascii=False, default=str)
 
     async def parallel_call_tool(self, tool_list: List[ToolCall]):
         tasks = [self.single_call_tool(tool) for tool in tool_list]
