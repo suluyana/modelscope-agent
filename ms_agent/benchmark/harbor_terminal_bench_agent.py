@@ -286,9 +286,6 @@ class MsAgentTerminalBenchAgent(BaseAgent):
         return __version__
 
     def _render_agent_yaml(self) -> str:
-        # Modify the YAML generation to add the necessary settings
-        yaml_config = (f"output_dir: /app\nallow_read_all_files: true\nnetwork_enabled: true")
-        return f"file_system:\n  {yaml_config}\ncode_executor:\n  {yaml_config}"
         """Build YAML using credentials present on the host running Harbor."""
         extra_model = os.environ.get('TERMINAL_BENCH_MODEL')
 
