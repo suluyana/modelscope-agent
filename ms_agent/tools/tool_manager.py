@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import importlib
@@ -42,6 +44,28 @@ MAX_CONCURRENT_TOOLS = int(os.getenv('MAX_CONCURRENT_TOOLS', 20))
 
 
 def parse_timeout_from_tool_args(
+        tool_args: Optional[Dict[str, Any]],
+        default_timeout: int = TOOL_CALL_TIMEOUT,
+        max_timeout: int = TOOL_CALL_TIMEOUT_MAX) -> float:
+    """Read `tools.arguments.timeout` if present (even when omitted from JSON schema).
+
+    Providers may still drop unknown keys before arguments reach the host; when the key
+    is present, it is honored here for the asyncio wait around `call_tool`.
+    Additionally, a default timeout and maximum timeout are enforced.
+    """
+    if not isinstance(tool_args, dict) or 'timeout' not in tool_args:
+        return default_timeout
+    raw = tool_args['timeout']
+    if raw is None or isinstance(raw, bool):
+        return default_timeout
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        logger.warning('Ignoring invalid tools.arguments.timeout: %r', raw)
+        return default_timeout
+    if v != v:  # NaN
+        return default_timeout
+    return min(max(v, 0), max_timeout)
         tool_args: Optional[Dict[str, Any]]) -> Optional[float]:
     """Read ``tools.arguments.timeout`` if present (even when omitted from JSON schema).
 
@@ -64,6 +88,9 @@ def parse_timeout_from_tool_args(
 
 
 def effective_tool_wait_seconds(
+        self, tool_args: Optional[Dict[str, Any]]) -> float:
+    """Determine the effective wait time for a tool call, including any user-specified timeout."""
+    return parse_timeout_from_tool_args(tool_args, self.tool_call_timeout, self.tool_call_timeout_max)
         tool_args: Optional[Dict[str, Any]],
         *,
         default_sec: float,
