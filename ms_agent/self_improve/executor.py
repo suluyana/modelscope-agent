@@ -1,6 +1,6 @@
 import os
 import subprocess
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from ms_agent.self_improve.schemas import GuardDecision, RepairPatch
 
 class FileGuard:
@@ -338,3 +338,59 @@ class RepairExecutor:
             patched_paths.append(path)
 
         return self._commit_patch(patch, patched_paths)
+
+    def commit_working_changes(
+        self,
+        patch_id: str,
+        description: str,
+        target_files: List[str],
+    ) -> Optional[str]:
+        """Commit files already modified by RepairAgent's tool-use session.
+
+        Returns the new commit SHA, or None if commit failed or was denied.
+        """
+        allowed: list[str] = []
+        for target in target_files:
+            if not self._assert_regular_workspace_path(target):
+                return None
+            size_kb = 0.0
+            if os.path.exists(target):
+                size_kb = os.path.getsize(target) / 1024.0
+            decision = self.guard.evaluate(
+                path=target,
+                operation="modify",
+                is_text=True,
+                size_kb=size_kb,
+                approval_mode=self.mode,
+            )
+            if not decision.allowed:
+                print(
+                    f"[Executor] commit_working_changes denied for "
+                    f"{target}: {decision.reason}"
+                )
+                return None
+            allowed.append(target)
+
+        if not allowed:
+            return None
+
+        patch = RepairPatch(
+            patch_id=patch_id,
+            incident_fingerprint="tool_use_repair",
+            target_files=allowed,
+            diff_content="",
+            description=description,
+            file_patches=[],
+        )
+        ok = self._commit_patch(patch, allowed)
+        if not ok:
+            return None
+
+        try:
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, cwd=".",
+            ).stdout.strip()
+            return sha
+        except Exception:
+            return None

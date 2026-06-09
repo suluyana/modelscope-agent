@@ -1,45 +1,338 @@
+"""RepairAgent: generates framework patches via multi-turn tool-use conversation.
+
+Uses LLMAgent + FileSystemTool so the LLM can autonomously grep, read, and
+edit source files — no hand-rolled file I/O or truncation.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
-from typing import Dict, Any, Optional, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
-from ms_agent.llm.llm import LLM
-from ms_agent.llm.utils import Message
-from omegaconf import OmegaConf
-
-from ms_agent.self_improve.schemas import RepairPatch
 from ms_agent.self_improve.planner import RepairPlan
-from ms_agent.self_improve.schemas import IncidentSignal
+from ms_agent.self_improve.schemas import IncidentSignal, RepairPatch
+
+_SAFE_PREFIXES = ("ms_agent/", "scripts/")
+_FORBIDDEN_PREFIXES = ("ms_agent/self_improve/",)
+
 
 class RepairAgent:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
-        
-        # Instantiate LLM from config if possible
-        llm_config = OmegaConf.create({"llm": config.get("llm", {"model": "qwen-max"})})
-        try:
-            self.llm = LLM.from_config(llm_config)
-        except Exception as e:
-            print(f"[RepairAgent] Failed to init LLM, will use fallback. Error: {e}")
-            self.llm = None
 
-    def _looks_like_unified_diff(self, diff_content: str) -> bool:
+    # ------------------------------------------------------------------
+    # Config / prompt construction
+    # ------------------------------------------------------------------
+
+    def _build_agent_config(self) -> Any:
+        """Construct a minimal DictConfig for a sub-LLMAgent.
+
+        Pattern follows ``agent_delegate.py:_build_agent_config`` (L223).
+        """
+        from omegaconf import OmegaConf
+
+        return OmegaConf.create({
+            "llm": self.config.get("llm", {"model": "qwen-max"}),
+            "output_dir": str(Path.cwd()),
+            "trust_remote_code": True,
+            "tools": {
+                "file_system": {
+                    "allow_read_all_files": True,
+                    "include": ["read_file", "grep", "glob", "edit_file"],
+                },
+            },
+            "max_chat_round": 15,
+            "save_history": False,
+            "enable_snapshots": False,
+            "callbacks": [],
+            "prompt": {"system": self._repair_system_prompt()},
+        })
+
+    @staticmethod
+    def _repair_system_prompt() -> str:
         return (
-            "diff --git " in diff_content
-            or ("\n--- " in f"\n{diff_content}" and "\n+++ " in f"\n{diff_content}" and "\n@@ " in f"\n{diff_content}")
+            "You are an expert Python developer fixing the ms_agent framework.\n"
+            "\n"
+            "## Workflow\n"
+            "1. Use `grep` to search for relevant patterns or error messages in the codebase.\n"
+            "2. Use `read_file` to read the full context of target files.\n"
+            "3. Use `edit_file` to make precise, minimal changes.\n"
+            "4. After editing, use `read_file` again to verify your changes look correct.\n"
+            "\n"
+            "## CRITICAL: edit_file usage\n"
+            "The `read_file` tool returns content with line number prefixes like `123\\tcode here`.\n"
+            "When using `edit_file`, the `old_string` and `new_string` must contain ONLY the actual\n"
+            "file content — do NOT include line number prefixes. For example:\n"
+            "  - read_file shows: `197\\t        self._init_lock = None`\n"
+            "  - edit_file old_string should be: `        self._init_lock = None`\n"
+            "Strip ALL line number prefixes (digits + tab) from old_string and new_string.\n"
+            "\n"
+            "## Safety constraints\n"
+            "- Only modify files under `ms_agent/` or `scripts/`.\n"
+            "- NEVER modify files under `ms_agent/self_improve/`.\n"
+            "- Do NOT modify benchmark task files, outputs, logs, or test files.\n"
+            "\n"
+            "## Patch principles\n"
+            "- Make the smallest possible change that fixes the root cause.\n"
+            "- Do NOT hardcode any task-specific logic — only generalizable framework fixes.\n"
+            "- Preserve existing code style and conventions.\n"
+            "- Each edit_file call must use exact existing text for the search string.\n"
+            "\n"
+            "## When done\n"
+            "After completing all edits, summarize what you changed in a short message.\n"
+            "If you determine there is no safe framework fix, say so explicitly and make no edits.\n"
         )
 
-    def _paths_from_unified_diff(self, diff_content: str) -> List[str]:
-        paths = []
+    def _build_repair_prompt(
+        self,
+        plan: Optional[RepairPlan],
+        signal: Optional[IncidentSignal],
+        failed_attempts: Optional[list] = None,
+    ) -> str:
+        parts: list[str] = []
+
+        parts.append(
+            f"## Failure description\n"
+            f"{plan.repair_prompt if plan else 'No description available.'}\n"
+            f"Reason: {plan.reason if plan else 'Unknown'}\n"
+        )
+
+        target_paths = self._configured_source_paths(plan)
+        if target_paths:
+            parts.append(
+                "## Target files to investigate\n"
+                + "\n".join(f"- `{p}`" for p in target_paths)
+                + "\n\nUse `read_file` and `grep` to explore these files. "
+                "Do NOT guess file contents — always read first.\n"
+            )
+
+        if signal is not None:
+            evidence_parts: list[str] = []
+            for ev in signal.evidence_index[:4]:
+                try:
+                    raw = Path(ev.path).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                tail = raw[-2000:] if len(raw) > 2000 else raw
+                evidence_parts.append(
+                    f"--- {ev.kind.value} from {Path(ev.path).name} ---\n{tail}"
+                )
+            if evidence_parts:
+                parts.append(
+                    "## Evidence snippets (tail)\n"
+                    + "\n\n".join(evidence_parts)
+                    + "\n\nThese are truncated tails. Use `read_file` with the "
+                    "evidence paths above if you need more context.\n"
+                )
+
+        if failed_attempts:
+            parts.append("## Previous failed attempts\n")
+            parts.append(
+                "The following patches were already tried and failed. "
+                "Do NOT repeat the same approach.\n\n"
+            )
+            for attempt in failed_attempts:
+                parts.append(f"- Patch ID: {attempt.get('patch_id')}")
+                parts.append(
+                    f"  Error: {attempt.get('verification_log', 'Unknown')}\n"
+                )
+
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Source path helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _configured_source_paths(plan: Optional[RepairPlan]) -> List[str]:
+        paths: list[str] = []
+        root = Path.cwd().resolve()
+        for path in getattr(plan, "target_source_paths", []) or []:
+            norm = os.path.normpath(path)
+            if not norm.startswith(_SAFE_PREFIXES):
+                continue
+            candidate = (root / norm).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            if norm not in paths:
+                paths.append(norm)
+        return paths
+
+    # ------------------------------------------------------------------
+    # Git diff extraction — only captures changes made DURING the session
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _snapshot_dirty_files() -> set[str]:
+        """Return set of files with uncommitted changes (vs HEAD)."""
+        try:
+            out = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, cwd=".",
+            ).stdout.strip()
+            staged = subprocess.run(
+                ["git", "diff", "--name-only", "--cached"],
+                capture_output=True, text=True, cwd=".",
+            ).stdout.strip()
+        except Exception:
+            return set()
+        result = set()
+        if out:
+            result.update(out.splitlines())
+        if staged:
+            result.update(staged.splitlines())
+        return result
+
+    @staticmethod
+    def _extract_changes_from_git(
+        patch_id: str,
+        pre_existing: set[str],
+    ) -> Optional[RepairPatch]:
+        """Build a RepairPatch from working-tree changes made since snapshot."""
+        try:
+            diff_names = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, cwd=".",
+            ).stdout.strip()
+        except Exception:
+            return None
+
+        if not diff_names:
+            return None
+
+        all_changed = diff_names.splitlines()
+        newly_changed = [f for f in all_changed if f not in pre_existing]
+
+        target_files = [
+            f for f in newly_changed
+            if f.startswith(_SAFE_PREFIXES)
+            and not f.startswith(_FORBIDDEN_PREFIXES)
+        ]
+        if not target_files:
+            print("[RepairAgent] No new allowed file changes detected.")
+            return None
+
+        disallowed = [
+            f for f in newly_changed
+            if not f.startswith(_SAFE_PREFIXES)
+            or f.startswith(_FORBIDDEN_PREFIXES)
+        ]
+        if disallowed:
+            print(
+                "[RepairAgent] Reverting edits to disallowed files: "
+                + ", ".join(disallowed)
+            )
+            subprocess.run(
+                ["git", "checkout", "--"] + disallowed,
+                cwd=".", capture_output=True,
+            )
+
+        try:
+            diff_content = subprocess.run(
+                ["git", "diff", "HEAD", "--"] + target_files,
+                capture_output=True, text=True, cwd=".",
+            ).stdout
+        except Exception:
+            diff_content = ""
+
+        return RepairPatch(
+            patch_id=patch_id,
+            incident_fingerprint="tool_use_repair",
+            target_files=target_files,
+            diff_content=diff_content,
+            description=f"Generated by RepairAgent (tool-use) for {patch_id}",
+            file_patches=[],
+        )
+
+    # ------------------------------------------------------------------
+    # Core: run LLMAgent with FileSystemTool
+    # ------------------------------------------------------------------
+
+    async def _run_repair_agent(
+        self,
+        plan: RepairPlan,
+        signal: IncidentSignal,
+        patch_id: str,
+        failed_attempts: Optional[list] = None,
+    ) -> Optional[RepairPatch]:
+        from ms_agent.agent.llm_agent import LLMAgent
+
+        pre_existing = self._snapshot_dirty_files()
+
+        config = self._build_agent_config()
+        agent = LLMAgent(config=config, tag=f"repair-{patch_id}")
+
+        prompt = self._build_repair_prompt(plan, signal, failed_attempts)
+
+        old_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            print(f"[RepairAgent] Starting tool-use repair for {patch_id}...")
+            await agent.run(prompt)
+        except Exception as e:
+            print(f"[RepairAgent] Agent run failed: {e}")
+        finally:
+            sys.stdout = old_stdout
+            try:
+                if agent.tool_manager:
+                    await agent.cleanup_tools()
+            except Exception:
+                pass
+
+        return self._extract_changes_from_git(patch_id, pre_existing)
+
+    def generate_patch(
+        self,
+        plan: RepairPlan,
+        signal: IncidentSignal,
+        patch_id: str,
+        failed_attempts: Optional[list] = None,
+    ) -> Optional[RepairPatch]:
+        """Public sync interface — internally runs async LLMAgent."""
+        print("[RepairAgent] Asking LLM to generate patch...")
+        try:
+            return asyncio.run(
+                self._run_repair_agent(plan, signal, patch_id, failed_attempts)
+            )
+        except Exception as e:
+            print(f"[RepairAgent] Patch generation failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Legacy helpers (kept for backward compatibility)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _looks_like_unified_diff(diff_content: str) -> bool:
+        return (
+            "diff --git " in diff_content
+            or (
+                "\n--- " in f"\n{diff_content}"
+                and "\n+++ " in f"\n{diff_content}"
+                and "\n@@ " in f"\n{diff_content}"
+            )
+        )
+
+    @staticmethod
+    def _paths_from_unified_diff(diff_content: str) -> List[str]:
+        paths: list[str] = []
         patterns = (
             re.compile(r"^diff --git a/(.+?) b/(.+?)$", re.MULTILINE),
             re.compile(r"^(?:---|\+\+\+) [ab]/(.+)$", re.MULTILINE),
         )
         for pattern in patterns:
             for match in pattern.finditer(diff_content):
-                candidates = match.groups()
-                for candidate in candidates:
+                for candidate in match.groups():
                     if candidate == "/dev/null":
                         continue
                     norm = os.path.normpath(candidate)
@@ -49,8 +342,11 @@ class RepairAgent:
                         paths.append(norm)
         return paths
 
-    def _extract_json(self, reply_text: str) -> Optional[dict]:
-        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", reply_text, re.DOTALL)
+    @staticmethod
+    def _extract_json(reply_text: str) -> Optional[dict]:
+        fenced = re.search(
+            r"```(?:json)?\s*(\{.*?\})\s*```", reply_text, re.DOTALL
+        )
         candidates = [fenced.group(1)] if fenced else []
         start = reply_text.find("{")
         if start != -1:
@@ -64,240 +360,4 @@ class RepairAgent:
                 continue
             if isinstance(parsed, dict):
                 return parsed
-        return None
-
-    def _candidate_paths_from_evidence(self, signal: Optional[IncidentSignal]) -> List[str]:
-        if signal is None:
-            return []
-
-        paths = []
-        root = Path.cwd().resolve()
-        pattern = re.compile(r"\b(?:ms_agent|scripts)/[A-Za-z0-9_./-]+\.py\b")
-        for ev in signal.evidence_index:
-            try:
-                with open(ev.path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except Exception:
-                continue
-            for match in pattern.findall(content):
-                norm = os.path.normpath(match)
-                if not (norm.startswith("ms_agent/") or norm.startswith("scripts/")):
-                    continue
-                candidate = (root / norm).resolve()
-                try:
-                    candidate.relative_to(root)
-                except ValueError:
-                    continue
-                if candidate.is_symlink() or not candidate.is_file():
-                    continue
-                if norm not in paths:
-                    paths.append(norm)
-        return paths[:5]
-
-    def _source_context(self, paths: Iterable[str]) -> str:
-        sections = []
-        for path in paths:
-            if not (path.startswith("ms_agent/") or path.startswith("scripts/")):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except Exception:
-                continue
-            if len(content) > 5000:
-                content = content[:2500] + "\n# ... file truncated ...\n" + content[-2500:]
-            sections.append(f"--- SOURCE FILE {path} ---\n{content}\n")
-        if not sections:
-            return (
-                "--- SOURCE FILE CONTEXT ---\n"
-                "No framework source file was confidently identified in the evidence. "
-                "Return an empty patch unless the evidence contains enough exact existing source text.\n"
-            )
-        return "\n".join(sections)
-
-    def _configured_source_paths(self, plan: Optional[RepairPlan]) -> List[str]:
-        paths = []
-        root = Path.cwd().resolve()
-        for path in getattr(plan, "target_source_paths", []) or []:
-            norm = os.path.normpath(path)
-            if not (norm.startswith("ms_agent/") or norm.startswith("scripts/")):
-                continue
-            candidate = (root / norm).resolve()
-            try:
-                candidate.relative_to(root)
-            except ValueError:
-                continue
-            if candidate.is_symlink() or not candidate.is_file():
-                continue
-            if norm not in paths:
-                paths.append(norm)
-        return paths
-
-    def _candidate_source_paths(
-        self,
-        signal: Optional[IncidentSignal],
-        plan: Optional[RepairPlan] = None,
-    ) -> List[str]:
-        paths = self._candidate_paths_from_evidence(signal)
-        for path in self._configured_source_paths(plan):
-            if path not in paths:
-                paths.append(path)
-        if not paths:
-            print(
-                "[RepairAgent] No candidate framework source file found in evidence. "
-                "Skipping patch generation."
-            )
-        return paths
-
-    def _build_prompt(
-        self,
-        plan: Optional[RepairPlan],
-        signal: Optional[IncidentSignal],
-        failed_attempts: Optional[list] = None,
-    ) -> str:
-        prompt = (
-            "You are an expert Python developer fixing the ms_agent framework.\n"
-            f"Failure Plan: {plan.repair_prompt if plan else ''}\n"
-            f"Reason: {plan.reason if plan else ''}\n\n"
-            "Evidence Context:\n"
-        )
-
-        if signal is not None:
-            for ev in signal.evidence_index:
-                try:
-                    with open(ev.path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                        if len(content) > 2000:
-                            content = content[-2000:]
-                        prompt += f"--- {ev.kind.value} from {ev.path} ---\n{content}\n\n"
-                except Exception:
-                    pass
-
-        candidate_paths = self._candidate_source_paths(signal, plan)
-        prompt += self._source_context(candidate_paths)
-
-        if failed_attempts:
-            prompt += "--- PREVIOUS FAILED ATTEMPTS ---\n"
-            prompt += (
-                "You have already tried the following patches which failed. "
-                "Do NOT generate the exact same patch again.\n\n"
-            )
-            for attempt in failed_attempts:
-                prompt += f"Attempt Patch ID: {attempt.get('patch_id')}\n"
-                prompt += f"Generated Patch:\n{json.dumps(attempt.get('patch_content', {}), indent=2)}\n"
-                prompt += f"Verification Error:\n{attempt.get('verification_log', 'Unknown error')}\n\n"
-
-        prompt += (
-            "Please output a patch to fix this error. Format your response strictly as JSON:\n"
-            "```json\n"
-            "{\n"
-            '  "target_files": ["relative/path.py"],\n'
-            '  "diff_content": "empty string unless you are absolutely sure you can produce a complete valid unified diff",\n'
-            '  "description": "What this patch does",\n'
-            '  "file_patches": [\n'
-            '    {\n'
-            '      "path": "relative/path.py",\n'
-            '      "search_text": "exact existing text copied from SOURCE FILE CONTEXT",\n'
-            '      "replace_text": "replacement text"\n'
-            '    }\n'
-            '  ]\n'
-            "}\n"
-            "```\n"
-            "Rules:\n"
-            "- Prefer file_patches with diff_content=\"\". This is the default and safest patch format.\n"
-            "- search_text must be copied exactly from SOURCE FILE CONTEXT and must be unique in that file.\n"
-            "- Use unified diff only if you can produce a complete git-apply-compatible diff with exact line counts.\n"
-            "- Only patch files listed in SOURCE FILE CONTEXT.\n"
-            "- Do not patch benchmark task files, outputs, logs, or absolute paths.\n"
-            "- If there is no safe framework fix, return target_files=[], diff_content=\"\", file_patches=[].\n"
-        )
-        return prompt
-
-    def _to_repair_patch(
-        self,
-        parsed: dict,
-        patch_id: str,
-        signal: IncidentSignal,
-        allowed_paths: Iterable[str],
-    ) -> Optional[RepairPatch]:
-        target_files = parsed.get("target_files", [])
-        diff_content = parsed.get("diff_content", "")
-        file_patches = parsed.get("file_patches", [])
-        if not file_patches and not self._looks_like_unified_diff(diff_content):
-            print("[RepairAgent] LLM returned no applicable patch content.")
-            return None
-
-        allowed = set(allowed_paths)
-        requested_paths = set()
-        if isinstance(target_files, list):
-            requested_paths.update(str(path) for path in target_files)
-        if isinstance(file_patches, list):
-            requested_paths.update(str(fp.get("path", "")) for fp in file_patches if isinstance(fp, dict))
-        if self._looks_like_unified_diff(diff_content):
-            diff_paths = self._paths_from_unified_diff(diff_content)
-            if not diff_paths:
-                print("[RepairAgent] Unified diff did not expose target paths.")
-                return None
-            requested_paths.update(diff_paths)
-        disallowed = sorted(path for path in requested_paths if path and path not in allowed)
-        if disallowed:
-            print(
-                "[RepairAgent] LLM patch touched files outside SOURCE FILE CONTEXT: "
-                + ", ".join(disallowed)
-            )
-            return None
-
-        primary = signal.primary_incident
-        return RepairPatch(
-            patch_id=patch_id,
-            incident_fingerprint=primary.fingerprint if primary else "unknown",
-            target_files=target_files,
-            diff_content=diff_content,
-            description=parsed.get("description", "Generated by RepairAgent"),
-            file_patches=file_patches,
-        )
-
-    def generate_patch(self, plan: RepairPlan, signal: IncidentSignal, patch_id: str, failed_attempts: list = None) -> Optional[RepairPatch]:
-        if not self.llm:
-            print("[RepairAgent] No LLM available, returning empty patch.")
-            return None
-
-        candidate_paths = self._candidate_source_paths(signal, plan)
-        if not candidate_paths:
-            return None
-
-        prompt = self._build_prompt(plan, signal, failed_attempts)
-
-        messages = [
-            Message(role="system", content="You are a self-healing agent modifying a python framework."),
-            Message(role="user", content=prompt)
-        ]
-
-        try:
-            print("[RepairAgent] Asking LLM to generate patch...")
-            # Some LLMs return a generator if stream is True, ms_agent LLM wraps this differently
-            # For simplicity, we just grab text.
-            response = self.llm.generate(messages, stream=False)
-            
-            # The response object can be a string or structured message depending on the LLM implementation
-            # Let's extract text
-            reply_text = ""
-            if isinstance(response, str):
-                reply_text = response
-            elif hasattr(response, "content"):
-                reply_text = response.content
-            elif hasattr(response, "__aiter__"):
-                # if it's an async generator, this will fail in sync context, but P0 skeleton might not handle it perfectly yet.
-                pass 
-                
-            print(f"[RepairAgent] LLM replied: {reply_text[:100]}...")
-            
-            parsed = self._extract_json(reply_text)
-            if parsed:
-                return self._to_repair_patch(parsed, patch_id, signal, candidate_paths)
-            else:
-                print("[RepairAgent] Could not parse JSON from LLM response.")
-        except Exception as e:
-            print(f"[RepairAgent] LLM generation failed: {e}")
-
         return None

@@ -1,4 +1,5 @@
 import inspect
+import subprocess
 from typing import Any, Dict
 
 from ms_agent.self_improve.schemas import EvidenceKind, IncidentSignal
@@ -260,59 +261,44 @@ class SelfImproveOrchestrator:
                 
             patch_id = f"patch_{iteration}"
             failed_attempts = self.failed_attempts_by_fingerprint.get(incident_fingerprint, [])
+
+            head_before = None
+            try:
+                head_before = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    capture_output=True, text=True, cwd=".",
+                ).stdout.strip()
+            except Exception:
+                pass
+
             patch = self.repair_agent.generate_patch(plan, signal, patch_id, failed_attempts=failed_attempts)
             if not patch:
                 print("[Orchestrator] Repair agent failed to generate a patch.")
                 break
             patch.incident_fingerprint = incident_fingerprint
 
-            import subprocess
-            head_before = None
-            tracked_dirty_before = False
-            try:
-                head_before = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=".").stdout.strip()
-            except Exception:
-                pass
-            try:
-                tracked_dirty_before = (
-                    subprocess.run(["git", "diff", "--quiet"], cwd=".").returncode != 0
-                    or subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=".").returncode != 0
-                )
-            except Exception:
-                tracked_dirty_before = False
-
-            applied = self.executor.apply_patch(patch, human_approval_callback)
-            if not applied:
-                print("[Orchestrator] Patch was not applied.")
+            commit_sha = self.executor.commit_working_changes(
+                patch_id=patch.patch_id,
+                description=patch.description,
+                target_files=patch.target_files,
+            )
+            if not commit_sha:
+                print("[Orchestrator] Patch commit failed or denied by guard.")
                 if incident_fingerprint not in self.failed_attempts_by_fingerprint:
                     self.failed_attempts_by_fingerprint[incident_fingerprint] = []
                 self.failed_attempts_by_fingerprint[incident_fingerprint].append({
                     "patch_id": patch.patch_id,
                     "patch_content": patch.model_dump() if hasattr(patch, "model_dump") else patch.dict(),
-                    "verification_log": self.executor.last_error or "Patch was not applied.",
+                    "verification_log": self.executor.last_error or "Commit failed.",
                 })
                 continue
-
-            head_after = None
-            try:
-                head_after = (
-                    subprocess.run(
-                        ["git", "rev-parse", "HEAD"],
-                        capture_output=True,
-                        text=True,
-                        cwd=".",
-                    )
-                    .stdout.strip()
-                )
-            except Exception:
-                pass
 
             self.ledger.record_patch_applied(
                 iteration,
                 incident_fingerprint,
                 patch.patch_id,
                 head_before or "",
-                head_after or "",
+                commit_sha,
             )
 
             # 8. VERIFY_PATCH (Stage 1: fast local check)
@@ -347,31 +333,24 @@ class SelfImproveOrchestrator:
                 self.failed_attempts_by_fingerprint[incident_fingerprint].append({
                     "patch_id": patch.patch_id,
                     "patch_content": patch.model_dump() if hasattr(patch, "model_dump") else patch.dict(),
-                    "verification_log": verify_res.output_log if not verify_passed else remote_log
+                    "verification_log": verify_res.output_log if not verify_passed else remote_log,
                 })
 
-                # Revert broken commit if it was created
+                # Revert broken commit
                 try:
-                    head_after = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=".").stdout.strip()
-                    if tracked_dirty_before:
-                        print(
-                            "[Orchestrator] Skip rollback because tracked files were dirty before patch."
-                        )
-                    elif head_before and head_after != head_before:
-                        print(f"[Orchestrator] Reverting broken commit {head_after}")
+                    current_head = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        capture_output=True, text=True, cwd=".",
+                    ).stdout.strip()
+                    if head_before and current_head != head_before:
+                        print(f"[Orchestrator] Reverting broken commit {current_head}")
                         subprocess.run(
                             [
-                                "git",
-                                "-c",
-                                "user.name=self-improve",
-                                "-c",
-                                "user.email=self-improve@example.invalid",
-                                "revert",
-                                "--no-edit",
-                                head_after,
+                                "git", "-c", "user.name=self-improve",
+                                "-c", "user.email=self-improve@example.invalid",
+                                "revert", "--no-edit", current_head,
                             ],
-                            check=True,
-                            cwd=".",
+                            check=True, cwd=".",
                         )
                 except Exception as e:
                     print(f"[Orchestrator] Warning: Failed to revert broken commit: {e}")
