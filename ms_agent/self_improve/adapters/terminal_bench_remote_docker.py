@@ -46,6 +46,7 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
         branch: str = _DEFAULT_BRANCH,
         timeout_sec: int = _DEFAULT_TIMEOUT_SEC,
         regression_tasks: List[str] | None = None,
+        eval_batch_size: int | None = None,
     ) -> None:
         if not TASK_NAME_RE.fullmatch(task_name) or task_name in {".", ".."}:
             raise ValueError(f"Invalid task name: {task_name!r}")
@@ -55,6 +56,7 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
         self.branch = branch
         self.timeout_sec = timeout_sec
         self.regression_tasks = regression_tasks or list(_DEFAULT_REGRESSION_TASKS)
+        self.eval_batch_size = eval_batch_size
 
         self._local_output_dir = local_output_dir or str(
             _repo_root() / "outputs" / "self_improve_remote" / task_name
@@ -124,7 +126,7 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
     ) -> str:
         """Write a launcher script on the remote and return its path."""
         tasks_str = ",".join(task_names)
-        batch_size = len(task_names)
+        batch_size = self.eval_batch_size or len(task_names)
         script_file = f"{remote_work_dir}/run.sh"
 
         script_lines = [
