@@ -18,7 +18,10 @@ class CodeAgent(Agent):
                  **kwargs):
         super().__init__(config, tag, trust_remote_code, **kwargs)
         self.load_cache = kwargs.get('load_cache', False)
-        
+
+        # Check for the existence of libtorch_global_deps.so
+        self._check_torch_dependencies()
+
         # Capability gap fix: artifact_missing / task_implementation_incomplete
         # Inject a system directive to force artifact verification before task completion
         self._artifact_verification_reminder = (
@@ -75,6 +78,16 @@ class CodeAgent(Agent):
         messages = await self.execute_code(inputs, **kwargs)
         self.save_history(messages, **kwargs)
         return messages
+
+    def _check_torch_dependencies(self):
+        import os
+        import sys
+        from pathlib import Path
+
+        torch_deps_path = Path(sys.prefix) / 'lib' / 'site-packages' / 'torch' / 'lib' / 'libtorch_global_deps.so'
+        if not torch_deps_path.exists():
+            raise RuntimeError(f"The required PyTorch shared object file '{torch_deps_path}' is missing. "
+                               "Please ensure that PyTorch and its dependencies are correctly installed.")
 
     async def execute_code(self, inputs: Union[str, List[Message]],
                            **kwargs) -> List[Message]:
