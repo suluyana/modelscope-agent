@@ -1,5 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from omegaconf import DictConfig
+try:
+    from omegaconf import DictConfig
+except ImportError:
+    from ms_agent.utils.utils import install_package
+    install_package('omegaconf', 'omegaconf')
+    from omegaconf import DictConfig
 from typing import Any, List, Union
 
 from ms_agent.llm import Message
