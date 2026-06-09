@@ -388,6 +388,70 @@ class TerminalBenchRemoteDockerAdapter(RunAdapter):
             "iteration": iteration,
         }
 
+    def run_tasks_with_artifacts(
+        self,
+        tasks: List[str],
+        work_dir_suffix: str = "si_rerun",
+        local_base_dir: str | None = None,
+    ) -> Dict[str, Tuple[float, Optional[str]]]:
+        """Run tasks on remote, download artifacts, return {task: (reward, local_trial_dir)}.
+
+        Unlike run_regression() which only reads reward via SSH, this method
+        downloads result.json + agent_stdout + verifier output so the
+        collect→classify→mine pipeline can run on the artifacts locally.
+        """
+        if not tasks:
+            return {}
+
+        base_dir = local_base_dir or str(
+            _repo_root() / "outputs" / "self_improve_remote"
+        )
+        remote_work_dir = f"{self.remote_repo_dir}/outputs/{work_dir_suffix}"
+        self._ssh(f"rm -rf {remote_work_dir}/trials", timeout=15)
+        self._run_evalscope_remote(tasks, work_dir_suffix)
+
+        results: Dict[str, Tuple[float, Optional[str]]] = {}
+        for task in tasks:
+            find_cmd = (
+                f"find {remote_work_dir}/trials "
+                f"-maxdepth 1 -type d -name '{task}__*' 2>/dev/null "
+                f"| sort -r | head -1"
+            )
+            r = self._ssh(find_cmd, timeout=30)
+            trial_path = r.stdout.strip()
+            if not trial_path:
+                results[task] = (0.0, None)
+                continue
+
+            local_trial_dir = os.path.join(base_dir, task, "rerun")
+            os.makedirs(local_trial_dir, exist_ok=True)
+
+            local_result = os.path.join(local_trial_dir, "result.json")
+            if not self._scp_from_remote(
+                f"{trial_path}/result.json", local_result
+            ):
+                results[task] = (0.0, None)
+                continue
+
+            agent_dir = os.path.join(local_trial_dir, "agent")
+            os.makedirs(agent_dir, exist_ok=True)
+            self._scp_from_remote(
+                f"{trial_path}/agent/agent_stdout.txt",
+                os.path.join(agent_dir, "agent_stdout.txt"),
+            )
+
+            verifier_dir = os.path.join(local_trial_dir, "verifier")
+            os.makedirs(verifier_dir, exist_ok=True)
+            self._scp_from_remote(
+                f"{trial_path}/verifier/test-stdout.txt",
+                os.path.join(verifier_dir, "test-stdout.txt"),
+            )
+
+            reward = self._parse_reward(local_result) or 0.0
+            results[task] = (reward, local_trial_dir)
+
+        return results
+
     def run_regression(self, tasks: List[str] | None = None) -> Dict[str, float]:
         """Run regression tasks and return {task_name: reward} mapping."""
         regression = tasks or self.regression_tasks
