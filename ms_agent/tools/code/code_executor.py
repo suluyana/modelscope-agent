@@ -2,7 +2,13 @@
 import asyncio
 import json
 import socket
-from omegaconf import DictConfig
+try:
+    from omegaconf import DictConfig
+except ImportError:
+    from ms_agent.utils.utils import install_package
+    install_package('omegaconf', 'omegaconf')
+    from omegaconf import DictConfig
+
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
