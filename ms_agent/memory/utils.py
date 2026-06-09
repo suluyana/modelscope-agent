@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from omegaconf import DictConfig, OmegaConf
 
