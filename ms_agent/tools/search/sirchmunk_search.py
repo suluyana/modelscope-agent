@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Sirchmunk backend for the ``localsearch`` tool.
 

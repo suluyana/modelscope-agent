@@ -197,21 +197,9 @@ class ToolManager:
         self._init_lock = None
 
     def register_tool(self, tool: ToolBase):
-        super().register_tool(tool)  # Assuming there is a superclass method to call
-
-        # Initialize alternative strategies and suggested strategies for the registered tool
-        self._alternative_strategies[tool.name] = []  # Placeholder for actual strategies
-        self._suggested_strategies[tool.name] = set()
-
         self.extra_tools.append(tool)
 
     async def connect(self):
-        # Suggest alternative strategies upon repetitive failures
-        self._alternative_strategies = {}
-
-        # Track which strategies have been suggested already for each tool
-        self._suggested_strategies = {}
-
         if self.mcp_client and MCPClient and isinstance(self.mcp_client, MCPClient):
             self.servers = self.mcp_client
             await self.servers.add_mcp_config(self.mcp_config)
@@ -297,26 +285,6 @@ class ToolManager:
                         tool_args = json.loads(tool_args)
                     except Exception:  # noqa
                         return f'The input {tool_args} is not a valid JSON, fix your arguments and try again'
-
-                # Track tool calls to detect repetitive failures
-                if not hasattr(self, '_tool_call_history'):
-                    self._tool_call_history = {}
-                key = (tool_name, json.dumps(tool_args, sort_keys=True))
-                if key not in self._tool_call_history:
-                    self._tool_call_history[key] = 0
-                self._tool_call_history[key] += 1
-
-                # Check for repetitive calls
-                if self._tool_call_history[key] > 3:
-                    return json.dumps({
-                        'success': False,
-                        'error': 'repetitive_failure',
-                        'tool_name': tool_name,
-                        'message': 'Detected repetitive failure. Please try a different strategy.',
-                        'call_info': brief_info,
-                        'recovery_hint': self.suggest_alternative_strategy(tool_name, tool_args),
-                    }, ensure_ascii=False)
-
                 assert tool_name in self._tool_index, f'Tool name {tool_name} not found'
                 tool_ins, server_name, _ = self._tool_index[tool_name]
                 raw_args = dict(tool_args) if isinstance(tool_args, dict) else {}
@@ -443,24 +411,3 @@ class ToolManager:
         exc_tb: TracebackType | None,
     ) -> None:
         pass
-
-    def suggest_alternative_strategy(self, tool_name, tool_args):
-        # Retrieve the list of alternative strategies for the given tool
-        strategies = self._alternative_strategies.get(tool_name, [])
-
-        # Filter out the strategies that have already been suggested
-        unsuggested_strategies = [strategy for strategy in strategies if strategy not in self._suggested_strategies[tool_name]]
-
-        # If there are no more unsuggested strategies, return a generic hint
-        if not unsuggested_strategies:
-            return 'Consider changing the approach or verifying the input parameters.'
-
-        # Select a strategy (for simplicity, we'll just pick the first one)
-        selected_strategy = unsuggested_strategies[0]
-
-        # Mark the selected strategy as suggested
-        self._suggested_strategies[tool_name].add(selected_strategy)
-
-        # Return the selected strategy as a hint
-        return f'Try this alternative strategy: {selected_strategy}'
-

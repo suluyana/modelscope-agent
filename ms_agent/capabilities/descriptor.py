@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass, field
 from typing import Literal
