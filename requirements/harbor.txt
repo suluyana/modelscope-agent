@@ -16,5 +16,5 @@ pandas
 pillow
 pyyaml
 requests
-sentence-transformers
+# sentence-transformers  # REMOVED: pulls ~5GB torch+CUDA deps causing OOM in TB containers
 typing_extensions
