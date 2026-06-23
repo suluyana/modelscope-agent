@@ -1,0 +1,8 @@
+hooks:
+  enabled_sources: [native, plugin]
+  enabled_executors: [command]
+
+skills:
+  sources: []
+
+local_dir: .

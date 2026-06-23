@@ -134,6 +134,9 @@ class SkillCatalog:
                         revision=getattr(src_cfg, "revision", None),
                         subdir=getattr(src_cfg, "subdir", None),
                         enabled=getattr(src_cfg, "enabled", True),
+                        origin=getattr(src_cfg, "origin", "config"),
+                        plugin_id=getattr(src_cfg, "plugin_id", None),
+                        capability=getattr(src_cfg, "capability", None),
                     ))
         # 3b. Simple path list (backward compat)
         elif hasattr(skills_config, "path") and skills_config.path:
@@ -172,7 +175,7 @@ class SkillCatalog:
             try:
                 skills = self._materialize_and_load(source)
                 for skill in skills.values():
-                    self._register_skill(skill)
+                    self._register_skill(skill, source)
             except Exception as e:
                 logger.warning(f"Failed to load skill source {source}: {e}")
 
@@ -236,6 +239,8 @@ class SkillCatalog:
     @staticmethod
     def _infer_trust_level(skill: SkillSchema, source=None) -> str:
         """Determine trust level from the skill's source path."""
+        if source is not None and getattr(source, 'origin', None) == 'plugin':
+            return 'plugin'
         skill_path_str = str(skill.skill_path)
         builtin_str = str(BUILTIN_SKILLS_DIR)
         user_str = str(USER_SKILLS_DIR)
@@ -246,12 +251,16 @@ class SkillCatalog:
             return 'local'
         return 'community'
 
-    def _register_skill(self, skill: SkillSchema) -> None:
+    def _register_skill(self, skill: SkillSchema, source=None) -> None:
         """Register a skill; later registrations override earlier ones.
 
         Runs safety scanning (when enabled) and applies trust policy.
         """
-        skill._trust_level = self._infer_trust_level(skill)
+        skill._trust_level = self._infer_trust_level(skill, source)
+        if source is not None:
+            skill._origin = getattr(source, 'origin', 'config')
+            skill._plugin_id = getattr(source, 'plugin_id', None)
+            skill._capability = getattr(source, 'capability', None)
 
         if self._safety_scanner:
             try:

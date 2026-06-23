@@ -159,6 +159,7 @@ class LLMAgent(Agent):
 
         # Skill runtime (initialized in prepare_skills)
         self._skill_runtime: Optional[SkillRuntime] = None
+        self._plugin_runtime = None
 
         # Slash-command router for interactive input (lazily built)
         self._command_router = None
@@ -609,6 +610,8 @@ class LLMAgent(Agent):
 
         from ms_agent.hooks.bridge import CallbackToHookBridge
         from ms_agent.hooks.factory import build_hook_runtime
+        from ms_agent.plugins.runtime import PluginRuntime
+        from ms_agent.utils.workspace_context import resolve_workspace_root
 
         self.task_manager = TaskManager()
 
@@ -618,8 +621,43 @@ class LLMAgent(Agent):
             or getattr(self, 'tag', None)
             or str(uuid.uuid4())
         )
-        hook_runtime = build_hook_runtime(self.config, session_id=session_id)
+        raw_hooks = {}
+        if hasattr(self.config, 'hooks') and self.config.hooks:
+            raw_hooks = OmegaConf.to_container(self.config.hooks, resolve=True) or {}
+        enabled_executors = frozenset(
+            raw_hooks.get('enabled_executors', ['command']) or ['command'])
+        self._plugin_runtime = PluginRuntime()
+        self._plugin_runtime.start_sync(
+            str(resolve_workspace_root(self.config)),
+            session_id,
+            config=self.config,
+            enabled_executors=enabled_executors,
+        )
+        self._register_plugin_commands()
+        plugin_mcp_servers = self._plugin_runtime.load_result.mcp_servers
+        if plugin_mcp_servers:
+            from ms_agent.plugins.runtime import dedupe_mcp_server_names
+            plugin_mcp_servers = dedupe_mcp_server_names(
+                plugin_mcp_servers,
+                set(self.mcp_config.setdefault('mcpServers', {}).keys()),
+            )
+            self._plugin_runtime.load_result.mcp_servers = plugin_mcp_servers
+            self.mcp_config['mcpServers'].update(plugin_mcp_servers)
+        hook_runtime = build_hook_runtime(
+            self.config,
+            session_id=session_id,
+            plugin_hook_registries=self._plugin_runtime.load_result.hook_registries,
+        )
         mcp_rt = self.mcp_runtime
+        if mcp_rt is not None and plugin_mcp_servers:
+            from ms_agent.config.mcp_schema import ResolvedMCPConfig
+            merged_servers = {
+                state.name: dict(state.config)
+                for state in mcp_rt.list_servers()
+            }
+            merged_servers.update(plugin_mcp_servers)
+            await mcp_rt.apply_config(
+                ResolvedMCPConfig(mcp_servers=merged_servers))
 
         self.tool_manager = ToolManager(
             self.config,
@@ -751,7 +789,17 @@ class LLMAgent(Agent):
             router = CommandRouter()
             register_builtin_commands(router)
             self._command_router = router
+            self._register_plugin_commands()
         return self._command_router
+
+    def _register_plugin_commands(self) -> None:
+        if self._command_router is None or self._plugin_runtime is None:
+            return
+        from ms_agent.plugins.commands import register_plugin_commands
+        register_plugin_commands(
+            self._command_router,
+            self._plugin_runtime.load_result.command_defs,
+        )
 
     def _resolve_interactive(self, messages) -> bool:
         """Decide whether this run is an interactive session.

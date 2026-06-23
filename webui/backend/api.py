@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from pathlib import Path
 from pydantic import BaseModel, Field
 # Import shared instances
-from shared import config_manager, project_discovery, session_manager
+from shared import CONFIG_DIR, config_manager, project_discovery, session_manager
 from typing import Any, Dict, List, Optional
 
 router = APIRouter()
@@ -115,6 +115,21 @@ class MCPServer(BaseModel):
     args: Optional[List[str]] = None
     url: Optional[str] = None
     env: Optional[Dict[str, str]] = None
+
+
+class PluginInstallRequest(BaseModel):
+    source: str
+    scope: str = 'global'
+    project_path: Optional[str] = None
+    link: bool = False
+    force: bool = False
+    format: Optional[str] = None
+
+
+class PluginToggleRequest(BaseModel):
+    enabled: bool
+    scope: str = 'global'
+    project_path: Optional[str] = None
 
 
 class GlobalConfig(BaseModel):
@@ -380,6 +395,86 @@ async def remove_mcp_server(server_name: str):
     if not success:
         raise HTTPException(status_code=404, detail='Server not found')
     return {'status': 'removed'}
+
+
+def _plugin_runtime(project_path: Optional[str] = None):
+    from ms_agent.plugins.config_manager import PluginConfigManager
+    from ms_agent.plugins.runtime import PluginRuntime
+    manager = PluginConfigManager(CONFIG_DIR, project_path)
+    return PluginRuntime(config_manager=manager, global_root=CONFIG_DIR)
+
+
+@router.get('/plugins')
+async def list_plugins(project_path: Optional[str] = Query(default=None)):
+    """List installed plugins and their scanned capabilities."""
+    runtime = _plugin_runtime(project_path)
+    runtime.start_sync(project_path or os.getcwd(), 'webui')
+    return {'plugins': runtime.list_all()}
+
+
+@router.post('/plugins/install')
+async def install_plugin(request: PluginInstallRequest):
+    """Install a local/github/modelscope plugin into MS-Agent plugin storage."""
+    runtime = _plugin_runtime(request.project_path)
+    try:
+        manifest = await runtime.install(
+            request.source,
+            scope=request.scope,
+            project_path=request.project_path,
+            link=request.link,
+            force=request.force,
+            format_hint=request.format,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    runtime.start_sync(request.project_path or os.getcwd(), 'webui')
+    return {
+        'plugin_id': manifest.plugin_id,
+        'name': manifest.name,
+        'version': manifest.version,
+        'format': manifest.format.value,
+        'capabilities': sorted(manifest.capabilities),
+    }
+
+
+@router.patch('/plugins/{plugin_id}')
+async def toggle_plugin(plugin_id: str, request: PluginToggleRequest):
+    """Enable or disable a plugin record."""
+    runtime = _plugin_runtime(request.project_path)
+    try:
+        await runtime.toggle(
+            plugin_id,
+            request.enabled,
+            scope=request.scope,
+            project_path=request.project_path,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {'status': 'updated'}
+
+
+@router.post('/plugins/{plugin_id}/reload')
+async def reload_plugin(
+    plugin_id: str,
+    project_path: Optional[str] = Query(default=None),
+):
+    """Reload plugin scan state for UI/API consumers."""
+    runtime = _plugin_runtime(project_path)
+    await runtime.reload(plugin_id, project_path=project_path or os.getcwd())
+    return {'plugins': runtime.list_all()}
+
+
+@router.delete('/plugins/{plugin_id}')
+async def uninstall_plugin(
+    plugin_id: str,
+    scope: str = Query(default='global'),
+    purge: bool = Query(default=False),
+    project_path: Optional[str] = Query(default=None),
+):
+    """Remove a plugin record, optionally deleting its managed files."""
+    runtime = _plugin_runtime(project_path)
+    await runtime.uninstall(plugin_id, scope=scope, purge=purge)
+    return {'status': 'deleted'}
 
 
 # Available models endpoint
