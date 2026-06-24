@@ -61,10 +61,10 @@ class CapabilityGapMiner:
             cluster_cfg.get("target_source_paths", [])
         )
 
-        # Auto-derive target paths from evidence when trajectory signals
-        # are strong but known_clusters has no configured paths.
         trajectory_confirmed = self._is_trajectory_confirmed(traj, symptom)
-        if not target_source_paths and trajectory_confirmed:
+        # Always mine stack frames / framework paths from evidence when cluster
+        # config did not already pin targets (install-time failures have no trajectory).
+        if not target_source_paths:
             target_source_paths = self._auto_target_paths_from_evidence(
                 signal.evidence_index
             )

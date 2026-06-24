@@ -54,6 +54,7 @@ from ms_agent.self_improve.schemas import (
     RootCauseHypothesis,
     SymptomClass,
 )
+from ms_agent.self_improve.target_resolver import resolve_repair_targets
 from ms_agent.self_improve.verifier import Verifier
 
 
@@ -130,6 +131,24 @@ def _collect_gap_details(
     return clusters
 
 
+def _enrich_cluster_targets(
+    clusters: Dict[str, Dict[str, Any]],
+    *,
+    include_symptom_defaults: bool,
+) -> None:
+    """Fill target_source_paths from evidence stacks and import-site expansion."""
+    repo = _repo_root()
+    for info in clusters.values():
+        info["target_source_paths"] = resolve_repair_targets(
+            symptom_class=info.get("symptom_class", "unknown"),
+            evidence_refs=info.get("evidence_refs", []),
+            ledger_targets=info.get("target_source_paths", []),
+            symptom_defaults=_auto_derive_targets,
+            repo_root=repo,
+            include_symptom_defaults=include_symptom_defaults,
+        )
+
+
 _SYMPTOM_DEFAULT_TARGETS: Dict[str, List[str]] = {
     "tool_repeated_failure": [
         "ms_agent/tools/tool_manager.py",
@@ -173,16 +192,17 @@ def _filter_repairable_gaps(
     """Filter gaps meeting min_support and type constraints, sorted by support desc."""
     if allowed_types is None:
         allowed_types = {ImprovementType.FRAMEWORK_PATCH.value}
+    _enrich_cluster_targets(
+        clusters,
+        include_symptom_defaults=auto_derive,
+    )
     eligible = []
     for key, info in clusters.items():
         if info["support_count"] < min_support:
             continue
         if not any(t in allowed_types for t in info["improvement_types"]):
             continue
-        targets = info["target_source_paths"]
-        if not targets and auto_derive:
-            targets = _auto_derive_targets(info.get("symptom_class", "unknown"))
-            info["target_source_paths"] = targets
+        targets = info.get("target_source_paths") or []
         if not targets:
             continue
         eligible.append((key, info))
@@ -250,7 +270,15 @@ def _build_synthetic_plan(
             f"{info.get('root_cause_hypothesis', 'unknown')}. "
             f"Observed in {info['support_count']} tasks: {task_list}. "
             f"Rationale: {rationale}. "
-            f"Target files: {target_list}. "
+            f"Target files (stack order + related sites): {target_list}. "
+        )
+        if symptom == "dependency_missing":
+            repair_prompt += (
+                "This is a missing-module / import failure. Fix EVERY bare import "
+                "of the missing module across the listed files and any others found "
+                "via grep — follow import-chain order (earliest frame first). "
+            )
+        repair_prompt += (
             "Generate a generalizable framework fix that does NOT hardcode "
             "any task-specific logic."
         )
@@ -271,27 +299,102 @@ def _build_synthetic_plan(
 # Remote verification helpers
 # ---------------------------------------------------------------------------
 
-def _run_regression(
+def _run_remote_tasks(
     adapter_type: str,
     remote_host: str,
     remote_repo_dir: str,
-    regression_tasks: List[str],
+    tasks: List[str],
+    *,
+    work_dir_suffix: str,
+    batch_size: int = 8,
 ) -> Dict[str, float]:
-    """Push code to remote and run regression tasks."""
-    if adapter_type != "remote_docker":
+    """Push code to remote and run tasks; return task -> reward."""
+    if adapter_type != "remote_docker" or not tasks:
         return {}
     from ms_agent.self_improve.adapters.terminal_bench_remote_docker import (
         TerminalBenchRemoteDockerAdapter,
     )
 
     adapter = TerminalBenchRemoteDockerAdapter(
-        task_name="regression",
+        task_name=tasks[0],
         remote_host=remote_host,
         remote_repo_dir=remote_repo_dir,
-        regression_tasks=regression_tasks,
+        eval_batch_size=batch_size,
     )
     adapter.sync_code_to_remote()
-    return adapter.run_regression(regression_tasks)
+    raw = adapter.run_tasks_with_artifacts(tasks, work_dir_suffix=work_dir_suffix)
+    return {task_id: reward for task_id, (reward, _) in raw.items()}
+
+
+def _verify_patch_on_remote(
+    adapter_type: str,
+    remote_host: str,
+    remote_repo_dir: str,
+    affected_tasks: List[str],
+    regression_tasks: List[str],
+    *,
+    batch_size: int = 8,
+) -> Tuple[bool, List[str], Dict[str, float]]:
+    """Verify patch: affected tasks first, then regression controls.
+
+    Returns (passed, failed_task_ids, rewards_by_task).
+    """
+    rewards: Dict[str, float] = {}
+    affected = list(dict.fromkeys(t for t in affected_tasks if t))
+    regression = [
+        t for t in regression_tasks
+        if t and t not in affected
+    ]
+
+    if affected:
+        print(f"[repair] Verifying affected tasks first: {affected}")
+        affected_rewards = _run_remote_tasks(
+            adapter_type,
+            remote_host,
+            remote_repo_dir,
+            affected,
+            work_dir_suffix="si_verify_affected",
+            batch_size=batch_size,
+        )
+        rewards.update(affected_rewards)
+        failed = [t for t in affected if affected_rewards.get(t, 0.0) != 1.0]
+        if failed:
+            return False, failed, rewards
+
+    if regression:
+        print(f"[repair] Running regression controls: {regression}")
+        regression_rewards = _run_remote_tasks(
+            adapter_type,
+            remote_host,
+            remote_repo_dir,
+            regression,
+            work_dir_suffix="si_remote_regression",
+            batch_size=batch_size,
+        )
+        rewards.update(regression_rewards)
+        failed = [t for t in regression if regression_rewards.get(t, 0.0) != 1.0]
+        if failed:
+            return False, failed, rewards
+
+    return True, [], rewards
+
+
+def _run_regression(
+    adapter_type: str,
+    remote_host: str,
+    remote_repo_dir: str,
+    regression_tasks: List[str],
+    batch_size: int = 8,
+) -> Dict[str, float]:
+    """Push code to remote and run regression tasks (legacy helper)."""
+    return _run_remote_tasks(
+        adapter_type,
+        remote_host,
+        remote_repo_dir,
+        regression_tasks,
+        work_dir_suffix="si_remote_regression",
+        batch_size=batch_size,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +541,7 @@ def _apply_patches(
     remote_repo_dir: str,
     regression_tasks: List[str],
     report_path: Path,
+    batch_size: int = 8,
 ) -> Tuple[int, List[str]]:
     """Apply patches for eligible clusters. Returns (patches_applied, affected_task_ids)."""
     patches_applied = 0
@@ -490,23 +594,35 @@ def _apply_patches(
             continue
         head_after = commit_sha
 
-        if adapter_type == "remote_docker" and regression_tasks:
-            print(f"[repair] Running regression: {regression_tasks}")
-            regression_results = _run_regression(
-                adapter_type, remote_host, remote_repo_dir, regression_tasks,
+        if adapter_type == "remote_docker" and (
+            info.get("task_ids") or regression_tasks
+        ):
+            cluster_affected = list(info.get("task_ids", []))
+            passed, failed_tasks, verify_rewards = _verify_patch_on_remote(
+                adapter_type,
+                remote_host,
+                remote_repo_dir,
+                affected_tasks=cluster_affected,
+                regression_tasks=regression_tasks,
+                batch_size=batch_size,
             )
-            failed_regression = [
-                t for t, r in regression_results.items() if r != 1.0
-            ]
-            if failed_regression:
-                print(f"[repair] Regression failed: {failed_regression}")
+            if not passed:
+                phase = (
+                    "affected_tasks_failed"
+                    if any(t in cluster_affected for t in failed_tasks)
+                    else "regression_failed"
+                )
+                print(f"[repair] Remote verification failed ({phase}): {failed_tasks}")
                 _revert_commit(head_before, head_after)
                 _append_report(
-                    report_path, cluster_key, info, "regression_failed", run_id,
-                    extra={"failed_tasks": failed_regression},
+                    report_path, cluster_key, info, phase, run_id,
+                    extra={
+                        "failed_tasks": failed_tasks,
+                        "rewards": verify_rewards,
+                    },
                 )
                 continue
-            print("[repair] Regression passed.")
+            print("[repair] Remote verification passed (affected + regression).")
 
         print(f"[repair] Patch applied successfully: {head_after}")
         patches_applied += 1
@@ -741,6 +857,7 @@ def main() -> None:
             remote_repo_dir=args.remote_repo_dir,
             regression_tasks=regression_tasks,
             report_path=report_path,
+            batch_size=args.batch_size,
         )
         total_patches += patches_applied
 

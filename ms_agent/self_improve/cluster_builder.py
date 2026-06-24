@@ -39,7 +39,12 @@ def discover_runledger_files(root: Path) -> List[Path]:
     return sorted(root.rglob("runledger.jsonl"))
 
 
-def extract_framework_paths(evidence_paths: Iterable[str], repo_root: Optional[Path] = None) -> List[str]:
+def extract_framework_paths(
+    evidence_paths: Iterable[str],
+    repo_root: Optional[Path] = None,
+    *,
+    max_paths: int = 8,
+) -> List[str]:
     paths: List[str] = []
     root = repo_root or Path.cwd()
     for evidence_path in evidence_paths:
@@ -56,7 +61,7 @@ def extract_framework_paths(evidence_paths: Iterable[str], repo_root: Optional[P
                 continue
             if norm not in paths:
                 paths.append(norm)
-    return paths[:8]
+    return paths[:max_paths]
 
 
 def build_known_clusters(
