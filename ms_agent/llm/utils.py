@@ -23,6 +23,30 @@ class Tool(TypedDict, total=False):
     parameters: Dict[str, Any] = dict()
 
 
+def collect_response(response):
+    """Normalize an LLM ``generate()`` return value to a single complete
+    :class:`Message`.
+
+    ``LLM.generate()`` returns either a ``Message`` (non-streaming) or a
+    ``Generator[Message, None, None]`` (streaming).  In the streaming case
+    the generator yields progressively accumulated ``Message`` objects and
+    the last one contains the full response.  This helper transparently
+    consumes the generator so callers that only need the final result can
+    work identically regardless of the ``stream`` config.
+
+    Usage::
+
+        response = collect_response(llm.generate(messages))
+        text = response.content
+    """
+    if isinstance(response, Message):
+        return response
+    msg = None
+    for msg in response:
+        pass
+    return msg
+
+
 @dataclass
 class Message:
     role: Literal['system', 'user', 'assistant', 'tool']
@@ -61,11 +85,16 @@ class Message:
     cached_tokens: int = 0
     # tokens used to create new cache (explicit cache only, billed at higher rate like 1.25x)
     cache_creation_input_tokens: int = 0
+    # reasoning/thinking tokens (subset of completion_tokens for thinking models)
+    reasoning_tokens: int = 0
 
     api_calls: int = 1
 
     # role=tool: extra payload for UIs / SSE only; omitted from LLM API via to_dict_clean().
     tool_detail: Optional[str] = None
+
+    # Hook attachments for UI / LLM condensation; omitted from to_dict_clean().
+    hook_attachments: List[Any] = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
@@ -94,6 +123,7 @@ class Message:
             'prompt_tokens',
             'api_calls',
             'tool_detail',
+            'hook_attachments',
             'searching_detail',
             'search_result',
             '_responses_output_items',
@@ -117,6 +147,7 @@ class ToolResult:
     resources: List[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)
     tool_detail: Optional[str] = None
+    hook_attachments: List[Any] = field(default_factory=list)
 
     @staticmethod
     def from_raw(raw):
@@ -131,9 +162,13 @@ class ToolResult:
                 text=str(model_text),
                 resources=raw.get('resources', []),
                 tool_detail=None if td is None else str(td),
+                hook_attachments=raw.get('hook_attachments', []),
                 extra={
                     k: v
                     for k, v in raw.items()
-                    if k not in ['text', 'resources', 'result', 'tool_detail']
+                    if k not in [
+                        'text', 'resources', 'result', 'tool_detail',
+                        'hook_attachments',
+                    ]
                 })
         raise TypeError('tool_call_result must be str or dict')

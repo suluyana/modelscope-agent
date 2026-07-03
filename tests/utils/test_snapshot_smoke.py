@@ -281,7 +281,6 @@ class TestLLMAgentSnapshotInterface(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             agent = self._make_agent(td)
-            h = take_snapshot(td, 'snap', message_count=2)
             messages = [
                 Message(role='system', content='sys'),
                 Message(role='user', content='task1'),
@@ -289,6 +288,8 @@ class TestLLMAgentSnapshotInterface(unittest.TestCase):
                 Message(role='user', content='task2'),
             ]
             save_history(td, 'smoke-test', agent.config, messages)
+            h = take_snapshot(td, 'snap', message_count=2)
+            self.assertIsNotNone(h)
 
             ok, truncated = agent.rollback(h)
             self.assertTrue(ok)
@@ -302,13 +303,14 @@ class TestLLMAgentSnapshotInterface(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             agent = self._make_agent(td)
-            h = take_snapshot(td, 'snap', message_count=1)
             save_history(
                 td, 'smoke-test', agent.config, [
                     Message(role='system', content='sys'),
                     Message(role='user', content='task1'),
                     Message(role='assistant', content='stale'),
                 ])
+            h = take_snapshot(td, 'snap', message_count=1)
+            self.assertIsNotNone(h)
 
             agent.rollback(h)
             stale = [

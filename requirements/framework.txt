@@ -1,4 +1,5 @@
 aiohttp
+croniter>=1.3.0
 dotenv
 edge_tts
 faiss-cpu
@@ -6,7 +7,7 @@ json5
 markdown
 matplotlib
 mcp
-modelscope
+modelscope>=1.35.2
 moviepy
 numpy
 omegaconf
@@ -14,6 +15,7 @@ openai
 pandas
 pillow
 pyyaml
+pytz
 requests
 sentence-transformers
 typing_extensions
