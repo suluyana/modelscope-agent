@@ -116,9 +116,13 @@ class PermissionConfig:
         whitelist = tuple(d.get('whitelist', ()))
         ask_rules = tuple(d.get('ask_rules', ()))
         user_blacklist = tuple(d.get('blacklist', ()))
-        blacklist = _DEFAULT_BLACKLIST + tuple(
-            p for p in user_blacklist if p not in _DEFAULT_BLACKLIST
-        )
+        if d.get('no_default_blacklist', False):
+            # Container / sandbox mode: strip built-in network blocks
+            blacklist = user_blacklist
+        else:
+            blacklist = _DEFAULT_BLACKLIST + tuple(
+                p for p in user_blacklist if p not in _DEFAULT_BLACKLIST
+            )
 
         safety_raw = d.get('safety_rules', {})
         # Merge directory configs from top level into safety config
