@@ -43,6 +43,7 @@ MANIFEST
 *.spec
 release.sh
 build.sh
+scripts/tb21-bench.sh
 *.html
 
 # Installer logs
