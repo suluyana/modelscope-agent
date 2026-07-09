@@ -72,12 +72,10 @@ class RepetitionGuardCallback(Callback):
 
     def __init__(self, config: DictConfig) -> None:
         super().__init__(config)
-        guard_cfg = getattr(config, "repetition_guard", None)
-        if guard_cfg is None:
-            guard_cfg = {}
-        self.threshold: int = int(getattr(guard_cfg, "threshold", _DEFAULT_THRESHOLD))
-        self.lookback: int = int(getattr(guard_cfg, "lookback_rounds", _DEFAULT_LOOKBACK))
-        self.max_warnings: int = int(getattr(guard_cfg, "max_warnings", _DEFAULT_MAX_WARNINGS))
+        guard_cfg = getattr(config, "repetition_guard", None) or {}
+        self.threshold: int = int(guard_cfg.get("threshold", _DEFAULT_THRESHOLD))
+        self.lookback: int = int(guard_cfg.get("lookback_rounds", _DEFAULT_LOOKBACK))
+        self.max_warnings: int = int(guard_cfg.get("max_warnings", _DEFAULT_MAX_WARNINGS))
         self._warnings_given: int = 0
         self._warned_keys: set[str] = set()
 

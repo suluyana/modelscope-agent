@@ -166,7 +166,8 @@ def take_snapshot(output_dir: str,
         logger.warning_once('[snapshot] git not found — snapshots disabled.')
         return None
     except subprocess.CalledProcessError as e:
-        logger.warning(f'[snapshot] git error: {e.stderr.strip()}')
+        stderr = (e.stderr or '').strip()
+        logger.warning(f'[snapshot] git error: {stderr or e}')
         return None
     except Exception as e:
         logger.warning(f'[snapshot] unexpected error: {e}')
@@ -230,6 +231,13 @@ def restore_snapshot(output_dir: str, commit_hash: str) -> tuple[bool, int]:
         meta = _load_meta(output_dir)
         message_count = meta.get(commit_hash, {}).get('message_count', 0)
         return True, message_count
+    except FileNotFoundError:
+        logger.warning_once('[snapshot] git not found — snapshots disabled.')
+        return False, 0
     except subprocess.CalledProcessError as e:
-        logger.warning(f'[snapshot] restore failed: {e.stderr.strip()}')
+        stderr = (e.stderr or '').strip()
+        logger.warning(f'[snapshot] restore failed: {stderr or e}')
+        return False, 0
+    except Exception as e:
+        logger.warning(f'[snapshot] unexpected restore error: {e}')
         return False, 0
