@@ -34,13 +34,15 @@ class PermissionResponse:
 
 
 class PermissionHandler(Protocol):
+
     async def ask(
         self,
         tool_name: str,
         tool_args: dict[str, Any],
         context: str,
         suggestions: list[str] | None = None,
-    ) -> PermissionResponse: ...
+    ) -> PermissionResponse:
+        ...
 
 
 class AutoPermissionHandler:
@@ -88,7 +90,8 @@ class CLIPermissionHandler:
         print(f'{"="*60}', file=sys.stderr)
 
         loop = asyncio.get_running_loop()
-        choice = await loop.run_in_executor(None, lambda: input('Choice [y/s/a/e/n]: ').strip().lower())
+        choice = await loop.run_in_executor(
+            None, lambda: input('Choice [y/s/a/e/n]: ').strip().lower())
 
         if choice == 's':
             return PermissionResponse(
@@ -127,7 +130,9 @@ class CLIPermissionHandler:
 
 class EventEmitter(Protocol):
     """Protocol for pushing events to the frontend."""
-    def emit(self, event: dict[str, Any]) -> None: ...
+
+    def emit(self, event: dict[str, Any]) -> None:
+        ...
 
 
 class WebPermissionHandler:
@@ -155,12 +160,18 @@ class WebPermissionHandler:
         self._pending[request_id] = future
 
         self._event_emitter.emit({
-            'type': 'permission_request',
-            'request_id': request_id,
-            'tool_name': tool_name,
-            'tool_args': tool_args,
-            'context': context,
-            'suggestions': suggestions or [],
+            'type':
+            'permission_request',
+            'request_id':
+            request_id,
+            'tool_name':
+            tool_name,
+            'tool_args':
+            tool_args,
+            'context':
+            context,
+            'suggestions':
+            suggestions or [],
             'options': [a.value for a in PermissionAction],
         })
 

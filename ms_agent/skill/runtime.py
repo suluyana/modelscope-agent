@@ -43,9 +43,7 @@ class SkillRuntime:
     def version(self) -> int:
         return self._version
 
-    def set_system_content_builder(
-        self, builder: Callable[[], str]
-    ) -> None:
+    def set_system_content_builder(self, builder: Callable[[], str]) -> None:
         self._system_content_builder = builder
 
     # -- toggle --
@@ -109,9 +107,7 @@ class SkillRuntime:
     def needs_refresh(self) -> bool:
         return self._version != self._last_applied_version
 
-    def maybe_refresh_system_prompt(
-        self, messages: list
-    ) -> bool:
+    def maybe_refresh_system_prompt(self, messages: list) -> bool:
         """Rebuild messages[0] if skill state changed since last apply.
 
         Uses _system_content_builder (injected by LLMAgent) to fully

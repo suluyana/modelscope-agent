@@ -14,7 +14,8 @@ from typing import Any, Literal, Sequence
 from .config import SafetyConfig
 from .matcher import PermissionMatcher
 from .path_validator import validate_path
-from .shell_validator import PathSafetyConfig, SafetyDecision, ShellPathValidator
+from .shell_validator import (PathSafetyConfig, SafetyDecision,
+                              ShellPathValidator)
 
 
 class SafetyGuard:
@@ -39,24 +40,28 @@ class SafetyGuard:
             allowed_directories=tuple(self._allowed_dirs),
             read_only_directories=tuple(self._read_only_dirs),
             workspace_root=workspace_root,
+            dangerous_removal_paths=tuple(config.dangerous_removal_paths),
         )
         self._shell_validator = ShellPathValidator(
             allowed_dirs=self._allowed_dirs,
             safety_config=path_safety_cfg,
         )
 
-    def check(self, tool_name: str, tool_args: dict[str, Any]) -> SafetyDecision:
+    def check(self, tool_name: str, tool_args: dict[str,
+                                                    Any]) -> SafetyDecision:
         # 1. Generic safety rules
         for rule in self._config.patterns:
             if self._matcher.match_with_content(rule, tool_name, tool_args):
-                return SafetyDecision(action='deny', reason=f'Blocked by safety rule: {rule}')
+                return SafetyDecision(
+                    action='deny', reason=f'Blocked by safety rule: {rule}')
 
         # 2. Tool-specific checks
         if tool_name.endswith('---shell_executor'):
             command = tool_args.get('command', '')
             return self._shell_validator.check(command)
 
-        if tool_name.endswith('---write_file') or tool_name.endswith('---edit_file'):
+        if tool_name.endswith('---write_file') or tool_name.endswith(
+                '---edit_file'):
             return self._check_file_path(tool_args.get('path', ''), 'write')
 
         if tool_name.endswith('---read_file'):
@@ -77,7 +82,8 @@ class SafetyGuard:
         # 3. No rule matched → allow
         return SafetyDecision(action='allow', reason='No safety rule matched')
 
-    def _check_file_path(self, path: str, op_type: Literal['read', 'write']) -> SafetyDecision:
+    def _check_file_path(self, path: str,
+                         op_type: Literal['read', 'write']) -> SafetyDecision:
         if not path:
             return SafetyDecision(action='deny', reason='Empty file path')
 
@@ -93,8 +99,16 @@ class SafetyGuard:
                     )
 
         cwd = self._workspace_root or os.getcwd()
-        result = validate_path(path, cwd, self._allowed_dirs, op_type, read_only_dirs=self._read_only_dirs)
+        result = validate_path(
+            path,
+            cwd,
+            self._allowed_dirs,
+            op_type,
+            read_only_dirs=self._read_only_dirs)
         if not result.allowed:
-            return SafetyDecision(action=result.action, reason=result.reason, category=result.category)
+            return SafetyDecision(
+                action=result.action,
+                reason=result.reason,
+                category=result.category)
 
         return SafetyDecision(action='allow', reason='Path validation passed')

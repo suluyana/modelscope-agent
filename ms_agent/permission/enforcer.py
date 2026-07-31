@@ -6,16 +6,13 @@ the PermissionHandler for interactive user confirmation.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from .config import PermissionConfig
-from .handler import (
-    AutoPermissionHandler,
-    PermissionAction,
-    PermissionHandler,
-    PermissionResponse,
-)
+from .handler import (AutoPermissionHandler, PermissionAction,
+                      PermissionHandler, PermissionResponse)
 from .matcher import PermissionMatcher
 from .memory import PermissionMemory
 from .suggestions import generate_suggestions
@@ -41,6 +38,24 @@ class PermissionEnforcer:
         self._handler = handler or AutoPermissionHandler()
         self._memory = memory or PermissionMemory()
         self._matcher = PermissionMatcher()
+        # Parallel tool calls (asyncio.gather in ToolManager.parallel_call_tool)
+        # would otherwise invoke the interactive handler concurrently — N
+        # prompts fighting over one terminal deadlocks. Serialize asks with a
+        # lock created lazily per running loop (the per-turn TUI uses a fresh
+        # loop each turn, so a single init-time Lock would bind to the wrong one).
+        self._ask_lock: asyncio.Lock | None = None
+        self._ask_lock_loop = None
+
+    def _ask_lock_for_loop(self) -> 'asyncio.Lock':
+        loop = asyncio.get_running_loop()
+        if self._ask_lock is None or self._ask_lock_loop is not loop:
+            self._ask_lock = asyncio.Lock()
+            self._ask_lock_loop = loop
+        return self._ask_lock
+
+    async def _serialized_ask(self, **kwargs) -> PermissionResponse:
+        async with self._ask_lock_for_loop():
+            return await self._handler.ask(**kwargs)
 
     async def check(
         self,
@@ -59,7 +74,7 @@ class PermissionEnforcer:
 
         if force_decision and force_decision.action == 'ask':
             suggestions = generate_suggestions(tool_name, tool_args)
-            response = await self._handler.ask(
+            response = await self._serialized_ask(
                 tool_name=tool_name,
                 tool_args=tool_args,
                 context=force_decision.reason or '',
@@ -69,7 +84,9 @@ class PermissionEnforcer:
 
         # 2. Auto / strict mode → allow (safety handled by SafetyGuard + ask_resolver)
         if self._config.mode in ('auto', 'strict'):
-            return PermissionDecision(action='allow', reason=f'{self._config.mode.capitalize()} mode')
+            return PermissionDecision(
+                action='allow',
+                reason=f'{self._config.mode.capitalize()} mode')
 
         # 3. Whitelist → allow
         for pattern in self._config.whitelist:
@@ -86,9 +103,9 @@ class PermissionEnforcer:
                 reason='Allowed by remembered permission',
             )
 
-        # 5. Ask user via handler
+        # 5. Ask user via handler (serialized against parallel tool calls)
         suggestions = generate_suggestions(tool_name, tool_args)
-        response = await self._handler.ask(
+        response = await self._serialized_ask(
             tool_name=tool_name,
             tool_args=tool_args,
             context='',
@@ -104,7 +121,8 @@ class PermissionEnforcer:
         tool_args: dict[str, Any],
     ) -> PermissionDecision:
         if response.action == PermissionAction.ALLOW_ONCE:
-            return PermissionDecision(action='allow', reason='User allowed once')
+            return PermissionDecision(
+                action='allow', reason='User allowed once')
 
         if response.action == PermissionAction.ALLOW_SESSION:
             pattern = response.pattern or tool_name

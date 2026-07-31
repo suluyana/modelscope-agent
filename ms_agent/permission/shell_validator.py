@@ -17,27 +17,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
-from .path_extractors import (
-    ExtractorEntry,
-    build_extractor_registry,
-    extract_find_exec_commands,
-    find_uses_delete,
-)
-from .path_validator import (
-    PathValidationResult,
-    is_dangerous_removal_path,
-    validate_path,
-)
+from .path_extractors import (ExtractorEntry, build_extractor_registry,
+                              extract_find_exec_commands, find_uses_delete)
+from .path_validator import (PathValidationResult, is_dangerous_removal_path,
+                             validate_path)
 from .sed_validator import check_sed_expression_safety, is_sed_read_only
 from .wrapper_strip import strip_safe_wrappers
 
 _PROCESS_INPUT_SUB = re.compile(r'<\s*\(')
 _PROCESS_OUTPUT_SUB = re.compile(r'>\s*\(')
-_REDIRECT_PATTERN = re.compile(
-    r'(?:&>>|&>|>>|>\||>)'
-    r'\s*'
-    r'(\S+)'
-)
+_REDIRECT_PATTERN = re.compile(r'(?:&>>|&>|>>|>\||>)'
+                               r'\s*'
+                               r'(\S+)')
 _FD_REDIRECT = re.compile(r'^\d*>&\d+$')
 _MAX_SUBSTITUTION_DEPTH = 16
 
@@ -55,6 +46,7 @@ class PathSafetyConfig:
     allowed_directories: tuple[str, ...] = ()
     read_only_directories: tuple[str, ...] = ()
     workspace_root: str | None = None
+    dangerous_removal_paths: tuple[str, ...] = ()
 
 
 class ShellPathValidator:
@@ -85,25 +77,29 @@ class ShellPathValidator:
         if len(command) > self._config.max_command_chars:
             return SafetyDecision(
                 action='deny',
-                reason=f'Command exceeds max length ({self._config.max_command_chars})',
+                reason=
+                f'Command exceeds max length ({self._config.max_command_chars})',
             )
 
         # 1. Process substitution
         if _PROCESS_OUTPUT_SUB.search(command):
             return SafetyDecision(
                 action='ask',
-                reason='Command contains output process substitution >(…) — may bypass path validation',
+                reason=
+                'Command contains output process substitution >(…) — may bypass path validation',
                 category='process_output_sub',
             )
         if _PROCESS_INPUT_SUB.search(command):
             return SafetyDecision(
                 action='ask',
-                reason='Command contains input process substitution <(…) — cannot statically analyse',
+                reason=
+                'Command contains input process substitution <(…) — cannot statically analyse',
                 category='process_input_sub',
             )
 
         # 2. Command substitution — recursively validate inner commands
-        substitution_result = self._check_command_substitutions(command, _depth=_depth)
+        substitution_result = self._check_command_substitutions(
+            command, _depth=_depth)
         if substitution_result is not None:
             return substitution_result
 
@@ -122,11 +118,10 @@ class ShellPathValidator:
             try:
                 tokens = shlex.split(sub_cmd)
             except ValueError:
-                # If parsing fails, check if it's a comment with unmatched quotes
-                if stripped.startswith('#'):
-                    continue
-                # Otherwise, ask for confirmation (could be command injection)
-                return SafetyDecision(action='ask', reason=f'Failed to parse command: {sub_cmd}', category='parse_failure')
+                return SafetyDecision(
+                    action='ask',
+                    reason=f'Failed to parse command: {sub_cmd}',
+                    category='parse_failure')
 
             if not tokens:
                 continue
@@ -193,13 +188,15 @@ class ShellPathValidator:
     ) -> SafetyDecision:
         entry = self._extractors.get(base_cmd)
         if entry is None:
-            return SafetyDecision(action='allow', reason=f'Unregistered command: {base_cmd}')
+            return SafetyDecision(
+                action='allow', reason=f'Unregistered command: {base_cmd}')
 
         # Command-level validator (e.g. mv/cp with flags)
         if entry.command_validator is not None and base_cmd != 'find':
             err = entry.command_validator(args)
             if err:
-                return SafetyDecision(action='ask', reason=err, category='command_validator')
+                return SafetyDecision(
+                    action='ask', reason=err, category='command_validator')
 
         # sed special handling
         if base_cmd == 'sed':
@@ -210,7 +207,8 @@ class ShellPathValidator:
 
         paths = entry.extractor(args)
         if not paths:
-            return SafetyDecision(action='allow', reason=f'{base_cmd}: no paths to validate')
+            return SafetyDecision(
+                action='allow', reason=f'{base_cmd}: no paths to validate')
 
         return self._validate_paths(paths, entry.op_type, base_cmd, cwd=cwd)
 
@@ -248,12 +246,14 @@ class ShellPathValidator:
         if entry.command_validator is not None:
             err = entry.command_validator(args)
             if err:
-                return SafetyDecision(action='ask', reason=err, category='command_validator')
+                return SafetyDecision(
+                    action='ask', reason=err, category='command_validator')
 
         op_type = 'write' if find_uses_delete(args) else entry.op_type
         paths = entry.extractor(args)
         if not paths:
-            return SafetyDecision(action='allow', reason='find: no paths to validate')
+            return SafetyDecision(
+                action='allow', reason='find: no paths to validate')
 
         return self._validate_paths(paths, op_type, 'find', cwd=cwd)
 
@@ -296,7 +296,8 @@ class ShellPathValidator:
 
         for path in paths:
             # Dangerous removal check for rm/rmdir
-            if cmd_name in ('rm', 'rmdir') and is_dangerous_removal_path(path):
+            if cmd_name in ('rm', 'rmdir') and is_dangerous_removal_path(
+                    path, self._config.dangerous_removal_paths):
                 return SafetyDecision(
                     action='deny',
                     reason=f'Dangerous removal path: {path}',
@@ -304,9 +305,13 @@ class ShellPathValidator:
 
             result = validate_path(path, effective_cwd, self._allowed_dirs, op_type, read_only_dirs=self._read_only_dirs)
             if not result.allowed:
-                return SafetyDecision(action=result.action, reason=result.reason, category=result.category)
+                return SafetyDecision(
+                    action=result.action,
+                    reason=result.reason,
+                    category=result.category)
 
-        return SafetyDecision(action='allow', reason=f'{cmd_name}: all paths validated')
+        return SafetyDecision(
+            action='allow', reason=f'{cmd_name}: all paths validated')
 
     def _check_redirects(self, sub_cmd: str) -> SafetyDecision:
         for match in _REDIRECT_PATTERN.finditer(sub_cmd):
@@ -318,15 +323,22 @@ class ShellPathValidator:
             if '$' in target or '%' in target:
                 return SafetyDecision(
                     action='deny',
-                    reason=f'Redirect target contains variable expansion: {target}',
+                    reason=
+                    f'Redirect target contains variable expansion: {target}',
                 )
 
             result = validate_path(
-                target, self._workspace_root, self._allowed_dirs, 'create',
+                target,
+                self._workspace_root,
+                self._allowed_dirs,
+                'create',
                 read_only_dirs=self._read_only_dirs,
             )
             if not result.allowed:
-                return SafetyDecision(action=result.action, reason=result.reason, category=result.category)
+                return SafetyDecision(
+                    action=result.action,
+                    reason=result.reason,
+                    category=result.category)
 
         return SafetyDecision(action='allow', reason='Redirects OK')
 
@@ -364,7 +376,8 @@ def _extract_command_substitutions(command: str) -> list[str]:
             if chars[i + 1] == '{':
                 body, end = _read_brace_expansion(chars, i + 2)
                 if body is None:
-                    raise ValueError('Unclosed parameter expansion in command substitution')
+                    raise ValueError(
+                        'Unclosed parameter expansion in command substitution')
                 bodies.extend(_extract_command_substitutions(body))
                 i = end
                 continue
@@ -372,7 +385,8 @@ def _extract_command_substitutions(command: str) -> list[str]:
                 if i + 2 < len(chars) and chars[i + 2] == '(':
                     body, end = _read_delimited_body(chars, i + 3, '(', ')')
                     if body is None:
-                        raise ValueError('Unclosed arithmetic expansion in command')
+                        raise ValueError(
+                            'Unclosed arithmetic expansion in command')
                     i = end
                     continue
                 body, end = _read_delimited_body(chars, i + 2, '(', ')')

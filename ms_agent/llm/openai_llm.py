@@ -10,8 +10,6 @@ from openai.types.chat.chat_completion_message_tool_call import (
     ChatCompletionMessageToolCall, Function)
 from typing import Any, Dict, Generator, Iterable, List, Optional
 
-import httpx
-import json
 from ms_agent.llm import LLM
 from ms_agent.llm.utils import Message, Tool, ToolCall
 from ms_agent.utils import (MAX_CONTINUE_RUNS, assert_package_exist,
@@ -74,10 +72,17 @@ class OpenAI(LLM):
         self.model: str = config.llm.model
         self.max_continue_runs = getattr(config.llm, 'max_continue_runs',
                                          None) or MAX_CONTINUE_RUNS
+        # Resolution: explicit arg -> config field -> env var -> service
+        # default. The env fallback keeps `service: openai` working with a
+        # `.env` that only sets OPENAI_BASE_URL/OPENAI_API_KEY (matching the
+        # provider-router CredentialResolver), instead of silently hitting the
+        # real OpenAI endpoint.
+        import os
         base_url = base_url or getattr(
-            config.llm, 'openai_base_url',
-            None) or get_service_config('openai').base_url
-        api_key = api_key or getattr(config.llm, 'openai_api_key', None)
+            config.llm, 'openai_base_url', None) or os.environ.get(
+                'OPENAI_BASE_URL') or get_service_config('openai').base_url
+        api_key = api_key or getattr(config.llm, 'openai_api_key',
+                                     None) or os.environ.get('OPENAI_API_KEY')
 
         self.client = openai.OpenAI(
             api_key=api_key,

@@ -165,9 +165,11 @@ class ToolResult:
                 hook_attachments=raw.get('hook_attachments', []),
                 extra={
                     k: v
-                    for k, v in raw.items()
-                    if k not in [
-                        'text', 'resources', 'result', 'tool_detail',
+                    for k, v in raw.items() if k not in [
+                        'text',
+                        'resources',
+                        'result',
+                        'tool_detail',
                         'hook_attachments',
                     ]
                 })

@@ -265,7 +265,6 @@ class TestMCPInResolver:
         assert config._merged_plugins.plugins[0].id == 'demo'
         assert plugin_path in list(config.plugins)
 
-
 class TestPersonalizationInResolver:
 
     def test_personalization_mapped_from_settings(self, tmp_path):

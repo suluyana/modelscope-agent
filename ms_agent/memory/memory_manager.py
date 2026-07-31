@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict
-
 from omegaconf import DictConfig, OmegaConf
+from typing import Dict
 
 from ms_agent.memory import Memory, memory_mapping
 from ms_agent.utils import get_logger

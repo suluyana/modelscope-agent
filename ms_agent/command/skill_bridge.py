@@ -11,7 +11,8 @@ import re
 from typing import TYPE_CHECKING
 
 from ms_agent.command.router import CommandRouter
-from ms_agent.command.types import CommandContext, CommandResult, CommandResultType
+from ms_agent.command.types import (CommandContext, CommandResult,
+                                    CommandResultType)
 
 if TYPE_CHECKING:
     from ms_agent.skill.catalog import SkillCatalog
@@ -45,11 +46,9 @@ class SkillCommandBridge:
         if not ctx.args:
             return CommandResult(
                 type=CommandResultType.MESSAGE,
-                content=(
-                    f'Skill: {skill.name}\n'
-                    f'Description: {skill.description}\n'
-                    f'Usage: /{skill.skill_id} <your instruction>'
-                ),
+                content=(f'Skill: {skill.name}\n'
+                         f'Description: {skill.description}\n'
+                         f'Usage: /{skill.skill_id} <your instruction>'),
             )
 
         body = _strip_frontmatter(skill.content)
@@ -58,8 +57,7 @@ class SkillCommandBridge:
         enriched = (
             f'Use the [{skill.name}] skill located at `{skill.skill_path}`.\n\n'
             f'{body}\n\n'
-            f"User's request: {ctx.args}"
-        )
+            f"User's request: {ctx.args}")
         return CommandResult(
             type=CommandResultType.SUBMIT_PROMPT,
             content=enriched,

@@ -36,7 +36,8 @@ class SkillsConfigManager:
     def load_project(self, project_path: str) -> Dict[str, Any]:
         return self._read(self._project_path(project_path))
 
-    def load_merged(self, project_path: Optional[str] = None) -> Dict[str, Any]:
+    def load_merged(self,
+                    project_path: Optional[str] = None) -> Dict[str, Any]:
         g = self.load_global()
         p = self.load_project(project_path) if project_path else {}
         return merge_skills_configs(g, p)
@@ -106,7 +107,8 @@ class SkillsConfigManager:
         return self._global_dir / SKILLS_FILE
 
     def _project_path(self, project_path: str) -> Path:
-        return Path(project_path) / PROJECT_META_DIR / SKILLS_FILE
+        from ms_agent.project.paths import project_internal_file
+        return project_internal_file(project_path, SKILLS_FILE)
 
     def _resolve_path(self, scope: str, project_path: Optional[str]) -> Path:
         if scope == 'project':
@@ -131,4 +133,6 @@ class SkillsConfigManager:
         tmp = path.with_suffix('.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.rename(path)
+        # replace() is atomic and cross-platform; rename() raises on Windows
+        # when the destination already exists.
+        tmp.replace(path)

@@ -1,8 +1,9 @@
 from __future__ import annotations
+
+import json
 import os
 from typing import Any, Dict, List
 
-import json
 from ms_agent.utils.logger import get_logger
 
 logger = get_logger()
@@ -25,11 +26,7 @@ def build_agent_card(
     The returned dict matches the A2A AgentCard schema and can be passed
     directly to ``a2a.types.AgentCard(**card_dict)`` or serialised to JSON.
     """
-    from a2a.types import (
-        AgentCard,
-        AgentCapabilities,
-        AgentSkill,
-    )
+    from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
     resolved_host = host if host != '0.0.0.0' else 'localhost'
     url = f'http://{resolved_host}:{port}/'

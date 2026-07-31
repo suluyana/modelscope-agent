@@ -24,33 +24,48 @@ import copy
 import json
 import os
 from copy import deepcopy
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from omegaconf import DictConfig, ListConfig, OmegaConf
-
 from ms_agent.config.mcp_manager import MCPConfigManager
-from ms_agent.config.mcp_schema import (
-    ResolvedMCPConfig,
-    collect_builtin_tool_names,
-    merge_mcp_layers,
-    normalize_mcp_servers_layer,
-)
-from ms_agent.utils import get_logger
+from ms_agent.config.mcp_schema import (ResolvedMCPConfig,
+                                        collect_builtin_tool_names,
+                                        merge_mcp_layers,
+                                        normalize_mcp_servers_layer)
 from ms_agent.plugins.config_manager import PluginConfigManager
+from ms_agent.utils import get_logger
 
 logger = get_logger()
 
 _FRAMEWORK_DEFAULTS_PATH = (
-    Path(__file__).parent.parent / 'agent' / 'agent.yaml'
-)
+    Path(__file__).parent.parent / 'agent' / 'agent.yaml')
 
 GLOBAL_SETTINGS_FILE = 'settings.json'
 GLOBAL_MCP_FILE = 'mcp.json'
 GLOBAL_SKILLS_FILE = 'skills.json'
 PROJECT_CONFIG_FILE = 'config.yaml'
+PROJECT_SETTINGS_LOCAL_FILE = 'settings.local.json'
 PROJECT_MCP_FILE = 'mcp.json'
 PROJECT_SKILLS_FILE = 'skills.json'
+
+# New project-local framework dir (underscore, matches ~/.ms_agent) and the
+# older hyphenated name kept for read-compat.
+PROJECT_INTERNAL_DIR = '.ms_agent'
+PROJECT_INTERNAL_DIR_LEGACY = '.ms-agent'
+
+
+def _project_internal_file(project_path: str, filename: str) -> Optional[Path]:
+    """Return <project>/.ms_agent/<file>, falling back to the legacy
+    <project>/.ms-agent/<file>. Returns the new-dir path (may not exist) when
+    neither exists, so callers can treat a missing file uniformly."""
+    new = Path(project_path) / PROJECT_INTERNAL_DIR / filename
+    if new.exists():
+        return new
+    legacy = Path(project_path) / PROJECT_INTERNAL_DIR_LEGACY / filename
+    if legacy.exists():
+        return legacy
+    return new
 
 
 class ConfigResolver:
@@ -65,13 +80,12 @@ class ConfigResolver:
     ) -> None:
         self._global_dir = Path(global_dir).expanduser()
         self.project_root = (
-            Path(project_root).expanduser() if project_root else None
-        )
+            Path(project_root).expanduser() if project_root else None)
         self.agent_config = agent_config
         self.mcp_manager = mcp_manager or MCPConfigManager(
             self._global_dir, self.project_root)
-        self.plugin_manager = PluginConfigManager(
-            self._global_dir, self.project_root)
+        self.plugin_manager = PluginConfigManager(self._global_dir,
+                                                  self.project_root)
 
     @property
     def global_root(self) -> Path:
@@ -105,8 +119,7 @@ class ConfigResolver:
             layers.append(global_settings)
 
         effective_agent_config = (
-            agent_config if agent_config is not None else self.agent_config
-        )
+            agent_config if agent_config is not None else self.agent_config)
         if effective_agent_config is not None:
             if isinstance(effective_agent_config, str):
                 effective_agent_config = OmegaConf.load(effective_agent_config)
@@ -234,14 +247,37 @@ class ConfigResolver:
             return None
 
     def _load_project_patch(self, project_path: str) -> Optional[DictConfig]:
-        patch_file = Path(project_path) / '.ms-agent' / PROJECT_CONFIG_FILE
-        if not patch_file.exists():
+        """Project-level config patch.
+
+        Merges (low -> high priority):
+          1. legacy/new ``config.yaml`` (agent schema, direct)
+          2. ``settings.local.json`` (settings schema, mapped like the global
+             settings.json — provider/model/personalization/... )
+        Both are optional; new ``.ms_agent/`` is preferred over legacy
+        ``.ms-agent/``.
+        """
+        layers: List[DictConfig] = []
+
+        yaml_file = _project_internal_file(project_path, PROJECT_CONFIG_FILE)
+        if yaml_file and yaml_file.exists():
+            try:
+                layers.append(OmegaConf.load(str(yaml_file)))
+            except Exception as e:
+                logger.warning(f'Failed to load project config.yaml: {e}')
+
+        local_file = _project_internal_file(project_path,
+                                            PROJECT_SETTINGS_LOCAL_FILE)
+        if local_file and local_file.exists():
+            try:
+                with open(local_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                layers.append(self._settings_to_agent_config(data))
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f'Failed to load settings.local.json: {e}')
+
+        if not layers:
             return None
-        try:
-            return OmegaConf.load(str(patch_file))
-        except Exception as e:
-            logger.warning(f'Failed to load project config patch: {e}')
-            return None
+        return self._merge_layers(layers)
 
     # -- merging --
 
@@ -254,17 +290,13 @@ class ConfigResolver:
             result = OmegaConf.merge(result, layer)
         return result
 
-    def _merge_mcp(
-        self, config: DictConfig, project_path: Optional[str]
-    ) -> DictConfig:
-        global_mcp = self._load_json_safe(
-            self._global_dir / GLOBAL_MCP_FILE
-        )
+    def _merge_mcp(self, config: DictConfig,
+                   project_path: Optional[str]) -> DictConfig:
+        global_mcp = self._load_json_safe(self._global_dir / GLOBAL_MCP_FILE)
         project_mcp = {}
         if project_path:
             project_mcp = self._load_json_safe(
-                Path(project_path) / '.ms-agent' / PROJECT_MCP_FILE
-            )
+                _project_internal_file(project_path, PROJECT_MCP_FILE))
 
         if not global_mcp and not project_mcp:
             return config
@@ -274,45 +306,44 @@ class ConfigResolver:
             OmegaConf.update(config, '_merged_mcp', merged, merge=True)
         return config
 
-    def _merge_plugins(
-        self, config: DictConfig, project_path: Optional[str]
-    ) -> DictConfig:
+    def _merge_plugins(self, config: DictConfig,
+                       project_path: Optional[str]) -> DictConfig:
         manager = (
             PluginConfigManager(self._global_dir, project_path)
-            if project_path
-            else self.plugin_manager
-        )
+            if project_path else self.plugin_manager)
         records = manager.load_merged(project_path)
         if not records:
             return config
 
-        payload = {'plugins': [record.to_dict() | {'scope': record.scope}
-                              for record in records]}
+        payload = {
+            'plugins':
+            [record.to_dict() | {
+                'scope': record.scope
+            } for record in records]
+        }
         OmegaConf.update(config, '_merged_plugins', payload, merge=True)
 
         enabled_paths = [
-            record.path for record in records
-            if record.enabled and record.path
+            record.path for record in records if record.enabled and record.path
         ]
         existing = []
         if hasattr(config, 'plugins') and config.plugins:
             existing = [str(item) for item in config.plugins]
-        merged_paths = existing + [p for p in enabled_paths if p not in existing]
+        merged_paths = existing + [
+            p for p in enabled_paths if p not in existing
+        ]
         if merged_paths:
             OmegaConf.update(config, 'plugins', merged_paths, merge=True)
         return config
 
-    def _merge_skills(
-        self, config: DictConfig, project_path: Optional[str]
-    ) -> DictConfig:
-        global_skills = self._load_json_safe(
-            self._global_dir / GLOBAL_SKILLS_FILE
-        )
+    def _merge_skills(self, config: DictConfig,
+                      project_path: Optional[str]) -> DictConfig:
+        global_skills = self._load_json_safe(self._global_dir
+                                             / GLOBAL_SKILLS_FILE)
         project_skills = {}
         if project_path:
             project_skills = self._load_json_safe(
-                Path(project_path) / '.ms-agent' / PROJECT_SKILLS_FILE
-            )
+                _project_internal_file(project_path, PROJECT_SKILLS_FILE))
 
         if not global_skills and not project_skills:
             return config
@@ -348,15 +379,25 @@ class ConfigResolver:
             if 'temperature' in llm and llm.get('temperature_enabled'):
                 agent_fields.setdefault('generation_config', {})
                 agent_fields['generation_config']['temperature'] = llm[
-                    'temperature'
-                ]
+                    'temperature']
             if 'max_tokens' in llm and llm['max_tokens']:
                 agent_fields.setdefault('generation_config', {})
                 agent_fields['generation_config']['max_tokens'] = llm[
-                    'max_tokens'
-                ]
+                    'max_tokens']
             if agent_llm:
                 agent_fields['llm'] = agent_llm
+        # default_model (from ModelSettingsManager) is a fallback when the llm
+        # block does not pin a model. Form: "provider/model" or bare "model".
+        default_model = settings.get('default_model')
+        if default_model:
+            agent_llm = agent_fields.setdefault('llm', {})
+            if not agent_llm.get('model'):
+                if '/' in default_model:
+                    prov, mdl = default_model.split('/', 1)
+                    agent_llm.setdefault('service', prov)
+                    agent_llm['model'] = mdl
+                else:
+                    agent_llm['model'] = default_model
         if 'output_dir' in settings:
             agent_fields['output_dir'] = settings['output_dir']
         if 'personalization' in settings:
@@ -432,13 +473,11 @@ def merge_skills_configs(
 
     global_enabled_map = {
         s.get('name', s.get('path', '')): s.get('enabled', True)
-        for s in global_sources
-        if isinstance(s, dict)
+        for s in global_sources if isinstance(s, dict)
     }
     project_enabled_map = {
         s.get('name', s.get('path', '')): s.get('enabled', True)
-        for s in project_sources
-        if isinstance(s, dict)
+        for s in project_sources if isinstance(s, dict)
     }
 
     merged_sources = list(global_sources) + [
@@ -448,7 +487,10 @@ def merge_skills_configs(
     return {
         'sources': merged_sources,
         'disabled': sorted(all_disabled),
-        '_enabled_map': {**global_enabled_map, **project_enabled_map},
+        '_enabled_map': {
+            **global_enabled_map,
+            **project_enabled_map
+        },
     }
 
 

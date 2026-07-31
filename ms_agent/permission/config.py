@@ -53,10 +53,13 @@ class SafetyConfig:
     read_only_directories: tuple[str, ...] = ()
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any], project_root: str | None = None) -> SafetyConfig:
+    def from_dict(cls,
+                  d: dict[str, Any],
+                  project_root: str | None = None) -> SafetyConfig:
         patterns = tuple(d.get('patterns', _DEFAULT_SAFETY_PATTERNS))
         sensitive = tuple(d.get('sensitive_paths', _DEFAULT_SENSITIVE_PATHS))
-        dangerous = tuple(d.get('dangerous_removal_paths', _DEFAULT_DANGEROUS_REMOVAL))
+        dangerous = tuple(
+            d.get('dangerous_removal_paths', _DEFAULT_DANGEROUS_REMOVAL))
 
         path_validation = d.get('path_validation', {})
         read_policy = path_validation.get('read_policy', 'loose')
@@ -106,7 +109,9 @@ class PermissionConfig:
     safety: SafetyConfig = SafetyConfig()
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any], project_root: str | None = None) -> PermissionConfig:
+    def from_dict(cls,
+                  d: dict[str, Any],
+                  project_root: str | None = None) -> PermissionConfig:
         if not d:
             return cls()
 
@@ -116,13 +121,16 @@ class PermissionConfig:
         whitelist = tuple(d.get('whitelist', ()))
         ask_rules = tuple(d.get('ask_rules', ()))
         user_blacklist = tuple(d.get('blacklist', ()))
-        if d.get('no_default_blacklist', False):
-            # Container / sandbox mode: strip built-in network blocks
-            blacklist = user_blacklist
-        else:
-            blacklist = _DEFAULT_BLACKLIST + tuple(
-                p for p in user_blacklist if p not in _DEFAULT_BLACKLIST
-            )
+        # The default blacklist blocks network-egress shell commands
+        # (curl/wget/ssh/...). ``allow_network: true`` (or legacy
+        # ``no_default_blacklist``) opts out of that secure default; the
+        # user's own blacklist entries still apply.
+        allow_network = bool(
+            d.get('allow_network', False)
+            or d.get('no_default_blacklist', False))
+        base_blacklist = () if allow_network else _DEFAULT_BLACKLIST
+        blacklist = base_blacklist + tuple(
+            p for p in user_blacklist if p not in base_blacklist)
 
         safety_raw = d.get('safety_rules', {})
         # Merge directory configs from top level into safety config

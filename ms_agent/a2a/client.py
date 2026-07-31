@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 import os
 from typing import Any, Dict, List, Optional
 
 import httpx
+
 from ms_agent.utils.logger import get_logger
 
 logger = get_logger()
@@ -22,8 +24,8 @@ class A2AClientManager:
                                  httpx.AsyncClient] = {}
 
     def _get_http_client(
-            self, headers: Optional[Dict[str, str]] = None
-    ) -> httpx.AsyncClient:
+            self,
+            headers: Optional[Dict[str, str]] = None) -> httpx.AsyncClient:
         client_key = tuple(sorted((headers or {}).items()))
         http_client = self._http_clients.get(client_key)
         if http_client is None or http_client.is_closed:
@@ -52,11 +54,7 @@ class A2AClientManager:
             return f'Error: A2A agent "{agent_name}" has no URL configured'
 
         try:
-            from a2a.client import (
-                A2ACardResolver,
-                ClientConfig,
-                ClientFactory,
-            )
+            from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
             from a2a.client.helpers import create_text_message_object
 
             auth_headers = self._build_auth_headers(cfg)
