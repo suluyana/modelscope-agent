@@ -16,6 +16,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from ms_agent.agent.runtime import Runtime
 from ms_agent.callbacks import Callback, callbacks_mapping
+from ms_agent.knowledge_search import SirchmunkSearch
 from ms_agent.llm.llm import LLM
 from ms_agent.llm.utils import Message, ToolResult
 from ms_agent.memory import Memory, get_memory_meta_safe, memory_mapping

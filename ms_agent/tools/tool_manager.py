@@ -263,14 +263,17 @@ class ToolManager:
             self.servers = self.mcp_client
             has_add = hasattr(self.servers, 'add_mcp_config')
             is_mcp = MCPClient is not None and isinstance(self.mcp_client, MCPClient)
-            if self.mcp_config and self.mcp_config.get('mcpServers') and (is_mcp or has_add):
+            if (isinstance(self.mcp_config, dict)
+                    and self.mcp_config.get('mcpServers')
+                    and (is_mcp or has_add)):
                 await self.servers.add_mcp_config(self.mcp_config)
                 if hasattr(self.servers, 'mcp_config'):
                     self.mcp_config = self.servers.mcp_config
         elif MCPClient is not None:
             self.servers = MCPClient(self.mcp_config, self.config)
             await self.servers.connect()
-        elif MCPClient is not None and not MCP_AVAILABLE:
+        elif (isinstance(self.mcp_config, dict)
+              and self.mcp_config.get('mcpServers')):
             logger.warning_once(
                 'mcp package not installed; MCP tools disabled for this run'
             )
