@@ -58,6 +58,66 @@ class TestSessionLogBasicIO:
         assert "seq" in msg
         assert "timestamp" in msg
 
+    def test_second_session_log_does_not_reuse_team_receipt_seq(self):
+        self.log.record_team_user({"content": "@bibo hi"})
+        self.log.record_team_receipt({
+            "kind": "dispatch_start",
+            "at_name": "bibo",
+            "content": "已派 @bibo · auto",
+        })
+        self.log.record_team_reply({
+            "at_name": "bibo",
+            "content": "from-worker",
+        })
+        other = SessionLog(self.tmpdir, session_key="test_basic")
+        other.get_all_messages()  # used to rewind seq past filtered rows
+        seq = other.append({
+            "role": "assistant",
+            "content": "# leaked lead article",
+        })
+        used = []
+        for line in self.log._path.read_text(encoding="utf-8").splitlines():
+            rec = json.loads(line)
+            if "seq" in rec:
+                used.append(rec["seq"])
+        assert seq not in used[:-1]
+        assert used.count(seq) == 1
+        assert seq == max(used)
+
+
+class TestSessionLogTeamUserIsolation:
+    """@mention user rows must not re-enter Lead LLM context."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.log = SessionLog(self.tmpdir, session_key="test_team_user")
+
+    def test_record_team_user_excluded_from_llm(self):
+        self.log.record_team_user({"content": "@bibo 请整理北京美食"})
+        self.log.record_team_receipt({
+            "kind": "dispatch_start",
+            "at_name": "bibo",
+            "content": "已派 @bibo · auto",
+        })
+        self.log.append({"role": "user", "content": "你好"})
+        msgs = self.log.get_all_messages()
+        assert [m["content"] for m in msgs] == ["你好"]
+        users = self.log.get_team_users()
+        assert users[0]["content"] == "@bibo 请整理北京美食"
+        assert users[0]["_type"] == "team_user"
+
+    def test_legacy_user_before_dispatch_receipt_excluded(self):
+        self.log.append({"role": "user", "content": "@lily 北京有哪些美景"})
+        self.log.record_team_receipt({
+            "kind": "dispatch_start",
+            "at_name": "lily",
+            "content": "已派 @lily · auto",
+        })
+        self.log.append({"role": "user", "content": "你好"})
+        msgs = self.log.get_all_messages()
+        assert [m["content"] for m in msgs] == ["你好"]
+        assert self.log.get_team_users()[0]["content"] == "@lily 北京有哪些美景"
+
 
 class TestSessionLogLastConsolidated:
     """last_consolidated pointer -- the heart of the non-destructive design."""

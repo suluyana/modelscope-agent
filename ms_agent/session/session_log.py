@@ -169,6 +169,56 @@ class SessionLog:
         }
         self._append_line(record)
 
+    def record_team_reply(self, event: Dict[str, Any]) -> None:
+        """Record an Agent Team (@mention) reply — display-only.
+
+        Written when a Host Bridge / ACP agent finishes a chat @dispatch.
+        Filtered out of ``get_all_messages`` so it never re-enters the lead
+        LLM context; history replay merges it back by ``seq`` as its own
+        assistant bubble (``at_name`` + ``content``).
+        """
+        seq = self._next_seq()
+        record = {
+            "_type": "team_reply",
+            "seq": seq,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **event,
+        }
+        self._append_line(record)
+
+    def record_team_receipt(self, event: Dict[str, Any]) -> None:
+        """Idle-style Team receipt (已派 / 已结束执行) — display-only.
+
+        Same contract as ``record_team_reply``: never re-enters the lead LLM
+        context. History replay shows a compact receipt bar, not a teammate
+        bubble (C-04).
+        """
+        seq = self._next_seq()
+        record = {
+            "_type": "team_receipt",
+            "seq": seq,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **event,
+        }
+        self._append_line(record)
+
+    def record_team_user(self, event: Dict[str, Any]) -> None:
+        """Human @mention that was routed to a teammate — display-only.
+
+        The main-chat timeline still shows the user's ``@bibo …`` bubble.
+        Filtered out of ``get_all_messages`` so Lead does not treat a
+        teammate's assignment as its own user turn (C-06).
+        """
+        seq = self._next_seq()
+        record = {
+            "_type": "team_user",
+            "role": "user",
+            "seq": seq,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **event,
+        }
+        self._append_line(record)
+
     # ------------------------------------------------------------------
     # Read path
     # ------------------------------------------------------------------
@@ -191,31 +241,22 @@ class SessionLog:
         self._update_meta('round', value)
 
     def get_all_messages(self) -> List[Dict[str, Any]]:
-        """All messages (excluding metadata and compaction events)."""
+        """LLM-visible messages (no metadata, receipts, or teammate @prompts)."""
         if self._messages is not None:
             return self._messages
         msgs: List[Dict[str, Any]] = []
-        if not self._path.exists():
-            self._messages = msgs
-            return msgs
-        for line in self._path.read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        records = self._read_jsonl_records()
+        skip_user = self._legacy_team_user_seqs(records)
+        for record in records:
             if record.get("_type") in (
                     "metadata", "compaction_event", "error", "permission",
-                    "skill_invocation", "loop_end"):
+                    "skill_invocation", "loop_end", "team_reply",
+                    "team_receipt", "team_user"):
+                continue
+            if record.get("seq") in skip_user:
                 continue
             msgs.append(record)
         self._messages = msgs
-        # Update seq counter to be past the last message
-        if msgs:
-            max_seq = max(m.get('seq', 0) for m in msgs)
-            self._seq = max(self._seq, max_seq + 1)
         return msgs
 
     def get_visible_messages(self) -> List[Dict[str, Any]]:
@@ -332,6 +373,54 @@ class SessionLog:
                 out.append(record)
         return out
 
+    def get_team_replies(self) -> List[Dict[str, Any]]:
+        """All Agent Team reply markers in chronological order (each keeps
+        its ``seq``).  Excluded from ``get_all_messages``; a UI merges them
+        back by ``seq`` as ``@at_name`` assistant bubbles.
+        """
+        out: List[Dict[str, Any]] = []
+        if not self._path.exists():
+            return out
+        for line in self._path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("_type") == "team_reply":
+                out.append(record)
+        return out
+
+    def get_team_receipts(self) -> List[Dict[str, Any]]:
+        """Idle Team receipts (已派 / 已结束执行) in chronological order.
+
+        Excluded from ``get_all_messages``; a UI merges them back by ``seq``
+        as compact receipt bars (C-04).
+        """
+        out: List[Dict[str, Any]] = []
+        for record in self._read_jsonl_records():
+            if record.get("_type") == "team_receipt":
+                out.append(record)
+        return out
+
+    def get_team_users(self) -> List[Dict[str, Any]]:
+        """Human @mention rows routed to teammates (main-chat timeline only).
+
+        Tagged ``team_user`` records plus legacy untagged user rows that sit
+        immediately before a ``dispatch_start`` receipt.
+        """
+        records = self._read_jsonl_records()
+        legacy = self._legacy_team_user_seqs(records)
+        out: List[Dict[str, Any]] = []
+        for record in records:
+            if record.get("_type") == "team_user":
+                out.append(record)
+            elif record.get("seq") in legacy:
+                out.append({**record, "_type": "team_user"})
+        return out
+
     def get_metadata(self) -> Dict[str, Any]:
         """Session metadata (title, created_at, status, counts, etc.)."""
         meta = self._read_meta()
@@ -365,6 +454,9 @@ class SessionLog:
     # ------------------------------------------------------------------
 
     def _next_seq(self) -> int:
+        # Re-scan disk so a second SessionLog (Team persist vs LLMAgent)
+        # cannot reuse seq numbers already written by the other writer.
+        self._load_all_to_set_seq()
         seq = self._seq
         self._seq += 1
         return seq
@@ -400,6 +492,8 @@ class SessionLog:
 
     def _load_all_to_set_seq(self) -> None:
         """Scan the file to find the highest seq number."""
+        if not self._path.exists():
+            return
         max_seq = -1
         for line in self._path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
@@ -413,6 +507,47 @@ class SessionLog:
             except json.JSONDecodeError:
                 continue
         self._seq = max_seq + 1
+
+    def _read_jsonl_records(self) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        if not self._path.exists():
+            return records
+        for line in self._path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return records
+
+    @staticmethod
+    def _legacy_team_user_seqs(records: List[Dict[str, Any]]) -> set:
+        """Untagged user rows immediately followed by a 已派 receipt.
+
+        Older builds persisted ``@bibo …`` via ``append`` (LLM-visible). Pair
+        them with the following ``dispatch_start`` so Lead no longer inherits
+        the teammate assignment.
+        """
+        by_seq = {
+            r['seq']: r
+            for r in records if isinstance(r.get('seq'), int)
+        }
+        skip: set = set()
+        for record in records:
+            if (record.get('_type') != 'team_receipt'
+                    or record.get('kind') != 'dispatch_start'):
+                continue
+            prev = by_seq.get(int(record.get('seq', 0)) - 1)
+            if not prev or prev.get('role') != 'user':
+                continue
+            if prev.get('_type') in (
+                    'team_user', 'team_receipt', 'team_reply', 'error',
+                    'permission', 'skill_invocation', 'loop_end'):
+                continue
+            skip.add(prev.get('seq'))
+        return skip
 
     def _read_meta(self) -> Dict[str, Any]:
         """Load mutable metadata from the sidecar (cached).
