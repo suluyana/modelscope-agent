@@ -8,7 +8,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from ms_agent.team.events import TeamEvent
+from ms_agent.team.events import TeamEvent, task_status_for_event
 from ms_agent.team.models import DispatchEnvelope, RuntimeCandidate, new_id
 from datetime import datetime, timezone
 
@@ -164,6 +164,100 @@ class BridgeHub:
         fut = self._pending.pop(dispatch_id, None)
         if fut and not fut.done():
             fut.set_result(result)
+
+    async def resolve_permission(
+        self,
+        *,
+        endpoint_id: str | None,
+        permission_request_id: str,
+        fingerprint: str,
+        decision: str,
+        option_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Forward an approval to the live Bridge; never replay stored args."""
+        bridge_id = self._resolve_bridge_id(endpoint_id)
+        ws = self._conns.get(bridge_id) if bridge_id else None
+        if ws is None:
+            return {
+                'ok': False,
+                'error': 'BRIDGE_UNREACHABLE',
+                'resume_status': 'needs_manual_restart',
+            }
+        payload = {
+            'type': 'permission_resolve',
+            'permission_request_id': permission_request_id,
+            'fingerprint': fingerprint,
+            'decision': decision,
+        }
+        if option_id:
+            payload['option_id'] = option_id
+        await ws.send_json(payload)
+        return {'ok': True, 'permission_request_id': permission_request_id}
+
+
+_PERMISSION_FRAME_TYPES = {
+    'permission_request': 'team.permission_requested',
+    'permission_resolved': 'team.permission_resolved',
+    'dispatch_waiting_approval': 'team.dispatch_waiting_approval',
+    'dispatch_resumed': 'team.dispatch_resumed',
+    'dispatch_continuation_required': 'team.dispatch_continuation_required',
+}
+
+
+def permission_frame_to_event(msg: dict[str, Any]) -> TeamEvent | None:
+    event_type = _PERMISSION_FRAME_TYPES.get(msg.get('type'))
+    if event_type is None:
+        return None
+    payload = {
+        key: value
+        for key, value in msg.items()
+        if key not in ('type', 'dispatch_id', 'endpoint_id')
+    }
+    if msg.get('type') == 'dispatch_continuation_required':
+        payload.setdefault('resume_status', 'needs_manual_restart')
+    return TeamEvent(
+        type=event_type,
+        dispatch_id=msg.get('dispatch_id'),
+        endpoint_id=msg.get('endpoint_id'),
+        payload=payload,
+    )
+
+
+def apply_permission_event_to_tasks(state, event: TeamEvent) -> None:
+    request_id = str((event.payload or {}).get('permission_request_id') or '')
+    if event.type == 'team.permission_requested' and request_id:
+        state.pending_permissions[request_id] = {
+            'permission_request_id': request_id,
+            'dispatch_id': event.dispatch_id,
+            'endpoint_id': event.endpoint_id,
+            'fingerprint': (event.payload or {}).get('fingerprint') or '',
+            'bridge_id': (event.payload or {}).get('bridge_id'),
+            'instance_id': (event.payload or {}).get('instance_id'),
+            'options': (event.payload or {}).get('options') or [],
+        }
+    elif event.type in (
+            'team.permission_resolved',
+            'team.dispatch_resumed',
+            'team.dispatch_continuation_required',
+    ) and request_id:
+        pending = state.pending_permissions.get(request_id)
+        if pending is not None:
+            pending['resume_status'] = (
+                (event.payload or {}).get('resume_status')
+                or event.type)
+            if event.type != 'team.dispatch_continuation_required':
+                state.pending_permissions.pop(request_id, None)
+    if not event.dispatch_id:
+        return
+    next_status = task_status_for_event(event, '')
+    if not next_status:
+        return
+    for project in state.projects.list():
+        for task in state.tasks.list(project.project_id):
+            if task.last_dispatch_id != event.dispatch_id:
+                continue
+            task.status = next_status  # type: ignore[assignment]
+            state.tasks.upsert(task)
 
 
 def get_bridge_hub() -> BridgeHub:
@@ -347,7 +441,16 @@ async def bridge_ws(websocket: WebSocket):
                         },
                     ))
             else:
-                await websocket.send_json({'type': 'ack', 'ref': mtype})
+                permission_event = permission_frame_to_event(msg)
+                if permission_event is not None:
+                    apply_permission_event_to_tasks(state, permission_event)
+                    await state._fanout_event(permission_event)  # noqa: SLF001
+                    await websocket.send_json({
+                        'type': 'ack',
+                        'ref': mtype,
+                    })
+                else:
+                    await websocket.send_json({'type': 'ack', 'ref': mtype})
     except WebSocketDisconnect:
         logger.info('Bridge disconnected: %s', bridge_id)
     finally:

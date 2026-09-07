@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -11,6 +12,10 @@ from typing import Any, Awaitable, Callable, Optional
 logger = logging.getLogger(__name__)
 
 NotificationHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+PermissionHandler = Callable[
+    [dict[str, Any]],
+    Awaitable[dict[str, Any]] | dict[str, Any],
+]
 
 
 class AuthRequired(RuntimeError):
@@ -26,8 +31,9 @@ class AcpSession:
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
-        auto_allow: bool = True,
+        auto_allow: bool = False,
         auth_method_id: str | None = None,
+        permission_handler: PermissionHandler | None = None,
     ) -> None:
         self.command = list(command)
         self.cwd = cwd
@@ -39,10 +45,12 @@ class AcpSession:
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
+        self._request_tasks: set[asyncio.Task] = set()
         self._stderr_buf: bytearray = bytearray()
         self._init_result: dict[str, Any] | None = None
         self._ready = False
         self.on_notification: NotificationHandler | None = None
+        self.on_permission_request = permission_handler
 
     @property
     def alive(self) -> bool:
@@ -72,6 +80,12 @@ class AcpSession:
         self._ready = False
 
     async def close(self) -> None:
+        for task in list(self._request_tasks):
+            task.cancel()
+        if self._request_tasks:
+            await asyncio.gather(
+                *self._request_tasks, return_exceptions=True)
+        self._request_tasks.clear()
         for task in (self._reader_task, self._stderr_task):
             if task:
                 task.cancel()
@@ -232,6 +246,11 @@ class AcpSession:
             if not fut.done():
                 fut.set_exception(err)
         self._pending.clear()
+        for task in list(self._request_tasks):
+            task.cancel()
+        if self._request_tasks:
+            await asyncio.gather(
+                *self._request_tasks, return_exceptions=True)
         self._ready = False
 
     async def _read_stderr(self) -> None:
@@ -256,16 +275,10 @@ class AcpSession:
             return
 
         method = msg.get('method') or ''
-        if method == 'session/request_permission' and self.auto_allow:
-            await self._respond(
-                msg['id'],
-                {
-                    'outcome': {
-                        'outcome': 'selected',
-                        'optionId': 'allow-once',
-                    }
-                },
-            )
+        if method == 'session/request_permission':
+            task = asyncio.create_task(self._serve_permission_request(msg))
+            self._request_tasks.add(task)
+            task.add_done_callback(self._request_tasks.discard)
             return
         if method in ('cursor/ask_question', 'cursor/create_plan'):
             await self._respond(
@@ -282,6 +295,73 @@ class AcpSession:
                     await result
             except Exception:  # noqa: BLE001
                 logger.debug('notification handler failed', exc_info=True)
+
+    async def _serve_permission_request(self, msg: dict[str, Any]) -> None:
+        """Resolve an ACP server request without blocking the stdout reader."""
+        try:
+            request = self._normalize_permission_request(msg)
+            if self.on_permission_request is not None:
+                result = self.on_permission_request(request)
+                if inspect.isawaitable(result):
+                    result = await result
+            elif self.auto_allow:
+                result = {
+                    'outcome': {
+                        'outcome': 'selected',
+                        'optionId': 'allow-once',
+                    }
+                }
+            else:
+                # Fail closed when a non-Bridge caller forgot to install a
+                # permission callback. Never silently approve an ACP tool.
+                result = {'outcome': {'outcome': 'cancelled'}}
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'ACP permission callback failed; denying request',
+                exc_info=True,
+            )
+            result = {'outcome': {'outcome': 'cancelled'}}
+        try:
+            await self._respond(msg['id'], result)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                'ACP permission response failed after process exit',
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _normalize_permission_request(msg: dict[str, Any]) -> dict[str, Any]:
+        params = msg.get('params') or {}
+        tool_call = params.get('toolCall') or params.get('tool_call') or {}
+        if not isinstance(tool_call, dict):
+            tool_call = {}
+        args = (
+            tool_call.get('rawInput')
+            or tool_call.get('raw_input')
+            or tool_call.get('input')
+            or {}
+        )
+        if not isinstance(args, dict):
+            args = {'value': args}
+        return {
+            'request_id': msg.get('id'),
+            'runtime_session_id': (
+                params.get('sessionId') or params.get('session_id') or ''),
+            'call_id': (
+                tool_call.get('toolCallId')
+                or tool_call.get('tool_call_id')
+                or tool_call.get('id')
+                or ''),
+            'tool': (
+                tool_call.get('title')
+                or tool_call.get('name')
+                or tool_call.get('kind')
+                or 'tool'),
+            'args': args,
+            'options': list(params.get('options') or []),
+        }
 
     async def _respond(self, req_id: Any, result: dict) -> None:
         assert self.proc and self.proc.stdin
@@ -307,14 +387,18 @@ class AcpProcessPool:
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
-        auto_allow: bool = True,
+        auto_allow: bool = False,
         auth_method_id: str | None = None,
+        permission_handler: PermissionHandler | None = None,
     ) -> AcpSession:
         key = self._key(runtime, cwd)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             sess = self._sessions.get(key)
             if sess is not None and sess.alive and sess._ready:
+                sess.auto_allow = auto_allow
+                if permission_handler is not None:
+                    sess.on_permission_request = permission_handler
                 return sess
             if sess is not None:
                 await sess.close()
@@ -324,6 +408,7 @@ class AcpProcessPool:
                 env=env,
                 auto_allow=auto_allow,
                 auth_method_id=auth_method_id,
+                permission_handler=permission_handler,
             )
             await sess.start()
             self._sessions[key] = sess

@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 from typing import AsyncIterator
 
-from ms_agent.bridge.adapters.acp_client import AuthRequired
+from ms_agent.bridge.adapters.acp_client import AuthRequired, PermissionHandler
 from ms_agent.bridge.adapters.acp_runtime import (
     cancel_acp_session,
     list_acp_sessions,
@@ -49,7 +49,7 @@ class AcpCursorAdapter:
         *,
         agent_command: str | None = None,
         dry_run: bool = False,
-        auto_allow_permissions: bool = True,
+        auto_allow_permissions: bool = False,
     ) -> None:
         self.agent_command = agent_command or _default_agent_bin()
         self.dry_run = dry_run
@@ -103,6 +103,7 @@ class AcpCursorAdapter:
         cwd: str | None = None,
         attachments: list[dict] | None = None,
         session_mode: str = 'fresh',
+        permission_handler: PermissionHandler | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         del permission_tier, attachments
         if self.dry_run or not await self.discover():
@@ -124,6 +125,7 @@ class AcpCursorAdapter:
                 session_mode=session_mode,
                 auth_method_id='cursor_login',
                 auto_allow=self.auto_allow_permissions,
+                permission_handler=permission_handler,
         ):
             yield ev
 

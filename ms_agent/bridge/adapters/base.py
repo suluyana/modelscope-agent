@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
 
 def _now_iso() -> str:
@@ -38,6 +38,10 @@ class RuntimeAdapter(Protocol):
         cwd: str | None = None,
         attachments: list[dict] | None = None,
         session_mode: str = 'fresh',
+        permission_handler: Callable[
+            [dict[str, Any]],
+            Awaitable[dict[str, Any]] | dict[str, Any],
+        ] | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         ...
 

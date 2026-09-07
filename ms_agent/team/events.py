@@ -19,6 +19,11 @@ EventType = Literal[
     'team.dispatch_done',
     'team.dispatch_error',
     'team.dispatch_cancelled',
+    'team.permission_requested',
+    'team.permission_resolved',
+    'team.dispatch_waiting_approval',
+    'team.dispatch_resumed',
+    'team.dispatch_continuation_required',
     'team.session',
     'team.circuit_open',
     'team.attribution_mismatch',
@@ -93,3 +98,19 @@ def reconcile_event_attribution(
     )
     event.at_name = card
     return mismatch
+
+
+def task_status_for_event(
+    event: TeamEvent,
+    current_status: str,
+) -> str:
+    """Project a dispatch lifecycle event onto its task-board status."""
+    return {
+        'team.permission_requested': 'waiting_approval',
+        'team.dispatch_waiting_approval': 'waiting_approval',
+        'team.dispatch_resumed': 'in_progress',
+        'team.dispatch_continuation_required': 'waiting_approval',
+        'team.dispatch_done': 'completed',
+        'team.dispatch_error': 'failed',
+        'team.dispatch_cancelled': 'cancelled',
+    }.get(event.type, current_status)

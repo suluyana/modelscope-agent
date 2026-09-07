@@ -18,6 +18,11 @@ def assert_dispatch_allowed(envelope: DispatchEnvelope) -> None:
 
 
 def permission_mode_for_tier(permission_tier: str) -> str:
+    """Translate dispatch policy to a safe runtime permission mode.
+
+    Identity is not permission policy: an owner dispatch still asks before a
+    restricted tool runs. Unknown/older tiers fail closed.
+    """
     if permission_tier == 'owner':
-        return 'bypassPermissions'
-    return 'default'
+        return 'interactive'
+    return 'restricted'

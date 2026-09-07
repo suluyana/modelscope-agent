@@ -286,20 +286,37 @@ class TestWorkspaceRoot:
 
 
 class TestDefaultBlacklist:
-    """PermissionConfig includes default network command blacklist."""
+    """Network egress is allowed unless ``allow_network: false``."""
 
-    def test_default_blacklist_contains_curl(self):
+    def test_default_config_allows_network(self):
         from ms_agent.permission.config import PermissionConfig
         config = PermissionConfig()
+        assert not any('curl' in p for p in config.blacklist)
+        assert not any('ssh' in p for p in config.blacklist)
+
+    def test_from_dict_empty_allows_network(self):
+        from ms_agent.permission.config import PermissionConfig
+        config = PermissionConfig.from_dict({})
+        assert not any('curl' in p for p in config.blacklist)
+
+    def test_allow_network_false_applies_builtin(self):
+        from ms_agent.permission.config import PermissionConfig
+        config = PermissionConfig.from_dict({'allow_network': False})
         assert any('curl' in p for p in config.blacklist)
-
-    def test_default_blacklist_contains_wget(self):
-        from ms_agent.permission.config import PermissionConfig
-        config = PermissionConfig()
         assert any('wget' in p for p in config.blacklist)
+        assert any('ssh' in p for p in config.blacklist)
 
-    def test_user_blacklist_merged(self):
+    def test_user_blacklist_not_merged_with_network_by_default(self):
         from ms_agent.permission.config import PermissionConfig
         config = PermissionConfig.from_dict({'blacklist': ['custom---tool']})
+        assert 'custom---tool' in config.blacklist
+        assert not any('curl' in p for p in config.blacklist)
+
+    def test_user_blacklist_merged_when_network_disabled(self):
+        from ms_agent.permission.config import PermissionConfig
+        config = PermissionConfig.from_dict({
+            'allow_network': False,
+            'blacklist': ['custom---tool'],
+        })
         assert any('curl' in p for p in config.blacklist)
         assert 'custom---tool' in config.blacklist

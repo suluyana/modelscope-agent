@@ -51,8 +51,8 @@ AdapterKind = Literal['acp', 'hermes', 'openclaw', 'cloud', 'ms_agent']
 ChannelKind = Literal['web', 'dingtalk', 'feishu', 'wecom']
 PermissionTier = Literal['owner', 'restricted']
 OperationKind = Literal['read', 'write']
-TaskStatus = Literal['pending', 'in_progress', 'completed', 'failed',
-                     'cancelled']
+TaskStatus = Literal['pending', 'in_progress', 'waiting_approval', 'completed',
+                     'failed', 'cancelled']
 SessionMode = Literal['attach', 'fresh']
 SessionModeHint = Literal['attach', 'fresh', 'auto']
 SessionResolutionReason = Literal[

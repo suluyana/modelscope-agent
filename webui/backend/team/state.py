@@ -95,6 +95,7 @@ class TeamAppState:
         self.event_subscribers: list = []
         self._event_buffer: list = []
         self._event_buffer_max = 256
+        self.pending_permissions: dict[str, dict[str, Any]] = {}
         if use_file:
             from ms_agent.team.stores.dispatch_log import FileDispatchLogStore
             self.dispatch_log = FileDispatchLogStore(root / 'dispatch_logs')

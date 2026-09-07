@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator
 
 from ms_agent.bridge.adapters.acp_client import (
     AuthRequired,
+    PermissionHandler,
     attach_fallback_allowed,
     get_acp_pool,
 )
@@ -129,7 +130,8 @@ async def run_acp_turn(
     session_mode: str,
     auth_method_id: str | None = None,
     env: dict[str, str] | None = None,
-    auto_allow: bool = True,
+    auto_allow: bool = False,
+    permission_handler: PermissionHandler | None = None,
     prompt_timeout: float = 300.0,
 ) -> AsyncIterator[BridgeEvent]:
     """Reuse pooled ACP process; attach via session/load or create fresh."""
@@ -141,6 +143,7 @@ async def run_acp_turn(
         env=env,
         auto_allow=auto_allow,
         auth_method_id=auth_method_id,
+        permission_handler=permission_handler,
     )
     yield BridgeEvent(
         type='status',
@@ -304,6 +307,7 @@ async def run_acp_turn(
             yield item
     finally:
         acp.on_notification = None
+        acp.on_permission_request = None
         if not task.done():
             task.cancel()
             try:

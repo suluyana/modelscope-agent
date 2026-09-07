@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Optional
 logger = logging.getLogger(__name__)
 
 MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
+LifecycleHandler = Callable[[], Awaitable[None]]
 
 
 class BridgeWSClient:
@@ -22,11 +23,15 @@ class BridgeWSClient:
         on_message: MessageHandler,
         reconnect_delay: float = 15.0,
         headers: dict[str, str] | None = None,
+        on_connect: LifecycleHandler | None = None,
+        on_disconnect: LifecycleHandler | None = None,
     ) -> None:
         self.url = url
         self.on_message = on_message
         self.reconnect_delay = reconnect_delay
         self.headers = headers or {}
+        self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
         self._ws = None
         self._stop = asyncio.Event()
 
@@ -68,16 +73,22 @@ class BridgeWSClient:
                 extra['additional_headers'] = self.headers
             else:
                 extra['extra_headers'] = self.headers
-        async with websockets.connect(self.url, **extra) as ws:
-            self._ws = ws
-            logger.info('Bridge connected to %s', self.url)
-            async for raw in ws:
-                if self._stop.is_set():
-                    break
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.warning('Invalid WS frame: %s', raw)
-                    continue
-                await self.on_message(msg)
-        self._ws = None
+        try:
+            async with websockets.connect(self.url, **extra) as ws:
+                self._ws = ws
+                logger.info('Bridge connected to %s', self.url)
+                if self.on_connect is not None:
+                    await self.on_connect()
+                async for raw in ws:
+                    if self._stop.is_set():
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning('Invalid WS frame: %s', raw)
+                        continue
+                    await self.on_message(msg)
+        finally:
+            self._ws = None
+            if self.on_disconnect is not None:
+                await self.on_disconnect()

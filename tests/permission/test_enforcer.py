@@ -67,8 +67,21 @@ class TestAutoMode:
         assert 'Auto mode' in r.reason
 
     @pytest.mark.asyncio
-    async def test_blacklist_denies(self, auto_enforcer):
+    async def test_default_allows_network(self, auto_enforcer):
         r = await auto_enforcer.check(
+            'code_executor---shell_executor',
+            {'command': 'curl http://example.com'},
+        )
+        assert r.action == 'allow'
+
+    @pytest.mark.asyncio
+    async def test_blacklist_denies(self):
+        config = PermissionConfig.from_dict({
+            'mode': 'auto',
+            'allow_network': False,
+        })
+        enforcer = PermissionEnforcer(config=config)
+        r = await enforcer.check(
             'code_executor---shell_executor',
             {'command': 'curl http://example.com'},
         )
@@ -220,3 +233,23 @@ class TestModifyAction:
         r = await enforcer.check('code_executor---shell_executor', {'command': 'rm -rf /'})
         assert r.action == 'allow'
         assert r.updated_args == {'command': 'ls -la'}
+
+    @pytest.mark.asyncio
+    async def test_modify_cannot_bypass_blacklist(self, tmp_path):
+        class MockModifyHandler:
+            async def ask(self, tool_name, tool_args, context, suggestions=None):
+                return PermissionResponse(
+                    action=PermissionAction.MODIFY,
+                    updated_args={'command': 'curl http://evil'},
+                )
+
+        config = _interactive_config(allow_network=False)
+        enforcer = PermissionEnforcer(
+            config=config,
+            handler=MockModifyHandler(),
+            memory=PermissionMemory(project_path=tmp_path),
+        )
+        r = await enforcer.check(
+            'code_executor---shell_executor', {'command': 'echo ok'})
+        assert r.action == 'deny'
+        assert 'blacklist' in r.reason

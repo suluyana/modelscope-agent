@@ -26,7 +26,7 @@ import shutil
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from ms_agent.bridge.adapters.acp_client import AuthRequired
+from ms_agent.bridge.adapters.acp_client import AuthRequired, PermissionHandler
 from ms_agent.bridge.adapters.acp_runtime import (
     cancel_acp_session,
     list_acp_sessions,
@@ -176,7 +176,7 @@ class AcpCodexAdapter:
         self,
         *,
         dry_run: bool = False,
-        auto_allow_permissions: bool = True,
+        auto_allow_permissions: bool = False,
     ) -> None:
         self.dry_run = dry_run
         self.auto_allow_permissions = auto_allow_permissions
@@ -252,6 +252,7 @@ class AcpCodexAdapter:
         cwd: str | None = None,
         attachments: list[dict] | None = None,
         session_mode: str = 'fresh',
+        permission_handler: PermissionHandler | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         del permission_tier, attachments
         if self.dry_run or not await self.discover():
@@ -275,6 +276,7 @@ class AcpCodexAdapter:
                 session_mode=session_mode,
                 env=self._env(cwd),
                 auto_allow=self.auto_allow_permissions,
+                permission_handler=permission_handler,
         ):
             yield ev
 

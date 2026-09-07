@@ -263,6 +263,55 @@ async def cancel_dispatch(dispatch_id: str):
     }
 
 
+class PermissionResolveRequest(BaseModel):
+    decision: str
+    fingerprint: str
+    option_id: Optional[str] = None
+    endpoint_id: Optional[str] = None
+
+
+@router.post('/permissions/{permission_request_id}/resolve')
+async def resolve_permission(
+    permission_request_id: str,
+    body: PermissionResolveRequest,
+):
+    """Resolve a live Bridge/ACP permission request. Never replays tool args."""
+    state = get_team_state()
+    pending = state.pending_permissions.get(permission_request_id)
+    if pending is None and not body.endpoint_id:
+        raise HTTPException(
+            409,
+            detail={
+                'error': 'PERMISSION_NOT_LIVE',
+                'resume_status': 'needs_manual_restart',
+            },
+        )
+    fingerprint = body.fingerprint or (
+        pending or {}).get('fingerprint') or ''
+    if not fingerprint:
+        raise HTTPException(400, detail={'error': 'FINGERPRINT_REQUIRED'})
+    if pending and pending.get('fingerprint') and fingerprint != pending[
+            'fingerprint']:
+        raise HTTPException(409, detail={'error': 'FINGERPRINT_MISMATCH'})
+    hub = get_bridge_hub()
+    result = await hub.resolve_permission(
+        endpoint_id=body.endpoint_id or (pending or {}).get('endpoint_id'),
+        permission_request_id=permission_request_id,
+        fingerprint=fingerprint,
+        decision=body.decision,
+        option_id=body.option_id,
+    )
+    if not result.get('ok'):
+        raise HTTPException(
+            503,
+            detail={
+                'error': result.get('error') or 'BRIDGE_UNREACHABLE',
+                'resume_status': 'needs_manual_restart',
+            },
+        )
+    return result
+
+
 def _dispatch_detail(state, dispatch_id: str) -> dict[str, Any] | None:
     """Envelope + log-derived status for C-05 private stream."""
     envelope = state.ingress.get_envelope(dispatch_id)

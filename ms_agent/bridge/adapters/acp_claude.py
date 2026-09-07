@@ -10,7 +10,7 @@ import os
 import shutil
 from typing import AsyncIterator
 
-from ms_agent.bridge.adapters.acp_client import AuthRequired
+from ms_agent.bridge.adapters.acp_client import AuthRequired, PermissionHandler
 from ms_agent.bridge.adapters.acp_runtime import (
     cancel_acp_session,
     list_acp_sessions,
@@ -39,7 +39,7 @@ class AcpClaudeAdapter:
         self,
         *,
         dry_run: bool = False,
-        auto_allow_permissions: bool = True,
+        auto_allow_permissions: bool = False,
     ) -> None:
         self.dry_run = dry_run
         self.auto_allow_permissions = auto_allow_permissions
@@ -91,6 +91,7 @@ class AcpClaudeAdapter:
         cwd: str | None = None,
         attachments: list[dict] | None = None,
         session_mode: str = 'fresh',
+        permission_handler: PermissionHandler | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         del permission_tier, attachments
         if self.dry_run or not await self.discover():
@@ -122,6 +123,7 @@ class AcpClaudeAdapter:
                 cwd=cwd,
                 session_mode=session_mode,
                 auto_allow=self.auto_allow_permissions,
+                permission_handler=permission_handler,
         ):
             yield ev
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import uuid
@@ -34,6 +36,18 @@ class AgentSlot:
     adapter: Any = None
 
 
+@dataclass
+class PendingPermission:
+    permission_request_id: str
+    fingerprint: str
+    dispatch_id: str
+    endpoint_id: str
+    runtime_session_id: str
+    options: list[dict[str, Any]]
+    future: asyncio.Future
+    resolution_reason: str = 'resolved'
+
+
 class BridgeDaemon:
     """Connects to platform WS as a MachineBridge; demuxes to local Agents."""
 
@@ -49,6 +63,7 @@ class BridgeDaemon:
         dry_run: bool = False,
         bridge_token: str | None = None,
         default_cwd: str | None = None,
+        permission_timeout: float | None = None,
     ) -> None:
         self.api_base = api_base
         self.ws_url = ws_url
@@ -59,9 +74,21 @@ class BridgeDaemon:
         self.instance_id = uuid.uuid4().hex
         self.queue = BridgeDispatchQueue()
         self.dry_run = dry_run
+        configured_permission_timeout = (
+            float(permission_timeout)
+            if permission_timeout is not None
+            else float(os.environ.get(
+                'MS_AGENT_BRIDGE_PERMISSION_TIMEOUT', '240')))
+        self.permission_timeout = min(
+            max(configured_permission_timeout, 0.1), 290.0)
         self._bridge_token = bridge_token
         self._ws: BridgeWSClient | None = None
         self._agents: dict[str, AgentSlot] = {}
+        self._pending_permissions: dict[str, PendingPermission] = {}
+        self._resolved_permissions: set[str] = set()
+        self._terminal_dispatches: set[str] = set()
+        self._permission_state_lock = asyncio.Lock()
+        self._interrupted_dispatches: dict[str, dict[str, Any]] = {}
         for slot in agents or []:
             if slot.adapter is None:
                 slot.adapter = make_adapter(slot.runtime, dry_run=dry_run)
@@ -85,6 +112,8 @@ class BridgeDaemon:
             ws_url,
             on_message=on_message,
             headers=headers,
+            on_connect=self._on_ws_connect,
+            on_disconnect=self._on_ws_disconnect,
         )
 
         async def _after_connect_heartbeat():
@@ -159,6 +188,7 @@ class BridgeDaemon:
         mtype = msg.get('type')
         if mtype == 'dispatch':
             envelope = DispatchEnvelope.from_dict(msg['envelope'])
+            self._terminal_dispatches.discard(envelope.dispatch_id)
             logger.info(
                 'Dispatch %s → @%s (%s)',
                 envelope.dispatch_id,
@@ -169,6 +199,10 @@ class BridgeDaemon:
         elif mtype == 'cancel':
             dispatch_id = msg.get('dispatch_id') or ''
             session_id = msg.get('runtime_session_id') or dispatch_id
+            async with self._permission_state_lock:
+                self._mark_dispatch_terminal(dispatch_id)
+                self._deny_permissions_for_dispatch(
+                    dispatch_id, reason='cancelled')
             # Best-effort: cancel on all adapters.
             for slot in self._agents.values():
                 if slot.adapter is not None:
@@ -181,6 +215,8 @@ class BridgeDaemon:
                 'summary': 'cancelled',
                 'artifacts': [],
             })
+        elif mtype == 'permission_resolve':
+            await self._resolve_permission(msg)
         elif mtype in ('revoke', 'policy_update', 'remote_profile_change'):
             logger.info('Received frame: %s', mtype)
         elif mtype == 'registered':
@@ -313,6 +349,12 @@ class BridgeDaemon:
 
         summary_parts: list[str] = []
         had_error = False
+
+        async def _permission_handler(
+                request: dict[str, Any]) -> dict[str, Any]:
+            return await self._forward_permission_request(
+                envelope, slot, request)
+
         try:
             async for event in slot.adapter.execute(
                     prompt=prompt,
@@ -320,6 +362,7 @@ class BridgeDaemon:
                     permission_tier=envelope.permission_tier,
                     cwd=cwd,
                     session_mode=envelope.session_mode,
+                    permission_handler=_permission_handler,
             ):
                 await self._send({
                     'type': 'stream_event',
@@ -345,6 +388,9 @@ class BridgeDaemon:
                 'artifacts': [],
             })
             return
+        finally:
+            self._deny_permissions_for_dispatch(
+                envelope.dispatch_id, reason='turn_ended')
 
         await self._send({
             'type': 'dispatch_done',
@@ -356,13 +402,246 @@ class BridgeDaemon:
             'artifacts': [],
         })
 
-    async def _send(self, payload: dict[str, Any]) -> None:
-        if self._ws is None:
+    async def _forward_permission_request(
+        self,
+        envelope: DispatchEnvelope,
+        slot: AgentSlot,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Forward one ACP request and keep its JSON-RPC call pending."""
+        if envelope.dispatch_id in self._terminal_dispatches:
+            return {'outcome': {'outcome': 'cancelled'}}
+        options = [
+            dict(option) for option in (request.get('options') or [])
+            if isinstance(option, dict)
+        ]
+        fingerprint_payload = {
+            'bridge_id': self.bridge_id,
+            'endpoint_id': envelope.target_endpoint_id,
+            'dispatch_id': envelope.dispatch_id,
+            'runtime_session_id': request.get('runtime_session_id') or '',
+            'call_id': request.get('call_id') or '',
+            'tool': request.get('tool') or 'tool',
+            'args': request.get('args') or {},
+            'options': options,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=str,
+            ).encode('utf-8')).hexdigest()
+        permission_request_id = f'perm_{uuid.uuid4().hex}'
+        future = asyncio.get_running_loop().create_future()
+        pending = PendingPermission(
+            permission_request_id=permission_request_id,
+            fingerprint=fingerprint,
+            dispatch_id=envelope.dispatch_id,
+            endpoint_id=envelope.target_endpoint_id,
+            runtime_session_id=request.get('runtime_session_id') or '',
+            options=options,
+            future=future,
+        )
+        self._pending_permissions[permission_request_id] = pending
+        frame = {
+            'type': 'permission_request',
+            'permission_request_id': permission_request_id,
+            'bridge_id': self.bridge_id,
+            'endpoint_id': envelope.target_endpoint_id,
+            'dispatch_id': envelope.dispatch_id,
+            'runtime_session_id': pending.runtime_session_id,
+            'call_id': request.get('call_id') or '',
+            'tool': request.get('tool') or 'tool',
+            'args': request.get('args') or {},
+            'options': options,
+            'fingerprint': fingerprint,
+        }
+        if not await self._send(frame):
+            self._pending_permissions.pop(permission_request_id, None)
+            raise RuntimeError('permission continuation_required: bridge offline')
+        await self._send({
+            'type': 'dispatch_waiting_approval',
+            'dispatch_id': envelope.dispatch_id,
+            'endpoint_id': envelope.target_endpoint_id,
+            'permission_request_id': permission_request_id,
+            'status': 'waiting_approval',
+        })
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=self.permission_timeout,
+            )
+        except asyncio.TimeoutError:
+            pending.resolution_reason = 'timeout'
+            result = {'outcome': {'outcome': 'cancelled'}}
+            self._resolved_permissions.add(permission_request_id)
+            if not future.done():
+                future.set_result(result)
+        finally:
+            self._pending_permissions.pop(permission_request_id, None)
+        if envelope.dispatch_id in self._terminal_dispatches:
+            pending.resolution_reason = 'cancelled'
+            result = {'outcome': {'outcome': 'cancelled'}}
+        await self._send({
+            'type': 'permission_resolved',
+            'permission_request_id': permission_request_id,
+            'dispatch_id': envelope.dispatch_id,
+            'endpoint_id': envelope.target_endpoint_id,
+            'fingerprint': fingerprint,
+            'decision': 'allow'
+            if result.get('outcome', {}).get('outcome') == 'selected'
+            else 'deny',
+            'option_id': result.get('outcome', {}).get('optionId'),
+            'reason': pending.resolution_reason,
+        })
+        async with self._permission_state_lock:
+            if (pending.resolution_reason not in ('cancelled', 'turn_ended')
+                    and envelope.dispatch_id not in self._terminal_dispatches):
+                await self._send({
+                    'type': 'dispatch_resumed',
+                    'dispatch_id': envelope.dispatch_id,
+                    'endpoint_id': envelope.target_endpoint_id,
+                    'permission_request_id': permission_request_id,
+                    'status': 'in_progress',
+                })
+        if envelope.dispatch_id in self._terminal_dispatches:
+            return {'outcome': {'outcome': 'cancelled'}}
+        return result
+
+    async def _resolve_permission(self, msg: dict[str, Any]) -> bool:
+        """Resolve a pending request once; duplicate WS deliveries are no-ops."""
+        request_id = str(msg.get('permission_request_id') or '')
+        if not request_id or request_id in self._resolved_permissions:
+            return False
+        pending = self._pending_permissions.get(request_id)
+        if pending is None or pending.future.done():
+            return False
+        supplied_fingerprint = str(msg.get('fingerprint') or '')
+        if supplied_fingerprint and supplied_fingerprint != pending.fingerprint:
+            logger.warning('Ignoring permission fingerprint mismatch: %s',
+                           request_id)
+            return False
+        decision = str(msg.get('decision') or '').lower()
+        if decision == 'allow':
+            option_id = self._select_allow_option(
+                pending.options,
+                str(msg.get('option_id') or msg.get('optionId') or ''),
+            )
+            if option_id is None:
+                result = {'outcome': {'outcome': 'cancelled'}}
+            else:
+                result = {
+                    'outcome': {
+                        'outcome': 'selected',
+                        'optionId': option_id,
+                    }
+                }
+        elif decision == 'deny':
+            result = {'outcome': {'outcome': 'cancelled'}}
+        else:
+            return False
+        self._resolved_permissions.add(request_id)
+        # Bound duplicate-detection memory; stale duplicates are harmless once
+        # there is no matching pending request.
+        if len(self._resolved_permissions) > 4096:
+            self._resolved_permissions.clear()
+            self._resolved_permissions.add(request_id)
+        pending.future.set_result(result)
+        return True
+
+    def _deny_permissions_for_dispatch(
+        self,
+        dispatch_id: str,
+        *,
+        reason: str,
+    ) -> int:
+        """Fail closed for cancellation/turn end without replaying tool args."""
+        denied = 0
+        for request_id, pending in list(self._pending_permissions.items()):
+            if pending.dispatch_id != dispatch_id or pending.future.done():
+                continue
+            pending.resolution_reason = reason
+            self._resolved_permissions.add(request_id)
+            pending.future.set_result({'outcome': {'outcome': 'cancelled'}})
+            denied += 1
+        return denied
+
+    def _mark_dispatch_terminal(self, dispatch_id: str) -> None:
+        if not dispatch_id:
             return
+        if len(self._terminal_dispatches) >= 4096:
+            self._terminal_dispatches.clear()
+        self._terminal_dispatches.add(dispatch_id)
+
+    @staticmethod
+    def _select_allow_option(
+        options: list[dict[str, Any]],
+        requested_option_id: str,
+    ) -> str | None:
+        for option in options:
+            option_id = str(
+                option.get('optionId') or option.get('option_id')
+                or option.get('id') or '')
+            kind = str(option.get('kind') or '').lower()
+            if requested_option_id and option_id == requested_option_id:
+                return option_id if 'allow' in kind else None
+        if requested_option_id:
+            return None
+        for option in options:
+            kind = str(option.get('kind') or '').lower()
+            normalized_kind = kind.replace('-', '_')
+            if normalized_kind != 'allow_once':
+                continue
+            option_id = str(
+                option.get('optionId') or option.get('option_id')
+                or option.get('id') or '')
+            if option_id:
+                return option_id
+        return None
+
+    async def _on_ws_disconnect(self) -> None:
+        """Fail waiting ACP calls; reconnect must not pretend they resumed."""
+        for request_id, pending in list(self._pending_permissions.items()):
+            if pending.future.done():
+                continue
+            self._interrupted_dispatches[pending.dispatch_id] = {
+                'dispatch_id': pending.dispatch_id,
+                'endpoint_id': pending.endpoint_id,
+                'permission_request_id': request_id,
+                'runtime_session_id': pending.runtime_session_id,
+            }
+            self._resolved_permissions.add(request_id)
+            if not pending.future.done():
+                pending.future.set_exception(
+                    RuntimeError('permission continuation_required after disconnect'))
+        self._pending_permissions.clear()
+
+    async def _on_ws_connect(self) -> None:
+        """Report interrupted waits without replaying tool arguments."""
+        for dispatch_id, interrupted in list(
+                self._interrupted_dispatches.items()):
+            sent = await self._send({
+                'type': 'dispatch_continuation_required',
+                **interrupted,
+                'bridge_id': self.bridge_id,
+                'instance_id': self.instance_id,
+                'status': 'needs_manual_restart',
+                'continuation_required': True,
+            })
+            if sent:
+                self._interrupted_dispatches.pop(dispatch_id, None)
+
+    async def _send(self, payload: dict[str, Any]) -> bool:
+        if self._ws is None:
+            return False
         try:
             await self._ws.send(payload)
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning('send failed: %s', exc)
+            return False
 
 
 def _parse_agents_arg(raw: str) -> list[dict[str, str]]:
