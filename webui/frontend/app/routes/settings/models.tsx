@@ -99,7 +99,7 @@ export default function ModelsSettings() {
 
   const updateSettings = async (patch: Partial<AgentSettings>) => {
     if (!settings) return
-    const next = await api.putAgentSettings({ ...settings, ...patch })
+    const next = await api.putAgentSettings(patch)
     setSettings(next)
   }
 
