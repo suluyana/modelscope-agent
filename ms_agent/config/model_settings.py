@@ -97,6 +97,45 @@ class ModelSettingsManager:
         if data.get('providers', {}).pop(provider_id, None) is not None:
             self._save_raw(data)
 
+    def patch_provider(
+        self,
+        provider_id: str,
+        *,
+        name: Optional[str] = None,
+        protocol: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        clear_api_key: bool = False,
+        clear_base_url: bool = False,
+    ) -> Dict[str, Any]:
+        """Partial update of a providers.<id> entry (creates it if missing).
+
+        ``api_key=''`` / ``base_url=''`` also clear. Used by TUI ``/model
+        provider set|key|url`` so a key-only change does not reset protocol.
+        """
+        data = self._load_raw()
+        providers = data.setdefault('providers', {})
+        entry = dict(providers.get(provider_id) or {
+            'name': provider_id,
+            'protocol': 'openai',
+            'models': [],
+        })
+        if name:
+            entry['name'] = name
+        if protocol:
+            entry['protocol'] = protocol
+        if clear_api_key or api_key == '':
+            entry.pop('api_key', None)
+        elif api_key is not None:
+            entry['api_key'] = api_key
+        if clear_base_url or base_url == '':
+            entry.pop('base_url', None)
+        elif base_url is not None:
+            entry['base_url'] = base_url
+        providers[provider_id] = entry
+        self._save_raw(data)
+        return entry
+
     def add_model(self, provider_id: str, model: str) -> None:
         data = self._load_raw()
         providers = data.setdefault('providers', {})
@@ -128,4 +167,14 @@ class ModelSettingsManager:
                           provider: Optional[str] = None) -> None:
         data = self._load_raw()
         data['default_model'] = f'{provider}/{model}' if provider else model
+        # Same shape WebUI writes: llm.provider + llm.model, so the next
+        # ConfigResolver pass (TUI or WebUI) sees the switch without a
+        # project patch.
+        if provider:
+            llm = data.get('llm')
+            if not isinstance(llm, dict):
+                llm = {}
+            llm['provider'] = provider
+            llm['model'] = model
+            data['llm'] = llm
         self._save_raw(data)

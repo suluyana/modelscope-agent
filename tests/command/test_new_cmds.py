@@ -1,4 +1,5 @@
 """Tests for new builtin commands: /usage, /model, /config, /quit, /tools, /compact, /context."""
+import json
 import pytest
 from dataclasses import dataclass, field
 from typing import List
@@ -125,6 +126,10 @@ class TestUsage:
 
 
 class TestModel:
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('MS_AGENT_HOME', str(tmp_path / 'ms_home'))
+
     @pytest.mark.asyncio
     async def test_show_current_model(self):
         router = make_router()
@@ -166,7 +171,8 @@ class TestModel:
         result = await router.dispatch(ctx)
 
         assert result.type == CommandResultType.MUTATE_STATE
-        assert 'Saved to' in result.content
+        assert 'settings.json' in result.content
+        assert 'Also saved project patch' in result.content
 
         # The source YAML is untouched.
         assert cfg_file.read_text(encoding='utf-8') == yaml_text
@@ -179,14 +185,66 @@ class TestModel:
         assert patch_cfg.llm.model == 'qwen3.7-max'
 
     @pytest.mark.asyncio
-    async def test_switch_model_no_source_file(self):
-        # config without local_dir/name -> in-memory only, no crash
+    async def test_switch_model_no_source_file(self, tmp_path):
+        # No project patch when output_dir/local_dir are unset; still writes
+        # the WebUI-shared default_model in settings.json.
         runtime = MockRuntime()
         router = make_router()
         ctx = make_ctx('/model gpt-4o', runtime=runtime)
         result = await router.dispatch(ctx)
         assert result.type == CommandResultType.MUTATE_STATE
-        assert 'in-memory only' in result.content
+        assert 'settings.json' in result.content
+        from ms_agent.config.model_settings import ModelSettingsManager
+        from ms_agent.project.paths import global_home
+        assert ModelSettingsManager(global_home()).get_default_model() == 'openai/gpt-4o'
+
+    @pytest.mark.asyncio
+    async def test_model_list_reads_settings(self, tmp_path):
+        from ms_agent.config.model_settings import ModelSettingsManager
+        from ms_agent.project.paths import global_home
+        ModelSettingsManager(global_home()).set_default_model(
+            'a-1', provider='acme')
+        router = make_router()
+        ctx = make_ctx('/model list', runtime=MockRuntime())
+        result = await router.dispatch(ctx)
+        assert 'Default: acme/a-1' in result.content
+        assert 'settings.json' in result.content
+
+    @pytest.mark.asyncio
+    async def test_provider_add_set_key_catalog(self, tmp_path):
+        runtime = MockRuntime()
+        router = make_router()
+        added = await router.dispatch(
+            make_ctx(
+                '/model provider add acme key=sk-secret url=https://acme/v1 protocol=openai',
+                runtime=runtime))
+        assert 'Provider acme saved' in added.content
+        data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
+        assert data['providers']['acme']['api_key'] == 'sk-secret'
+        assert data['providers']['acme']['base_url'] == 'https://acme/v1'
+        listed = await router.dispatch(make_ctx('/model list', runtime=runtime))
+        assert 'sk-secret' not in listed.content
+        assert 'key=set' in listed.content
+        await router.dispatch(
+            make_ctx('/model provider key acme sk-new', runtime=runtime))
+        data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
+        assert data['providers']['acme']['api_key'] == 'sk-new'
+        await router.dispatch(
+            make_ctx('/model catalog add acme a-1', runtime=runtime))
+        await router.dispatch(
+            make_ctx('/model catalog remove acme a-1', runtime=runtime))
+        data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
+        assert 'a-1' not in data['providers']['acme'].get('models', [])
+        await router.dispatch(
+            make_ctx('/model provider remove acme', runtime=runtime))
+        data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
+        assert 'acme' not in data.get('providers', {})
+
+    @pytest.mark.asyncio
+    async def test_cannot_remove_builtin_without_override(self):
+        result = await make_router().dispatch(
+            make_ctx('/model provider remove openai', runtime=MockRuntime()))
+        assert 'Cannot remove builtin' in result.content
 
     @pytest.mark.asyncio
     async def test_no_runtime(self):
@@ -381,9 +439,15 @@ class TestAllCommandsRegistered:
         assert 'tools' in all_names
         assert 'compact' in all_names
         assert 'context' in all_names
+        assert 'mcp' in all_names
+        assert 'skills' in all_names
+        assert 'search' in all_names
+        assert 'instruction' in all_names
+        assert 'profile' in all_names
+        assert 'memory' in all_names
 
     def test_total_builtin_count(self):
         router = make_router()
         cmds = router.list_commands('cli')
         total = sum(len(v) for v in cmds.values())
-        assert total == 12
+        assert total == 18

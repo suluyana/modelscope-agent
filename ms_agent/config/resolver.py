@@ -451,7 +451,33 @@ class ConfigResolver:
         # (honored in ToolManager), which lets a higher layer turn a tool off.
         if 'tools' in settings:
             agent_fields['tools'] = settings['tools']
+        ConfigResolver._fill_provider_catalog(agent_fields, settings)
         return OmegaConf.create(agent_fields)
+
+    @staticmethod
+    def _fill_provider_catalog(agent_fields: Dict[str, Any],
+                               settings: Dict[str, Any]) -> None:
+        """Copy providers.<id> credentials onto llm when the llm block only
+        names a provider (WebUI stores keys under ``providers``, not always
+        under ``llm.api_key``). Never overwrites an explicit llm value."""
+        providers = settings.get('providers')
+        if not isinstance(providers, dict):
+            return
+        agent_llm = agent_fields.get('llm')
+        if not isinstance(agent_llm, dict):
+            return
+        pid = str(agent_llm.get('service') or '')
+        entry = providers.get(pid)
+        if not pid or not isinstance(entry, dict):
+            return
+        if entry.get('api_key'):
+            agent_llm.setdefault(f'{pid}_api_key', entry['api_key'])
+            agent_llm.setdefault('api_key', entry['api_key'])
+        if entry.get('base_url'):
+            agent_llm.setdefault(f'{pid}_base_url', entry['base_url'])
+            agent_llm.setdefault('base_url', entry['base_url'])
+        if entry.get('protocol'):
+            agent_llm.setdefault('protocol', entry['protocol'])
 
     @staticmethod
     def _load_json_safe(path: Path) -> Dict[str, Any]:

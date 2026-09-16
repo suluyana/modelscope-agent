@@ -39,6 +39,18 @@ from ms_agent.utils.logger import get_logger
 
 logger = get_logger()
 
+# Same discriminator WebUI session_overrides use. Writing
+# tools.todo_list.plan_filename without mcp:false makes ToolManager treat
+# todo_list as an MCP server ('url' or 'command' parameter is required).
+TUI_RESOLVER_DEFAULTS = {
+    'tools': {
+        'todo_list': {
+            'enabled': True,
+            'mcp': False,
+        },
+    },
+}
+
 
 class TuiApp:
 
@@ -51,6 +63,7 @@ class TuiApp:
         work_dir: Optional[str] = None,
         emit_events: Optional[str] = None,
         mcp_server_file: Optional[str] = None,
+        explicit_config: bool = False,
     ) -> None:
         Env.load_dotenv_into_environ(env_file)
         self.console = Console()
@@ -59,9 +72,12 @@ class TuiApp:
         self.work_dir = str(
             Path(work_dir).expanduser().resolve() if work_dir else Path.cwd().
             resolve())
+        self._project = self._open_project(self.work_dir)
 
-        config = Config.from_task(config_path)
-        config = self._prepare_config(config, permission_mode, self.work_dir)
+        config = self._load_runtime_config(
+            config_path, self.work_dir, explicit_config=explicit_config)
+        config = self._prepare_config(
+            config, permission_mode, self.work_dir, self._project)
         self.config = config
 
         mode = str(
@@ -84,16 +100,10 @@ class TuiApp:
             self._jsonl_sink = JsonlEventSink(emit_events)
             event_sink = TeeEventSink(self.renderer, self._jsonl_sink)
 
-        # Session layer (M1). Work dir == project (CC-aligned): sessions live at
-        # ~/.ms_agent/projects/<work-dir-key>/sessions.
+        # Same path as WebUI: ProjectManager.open_folder (find-by-path, else
+        # path-key). Sessions then live under that project's id.
         from ms_agent.project import SessionManager
-        from ms_agent.project.paths import project_key
-        from ms_agent.project.types import Project
-        proj = Project(
-            id=project_key(self.work_dir),
-            name=Path(self.work_dir).name or 'project',
-            path=self.work_dir)
-        self._sm = SessionManager(proj)
+        self._sm = SessionManager(self._project)
         self.session = None
 
         # Bridge managed config files into the runtime (what a WebUI backend
@@ -141,11 +151,115 @@ class TuiApp:
 
         # ('new', None) | ('resume', '<#|id>') | None, set by session commands.
         self._pending_switch: Optional[Tuple[str, Optional[str]]] = None
+        # Sessions this TUI process minted. Empty leftovers may be pruned;
+        # WebUI (or another TUI) sessions must not.
+        self._owned_session_ids: set[str] = set()
+
+    @staticmethod
+    def _apply_provider_credentials(config, overwrite: bool = False) -> None:
+        """Fill llm keys from settings.json ``providers.<service>``.
+
+        ``overwrite=True`` is for a live ``/model provider`` edit of the
+        current service (replace, don't only fill blanks).
+        """
+        try:
+            from ms_agent.config.model_settings import ModelSettingsManager
+            from ms_agent.project.paths import global_home
+            raw = ModelSettingsManager(global_home())._load_raw()
+        except Exception:
+            return
+        service = str(OmegaConf.select(config, 'llm.service', default='') or '')
+        entry = (raw.get('providers') or {}).get(service) or {}
+        if not service or not isinstance(entry, dict):
+            return
+
+        def _set(field, value, *, force: bool) -> None:
+            if value in (None, ''):
+                if force:
+                    OmegaConf.update(config, field, '', merge=True)
+                return
+            if force or not OmegaConf.select(config, field, default=None):
+                OmegaConf.update(config, field, value, merge=True)
+
+        key_field = f'llm.{service}_api_key'
+        url_field = f'llm.{service}_base_url'
+        _set(key_field, entry.get('api_key'), force=overwrite)
+        _set('llm.api_key', entry.get('api_key'), force=overwrite)
+        _set(url_field, entry.get('base_url'), force=overwrite)
+        _set('llm.base_url', entry.get('base_url'), force=overwrite)
+        proto = entry.get('protocol')
+        if proto and (overwrite or not OmegaConf.select(
+                config, 'llm.protocol', default=None)):
+            OmegaConf.update(config, 'llm.protocol', proto, merge=True)
+
+    @staticmethod
+    def _open_project(work_dir: str):
+        """Same ProjectManager.open_folder path WebUI uses for a local folder.
+
+        New mounts inherit PersonalizationSettings.memory_enabled (WebUI's
+        default for new projects). An already-registered folder keeps its
+        stored flags.
+        """
+        from ms_agent.project import ProjectManager
+        from ms_agent.project.paths import global_home
+        from ms_agent.personalization.settings import PersonalizationSettings
+
+        mem = False
+        backend = None
+        try:
+            loaded = PersonalizationSettings().load()
+            mem = bool(loaded.memory_enabled)
+            backend = loaded.memory_backend
+        except Exception:
+            pass
+        return ProjectManager(base_dir=str(global_home())).open_folder(
+            work_dir, memory_enabled=mem, memory_backend=backend)
 
     # -- config shaping --
 
     @staticmethod
-    def _prepare_config(config, permission_mode, work_dir):
+    def _load_runtime_config(config_path: str,
+                             work_dir: str,
+                             *,
+                             explicit_config: bool = False):
+        """Same layered merge WebUI uses (ConfigResolver), not Config.from_task
+        alone.
+
+        Default TUI (no ``--config``): framework yaml → settings.json → project
+        patch, so WebUI's ``default_model`` / ``llm`` is what the first turn
+        actually runs. An explicit ``--config`` yaml still wins over settings.
+        """
+        from ms_agent.config.resolver import ConfigResolver
+        from ms_agent.project.paths import global_home
+
+        resolver = ConfigResolver(
+            global_dir=str(global_home()),
+            project_root=work_dir,
+            defaults=TUI_RESOLVER_DEFAULTS,
+        )
+        agent_config = Config.from_task(config_path) if explicit_config else None
+        return resolver.resolve(
+            agent_config=agent_config,
+            project_path=work_dir,
+        )
+
+    @staticmethod
+    def _bind_todo_list_session(cfg, sess_dir: str) -> None:
+        """Point the builtin plan tool at this session dir.
+
+        ``mcp: false`` must be set whenever plan_filename is written: a
+        ``tools.todo_list`` node without that flag is treated as an MCP server.
+        """
+        plan_json = os.path.join(sess_dir, 'plan.json')
+        plan_md = os.path.join(sess_dir, 'plan.md')
+        OmegaConf.update(cfg, 'tools.todo_list.mcp', False, merge=True)
+        OmegaConf.update(
+            cfg, 'tools.todo_list.plan_filename', plan_json, merge=True)
+        OmegaConf.update(
+            cfg, 'tools.todo_list.plan_md_filename', plan_md, merge=True)
+
+    @staticmethod
+    def _prepare_config(config, permission_mode, work_dir, project=None):
         OmegaConf.update(config, 'generation_config.stream', True, merge=True)
         OmegaConf.update(
             config, 'generation_config.stream_output', True, merge=True)
@@ -160,11 +274,16 @@ class TuiApp:
         OmegaConf.update(config, 'session_log.enabled', True, merge=True)
         # Interactive lifecycle regardless of stdin detection.
         OmegaConf.update(config, 'interactive', True, merge=True)
+        # Same as WebUI: data-driven provider layer (credentials + protocol).
+        OmegaConf.update(config, 'llm.use_provider_router', True, merge=True)
         # max_chat_round bounds autonomous *steps*; under route A the counter
         # accumulates across interactive turns (and restores on resume), so a
         # small per-task value would cut a long chat short. Raise it high — the
         # user (not a round cap) ends an interactive session.
         OmegaConf.update(config, 'max_chat_round', 1000, merge=True)
+        # Seed before _apply_session writes plan paths, so a fresh TUI without
+        # a WebUI-seeded settings.json still does not MCP-connect todo_list.
+        OmegaConf.update(config, 'tools.todo_list.mcp', False, merge=True)
         if permission_mode:
             OmegaConf.update(
                 config, 'permission.mode', permission_mode, merge=True)
@@ -176,13 +295,45 @@ class TuiApp:
         ]
         OmegaConf.update(config, 'callbacks', cbs, merge=False)
         # Merge the work-dir project patch (e.g. a persisted /model override).
+        # Skipped when ConfigResolver.resolve() already applied it.
+        if not getattr(config, '_project_patch_applied', False):
+            try:
+                from ms_agent.config.resolver import ConfigResolver
+                patch = ConfigResolver()._load_project_patch(work_dir)
+                if patch is not None:
+                    config = OmegaConf.merge(config, patch)
+            except Exception:
+                logger.debug(
+                    'work-dir config patch merge skipped', exc_info=True)
+        TuiApp._apply_provider_credentials(config)
+        # Same files WebUI writes: settings.json personalization + project
+        # instruction. File-based AGENTS.md / PROFILE.md are read live.
+        if project is not None and getattr(project, 'instruction', ''):
+            OmegaConf.update(
+                config,
+                'personalization.project_instruction',
+                project.instruction,
+                merge=True,
+            )
         try:
-            from ms_agent.config.resolver import ConfigResolver
-            patch = ConfigResolver()._load_project_patch(work_dir)
-            if patch is not None:
-                config = OmegaConf.merge(config, patch)
+            from ms_agent.personalization.settings import PersonalizationSettings
+            loaded = PersonalizationSettings().load()
+            if loaded.global_instruction:
+                OmegaConf.update(
+                    config,
+                    'personalization.global_instruction',
+                    loaded.global_instruction,
+                    merge=True,
+                )
         except Exception:
-            logger.debug('work-dir config patch merge skipped', exc_info=True)
+            logger.debug('personalization settings merge skipped', exc_info=True)
+        if project is not None:
+            try:
+                from ms_agent.personalization.memory_apply import (
+                    apply_project_memory)
+                apply_project_memory(config, project)
+            except Exception:
+                logger.debug('project memory apply skipped', exc_info=True)
         return config
 
     # -- session commands (registered into the agent's router) --
@@ -271,6 +422,13 @@ class TuiApp:
         OmegaConf.update(cfg, 'session_log.dir', sess_dir, merge=True)
         OmegaConf.update(
             cfg, 'session_log.session_key', session.session_key, merge=True)
+        # Same as WebUI: plan files live beside the session log, not a
+        # project-shared workspace plan.json. mcp:false is required so
+        # ToolManager does not treat todo_list as an MCP server.
+        self._bind_todo_list_session(cfg, sess_dir)
+        # prepare_tools() rebuilds TodoListTool from this config each
+        # run_loop; do not patch extra_tools here (those instances are
+        # discarded).
         self.config = cfg  # keep the app reference in sync for banners/views
         self.session = session
         self.state.session_name = session.name
@@ -290,16 +448,16 @@ class TuiApp:
         except Exception:
             return True  # on doubt, keep it
 
-    def _prune_empty_sessions(self) -> None:
-        """Delete sessions that never received a user turn (leftover empties
-        from prior launches), so ``/sessions`` stays meaningful."""
-        for s in self._sm.list():
-            self._prune_if_empty(s)
-
     def _prune_if_empty(self, session) -> None:
+        # Only drop unused sessions this process created. A resumed WebUI
+        # chat with no user-role line must stay.
+        owned = getattr(self, '_owned_session_ids', set())
+        if session.id not in owned:
+            return
         if not self._session_has_history(session):
             try:
                 self._sm.delete(session.id)
+                owned.discard(session.id)
             except Exception:
                 pass
 
@@ -431,9 +589,11 @@ class TuiApp:
 
     async def _serve(self) -> None:
         self._banner()
-        self._prune_empty_sessions(
-        )  # clear leftover empties from prior launches
+        # Do not wipe empty sessions on startup: WebUI may have created a
+        # chat the user has not typed into yet. Empty leftovers from *this*
+        # TUI process are pruned when leaving the session (below).
         self.session = self._sm.create(model=self._model or None)
+        self._owned_session_ids.add(self.session.id)
         resume = False  # a fresh session reads a prompt; a resumed one restores
         self.renderer.rule(f'session {self.session.id}', 'green')
         while True:
@@ -486,6 +646,7 @@ class TuiApp:
             kind = switch[0]
             if kind == 'new':
                 self.session = self._sm.create(model=self._model or None)
+                self._owned_session_ids.add(self.session.id)
                 resume = False
                 self.renderer.rule(f'new session {self.session.id}', 'green')
             elif kind == 'resume':
@@ -520,6 +681,7 @@ def main(
     work_dir: Optional[str] = None,
     emit_events: Optional[str] = None,
     mcp_server_file: Optional[str] = None,
+    explicit_config: bool = False,
 ) -> None:
     TuiApp(
         config_path,
@@ -528,4 +690,5 @@ def main(
         trust_remote_code=trust_remote_code,
         work_dir=work_dir,
         emit_events=emit_events,
-        mcp_server_file=mcp_server_file).run()
+        mcp_server_file=mcp_server_file,
+        explicit_config=explicit_config).run()
