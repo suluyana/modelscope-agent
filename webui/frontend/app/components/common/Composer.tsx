@@ -847,12 +847,15 @@ export function Composer({
         // instead of being hoisted into its own section above a divider.
         ...projects.map((p) => ({
           key: p.id,
-          icon: <FolderIcon className="h-5 w-5" />,
+          icon: <FolderIcon className="h-4 w-4" />,
           // Capped + truncated: an antd menu sizes itself to its widest row, so
           // one long project name stretched the whole panel past the viewport.
           // The full name stays reachable via the row's native tooltip.
           label: (
-            <span className="block max-w-[240px] truncate" title={p.name}>
+            <span
+              className="block max-w-[240px] text-xs truncate"
+              title={p.name}
+            >
               {p.name}
             </span>
           ),
@@ -861,11 +864,11 @@ export function Composer({
             onProjectChange?.(p.id)
           }
         })),
-        { type: 'divider' as const },
+        ...(projects.length > 0 ? [{ type: 'divider' as const }] : []),
         {
           key: '__create__',
-          icon: <AddIcon className="h-5 w-5" />,
-          label: t.home.createProject,
+          icon: <AddIcon className="h-4 w-4" />,
+          label: <span className="text-xs">{t.home.createProject}</span>,
           onClick: () => setCreateOpen(true)
         }
       ]
@@ -1102,7 +1105,7 @@ export function Composer({
                 >
                   <span className="min-w-0 truncate">{pickerLabel}</span>
                   <CaretDownIcon
-                    className={`ml-1 h-[7px] w-[7px] shrink-0 transition-transform duration-200 ${
+                    className={`ml-1 h-2.25 w-2.25 shrink-0 transition-transform duration-200 ${
                       projectMenuOpen ? 'rotate-180' : ''
                     }`}
                   />
@@ -1327,15 +1330,6 @@ export function Composer({
                           />
                         )}
 
-                        {/* Pills: hidden on a narrow footer unless expanded, always
-                            inline above the threshold.
-                            `w-max` + `shrink-0` are what make the strip above
-                            scrollable rather than squashed: PillButton carries
-                            `min-w-0`, so inside a nowrap line the pills would
-                            otherwise all compress to a few unreadable characters
-                            instead of overflowing. Sizing this row to its content
-                            leaves the line exactly full, so each pill keeps the
-                            width its own `max-w` cap gives it. */}
                         <div
                           className={`flex items-center gap-2.5 ${
                             pillsExpanded
@@ -1402,15 +1396,17 @@ export function Composer({
 
                           {/* Search-not-configured hint: only when search is on
                               but its provider has no key. Uses PillButton (not a
-                              hand-rolled button) so the background, padding,
-                              height and label truncation match the selector
-                              pills exactly — copying its classes by hand drifted
-                              on all four. `caret={false}`: it navigates rather
-                              than opening a panel. */}
+                              hand-rolled button) so the background, padding and
+                              height match the selector pills exactly — copying its
+                              classes by hand drifted on all of them. `caret={false}`:
+                              it navigates rather than opening a panel. `fitContent`
+                              drops the shared width cap so the whole "search not set
+                              up" message reads instead of collapsing to "Searc…". */}
                           {searchNeedsKey && (
                             <Tooltip title={t.home.searchUnconfiguredTip}>
                               <PillButton
                                 caret={false}
+                                fitContent
                                 onClick={() => navigate('/settings/search')}
                                 icon={<EditIcon className="h-4 w-4" />}
                                 className="!text-msa-text-3"
@@ -1423,7 +1419,7 @@ export function Composer({
                       </div>
 
                       {/* Right: attach + send */}
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-4">
                         {attachable && (
                           <>
                             <input
