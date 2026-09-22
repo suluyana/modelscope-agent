@@ -27,6 +27,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 from ms_agent.config import Config
@@ -42,12 +43,20 @@ logger = get_logger()
 # Same discriminator WebUI session_overrides use. Writing
 # tools.todo_list.plan_filename without mcp:false makes ToolManager treat
 # todo_list as an MCP server ('url' or 'command' parameter is required).
+# Snapshots default off: TUI has no /rollback, and a home-dir work tree
+# would git-add the whole $HOME on the first turn.
 TUI_RESOLVER_DEFAULTS = {
+    'enable_snapshots': False,
     'tools': {
         'todo_list': {
             'enabled': True,
             'mcp': False,
         },
+    },
+    # Non-empty so LLMAgent.prepare_skills runs and loads bundled skills
+    # (update-config, …). An empty ``{}`` is falsy under OmegaConf.
+    'skills': {
+        'prompt_injection': 'all',
     },
 }
 
@@ -151,6 +160,8 @@ class TuiApp:
 
         # ('new', None) | ('resume', '<#|id>') | None, set by session commands.
         self._pending_switch: Optional[Tuple[str, Optional[str]]] = None
+        # First chat collected while recovering from a missing API key.
+        self._queued_query: Optional[str] = None
         # Sessions this TUI process minted. Empty leftovers may be pruned;
         # WebUI (or another TUI) sessions must not.
         self._owned_session_ids: set[str] = set()
@@ -168,10 +179,8 @@ class TuiApp:
             raw = ModelSettingsManager(global_home())._load_raw()
         except Exception:
             return
-        service = str(OmegaConf.select(config, 'llm.service', default='') or '')
-        entry = (raw.get('providers') or {}).get(service) or {}
-        if not service or not isinstance(entry, dict):
-            return
+        if not isinstance(raw, dict):
+            raw = {}
 
         def _set(field, value, *, force: bool) -> None:
             if value in (None, ''):
@@ -180,6 +189,27 @@ class TuiApp:
                 return
             if force or not OmegaConf.select(config, field, default=None):
                 OmegaConf.update(config, field, value, merge=True)
+
+        service = str(OmegaConf.select(config, 'llm.service', default='') or '')
+        providers = raw.get('providers') or {}
+        entry = providers.get(service) if isinstance(providers.get(service), dict) else {}
+        if not entry and service:
+            for pid, item in providers.items():
+                if str(pid).lower() == service.lower() and isinstance(item, dict):
+                    entry = item
+                    break
+        if not service:
+            return
+        # Canonicalize MiniMax → minimax so later lookups hit the builtin id.
+        from ms_agent.llm.spec import get_registry
+        spec = get_registry().get(service)
+        if spec is not None and spec.name != service:
+            OmegaConf.update(config, 'llm.service', spec.name, merge=True)
+            service = spec.name
+            if not entry:
+                hit = providers.get(spec.name)
+                if isinstance(hit, dict):
+                    entry = hit
 
         key_field = f'llm.{service}_api_key'
         url_field = f'llm.{service}_base_url'
@@ -294,8 +324,9 @@ class TuiApp:
             if c != 'input_callback'
         ]
         OmegaConf.update(config, 'callbacks', cbs, merge=False)
-        # Merge the work-dir project patch (e.g. a persisted /model override).
-        # Skipped when ConfigResolver.resolve() already applied it.
+        # Merge a work-dir ``.ms_agent/config.yaml`` pin if one exists.
+        # ``/model`` no longer writes this file; skipped when resolve() already
+        # applied it.
         if not getattr(config, '_project_patch_applied', False):
             try:
                 from ms_agent.config.resolver import ConfigResolver
@@ -585,6 +616,68 @@ class TuiApp:
         for h in lg.handlers:
             h.setLevel(logging.ERROR)
 
+    @staticmethod
+    def _is_missing_api_key(exc: BaseException) -> bool:
+        from ms_agent.llm.credentials import is_missing_api_key_error
+        return is_missing_api_key_error(exc)
+
+    @staticmethod
+    def _credential_setup_text(exc: BaseException) -> str:
+        from ms_agent.llm.credentials import missing_api_key_setup_text
+        return missing_api_key_setup_text(exc)
+
+    def _ensure_command_runtime(self) -> None:
+        """Let slash commands run after prepare_llm failed (no live LLM yet)."""
+        from ms_agent.agent.runtime import Runtime
+        cfg = self.agent.config
+        llm = getattr(self.agent, 'llm', None)
+        if llm is None:
+            llm = SimpleNamespace(
+                config=cfg,
+                model=str(
+                    OmegaConf.select(cfg, 'llm.model', default='') or ''),
+                _setup_stub=True,
+            )
+            self.agent.llm = llm
+        if getattr(self.agent, 'runtime', None) is None:
+            self.agent.runtime = Runtime(llm=llm)
+        elif getattr(self.agent.runtime, 'llm', None) is None:
+            self.agent.runtime.llm = llm
+
+    async def _setup_until_ready(self) -> Optional[str]:
+        """Prompt until credentials work or the user quits. Returns first chat."""
+        from ms_agent.command.interactive import InteractiveSession
+        from ms_agent.llm import LLM
+
+        self._ensure_command_runtime()
+        session = InteractiveSession(
+            self.router,
+            source='tui',
+            input_source=self.input,
+            event_sink=self.renderer,
+        )
+        while True:
+            turn = await session.run_turn(
+                messages=None, runtime=self.agent.runtime)
+            if turn.action == 'quit':
+                return None
+            try:
+                rebuilt = LLM.from_config(self.agent.config)
+            except ValueError as exc:
+                if self._is_missing_api_key(exc):
+                    self.console.print(
+                        Panel(
+                            self._credential_setup_text(exc),
+                            title='[yellow]still no API key[/]',
+                            border_style='yellow',
+                            expand=False))
+                    continue
+                raise
+            self.agent.llm = rebuilt
+            if self.agent.runtime is not None:
+                self.agent.runtime.llm = rebuilt
+            return turn.text or ''
+
     # -- main loop (route A: one lifecycle per session) --
 
     async def _serve(self) -> None:
@@ -600,11 +693,15 @@ class TuiApp:
             self._pending_switch = None
             self._apply_session(self.session, resume=resume)
             try:
-                gen = await self.agent.run(None, stream=True)
+                query = self._queued_query
+                self._queued_query = None
+                gen = await self.agent.run(query, stream=True)
                 async for _ in gen:
                     pass
             except EOFError:
                 break  # Ctrl-D at the prompt exits
+            except asyncio.CancelledError:
+                break  # generator/teardown cancel on /quit — not a crash
             except KeyboardInterrupt:
                 # Ctrl-C interrupts the running turn but keeps the REPL alive.
                 # Cap the turn with an assistant marker so the resume below
@@ -623,16 +720,35 @@ class TuiApp:
                 resume = True
                 continue
             except Exception as e:  # noqa: BLE001 — surface, don't crash the REPL
+                if isinstance(e, RuntimeError) and (
+                        'cancel scope' in str(e) or 'athrow()' in str(e)):
+                    break
                 self.renderer.finalize()
-                logger.warning('TUI lifecycle error', exc_info=True)
+                if self._is_missing_api_key(e):
+                    logger.info('TUI waiting for API key: %s', e)
+                    self.console.print(
+                        Panel(
+                            self._credential_setup_text(e),
+                            title='[yellow]setup[/]',
+                            border_style='yellow',
+                            expand=False))
+                    queued = await self._setup_until_ready()
+                    if queued is None:
+                        break
+                    self._queued_query = queued
+                    resume = False
+                    continue
+                logger.warning('TUI turn error', exc_info=True)
+                # run_loop already emitted ErrorRaised; the renderer drew the
+                # panel. Reprinting it and then `break` looked like a crash
+                # (two identical errors, then "bye"). Keep the REPL so the
+                # user can /model switch or try again. resume=True restores
+                # the sealed failed turn instead of resending it.
                 self.console.print(
-                    Panel(
-                        f'[bold]{type(e).__name__}[/]: {e}',
-                        title='[red]error[/]',
-                        border_style='red',
-                        subtitle='[dim]LOG_LEVEL=INFO for details[/]',
-                        expand=False))
-                break
+                    '[dim](turn failed — session still open, '
+                    '/model to switch, /quit to exit)[/]')
+                resume = True
+                continue
             self._name_session_from_log()
             # Resolve a resume target against the live list before pruning.
             switch = self._pending_switch

@@ -17,16 +17,19 @@ def make_router():
     return router
 
 
-def make_ctx(text, runtime=None):
+def make_ctx(text, runtime=None, extra=None):
     router = make_router()
     cmd, args = CommandRouter.parse_input(text)
+    payload = {'router': router}
+    if extra:
+        payload.update(extra)
     return CommandContext(
         raw_input=text,
         command_name=cmd,
         args=args,
         source='cli',
         runtime=runtime,
-        extra={'router': router},
+        extra=payload,
     )
 
 
@@ -50,7 +53,22 @@ class TestMcpCommand:
     async def test_help(self):
         result = await make_router().dispatch(make_ctx('/mcp'))
         assert result.type == CommandResultType.MESSAGE
+        assert result.content.startswith('No MCP servers.')
         assert '/mcp list' in result.content
+
+    @pytest.mark.asyncio
+    async def test_help_flag_is_usage_only(self):
+        result = await make_router().dispatch(make_ctx('/mcp help'))
+        assert result.content.startswith('usage:')
+        assert 'No MCP servers' not in result.content
+
+    @pytest.mark.asyncio
+    async def test_missing_args_is_focused(self):
+        result = await make_router().dispatch(
+            make_ctx('/mcp json', MockRuntime()))
+        assert 'Need: /mcp json <file.json>' in result.content
+        assert 'Got:  /mcp json' in result.content
+        assert '/mcp add' not in result.content
 
     @pytest.mark.asyncio
     async def test_add_list_disable_global(self, isolate_home):
@@ -61,6 +79,7 @@ class TestMcpCommand:
                 '/mcp add docs global url=https://example/mcp',
                 runtime=runtime))
         assert 'Added docs' in added.content
+        assert 'Settings' not in added.content
 
         listed = await router.dispatch(make_ctx('/mcp list global', runtime))
         assert 'docs' in listed.content
@@ -90,10 +109,28 @@ class TestMcpCommand:
         result = await make_router().dispatch(
             make_ctx('/mcp add local command=npx', runtime))
         assert 'Added local' in result.content
+        assert '(project)' in result.content
+        assert 'Settings' in result.content
         mgr = MCPConfigManager(str(isolate_home), str(work))
         entry = mgr.list('project')['local']
         assert entry['command'] == 'npx'
         assert entry['args'] == []
+
+    @pytest.mark.asyncio
+    async def test_add_sees_work_dir_on_agent_runtime(self, tmp_path,
+                                                      isolate_home):
+        """Live TUI passes Runtime(llm=...), not a fake agent with .config."""
+        from types import SimpleNamespace
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = SimpleNamespace(
+            llm=SimpleNamespace(
+                config=OmegaConf.create({'output_dir': str(work)})))
+        result = await make_router().dispatch(
+            make_ctx('/mcp add live url=https://example/mcp', runtime))
+        assert 'Added live (project)' in result.content
+        mgr = MCPConfigManager(str(isolate_home), str(work))
+        assert 'live' in mgr.list('project')
 
     @pytest.mark.asyncio
     async def test_add_splits_stdio_command_line(self, isolate_home):
@@ -135,6 +172,7 @@ class TestSkillsCommand:
     @pytest.mark.asyncio
     async def test_help(self):
         result = await make_router().dispatch(make_ctx('/skills'))
+        assert result.content.startswith('No skills.')
         assert '/skills add' in result.content
 
     @pytest.mark.asyncio
@@ -192,6 +230,92 @@ class TestSkillsCommand:
             make_ctx('/skills disable demo global', runtime))
         data = SkillsConfigManager(str(isolate_home)).load_global()
         assert 'demo' in data.get('disabled', [])
+
+    @pytest.mark.asyncio
+    async def test_add_without_scope_uses_project_when_work_dir(
+            self, tmp_path, isolate_home):
+        src = tmp_path / 'ask-skill'
+        src.mkdir()
+        (src / 'SKILL.md').write_text('# ask\n')
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        result = await make_router().dispatch(
+            make_ctx(f'/skills add {src}', runtime))
+        assert 'Imported: ask-skill (project)' in result.content
+        assert (work / '.ms_agent' / 'skills' / 'ask-skill' / 'SKILL.md').is_file()
+        assert not (isolate_home / 'skills' / 'ask-skill').exists()
+
+    @pytest.mark.asyncio
+    async def test_add_without_work_dir_defaults_global(
+            self, tmp_path, isolate_home):
+        src = tmp_path / 'solo-skill'
+        src.mkdir()
+        (src / 'SKILL.md').write_text('# solo\n')
+        result = await make_router().dispatch(
+            make_ctx(f'/skills add {src}', MockRuntime()))
+        assert 'Imported: solo-skill (global)' in result.content
+        dest = SkillsConfigManager(str(isolate_home)).global_skills_tree()
+        assert (dest / 'solo-skill' / 'SKILL.md').is_file()
+
+    @pytest.mark.asyncio
+    async def test_enable_without_scope_uses_same_default_as_add(
+            self, tmp_path, isolate_home):
+        src = tmp_path / 'only-here'
+        src.mkdir()
+        (src / 'SKILL.md').write_text('# only\n')
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        router = make_router()
+        await router.dispatch(
+            make_ctx(f'/skills add {src}', runtime))
+        result = await router.dispatch(
+            make_ctx('/skills disable only-here', runtime))
+        assert 'disable only-here (project)' in result.content
+        proj = SkillsConfigManager(str(isolate_home)).load_project(str(work))
+        assert 'only-here' in proj.get('disabled', [])
+        glob = SkillsConfigManager(str(isolate_home)).load_global()
+        assert 'only-here' not in glob.get('disabled', [])
+
+    @pytest.mark.asyncio
+    async def test_list_without_runtime_shows_live_tree_ids(
+            self, tmp_path, isolate_home):
+        src = tmp_path / 'shown-skill'
+        src.mkdir()
+        (src / 'SKILL.md').write_text('# Shown\n')
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        router = make_router()
+        await router.dispatch(
+            make_ctx(f'/skills add {src} global', runtime))
+        listed = await router.dispatch(make_ctx('/skills list', runtime))
+        assert 'shown-skill' in listed.content
+        assert listed.content.strip().startswith('Skills:')
+        assert 'Sources:' not in listed.content
+
+    @pytest.mark.asyncio
+    async def test_disable_skill_named_project_is_not_a_scope(
+            self, tmp_path, isolate_home):
+        src = tmp_path / 'project'
+        src.mkdir()
+        (src / 'SKILL.md').write_text('# project\n')
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        router = make_router()
+        await router.dispatch(
+            make_ctx(f'/skills add {src} project', runtime))
+        result = await router.dispatch(
+            make_ctx('/skills disable project', runtime))
+        assert 'disable project (project)' in result.content
+        proj = SkillsConfigManager(str(isolate_home)).load_project(str(work))
+        assert 'project' in proj.get('disabled', [])
 
     @pytest.mark.asyncio
     async def test_alias_skill_mgr(self):

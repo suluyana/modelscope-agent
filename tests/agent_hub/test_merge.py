@@ -276,10 +276,9 @@ class TestResolveTargetPath(unittest.TestCase):
         self.assertEqual(
             _resolve_target_path("hermes", "memories/MEMORY.md", "qoder"),
             "memory/MEMORY.md")
-        # ms-agent has no memory slot, so qoder memory has no semantic target
-        # there either (folds into the catch-all instead).
-        self.assertIsNone(
-            _resolve_target_path("qoder", "memory/MEMORY.md", "ms-agent"))
+        self.assertEqual(
+            _resolve_target_path("qoder", "memory/MEMORY.md", "ms-agent"),
+            "memory/MEMORY.md")
 
     def test_cross_product_ms_agent_profile(self):
         # ms-agent PROFILE.md -> qwenpaw maps to memory/USER.md (USER group).
@@ -305,13 +304,17 @@ class TestResolveTargetPath(unittest.TestCase):
         self.assertIsNone(
             _resolve_target_path("qoder", "memory/USER.md", "openhuman"))
 
-    def test_cross_product_ms_agent_no_memory_slot(self):
-        # ms-agent has NO memory slot (memory is project-level at runtime, not
-        # part of the global home layout). An inbound MEMORY.md therefore has no
-        # semantic target and returns None, letting the merger fold it into the
-        # catch-all instructions file instead of writing a dead MEMORY.md.
-        self.assertIsNone(_resolve_target_path("openclaw", "MEMORY.md", "ms-agent"))
-        self.assertIsNone(_resolve_target_path("nanobot", "memory/MEMORY.md", "ms-agent"))
+    def test_cross_product_ms_agent_memory_slot(self):
+        # ms-agent runtime memory is project-level. The merger still maps
+        # inbound MEMORY.md onto the semantic slot ``memory/MEMORY.md``;
+        # convert_workspace peels that file out of the global home and writes
+        # it under ``<work>/.ms_agent/memory/MEMORY.md``.
+        self.assertEqual(
+            _resolve_target_path("openclaw", "MEMORY.md", "ms-agent"),
+            "memory/MEMORY.md")
+        self.assertEqual(
+            _resolve_target_path("nanobot", "memory/MEMORY.md", "ms-agent"),
+            "memory/MEMORY.md")
 
     def test_cross_product_no_mapping_passthrough(self):
         result = _resolve_target_path("nanobot", "skills/my-skill/SKILL.md", "openclaw")
@@ -460,10 +463,10 @@ class TestMergeResources(unittest.TestCase):
         self.assertIn("memory/notes.json", result.merged_files)
         self.assertNotIn("memories/notes.json", result.merged_files)
 
-    def test_loose_memory_keeps_path_for_ms_agent(self):
-        """ms-agent has no home-level memory slot: loose detail keeps its
-        original path at the merge level and the target-spec filter drops
-        it (memory stays out of ms-agent by design)."""
+    def test_loose_memory_inlined_for_ms_agent(self):
+        """ms-agent runtime reads one MEMORY.md: loose topic detail is
+        inlined into ``memory/MEMORY.md`` (then convert peels that file
+        into the project work dir)."""
         result = merge_resources(
             incoming={"memory/t.md": "topic body\n"},
             source_product="qoder",
@@ -471,8 +474,9 @@ class TestMergeResources(unittest.TestCase):
             source_defaults={},
             target_defaults={},
         )
-        self.assertEqual(result.merged_files.get("memory/t.md"),
-                         "topic body\n")
+        merged = result.merged_files["memory/MEMORY.md"]
+        self.assertIn("topic body", merged)
+        self.assertNotIn("memory/t.md", result.merged_files)
 
     def test_fills_missing_from_target_defaults(self):
         """merge_resources fills target defaults for absent source files."""

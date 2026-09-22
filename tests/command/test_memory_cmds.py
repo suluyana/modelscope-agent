@@ -79,6 +79,64 @@ class TestMemoryCommand:
         assert runtime.memory_tools == ['loaded']
 
     @pytest.mark.asyncio
+    async def test_project_toggle_sees_work_dir_on_agent_runtime(
+            self, tmp_path, isolate_home):
+        from types import SimpleNamespace
+        work = tmp_path / 'repo'
+        work.mkdir()
+        ProjectManager(base_dir=str(isolate_home)).open_folder(str(work))
+        runtime = SimpleNamespace(
+            config=None,
+            llm=SimpleNamespace(
+                config=OmegaConf.create({'output_dir': str(work)})),
+            memory_tools=[],
+        )
+        result = await make_router().dispatch(
+            make_ctx('/memory on', runtime))
+        assert 'Project memory → on' in result.content
+
+    @pytest.mark.asyncio
+    async def test_backend_without_scope_is_global_only(
+            self, tmp_path, isolate_home):
+        work = tmp_path / 'repo'
+        work.mkdir()
+        pm = ProjectManager(base_dir=str(isolate_home))
+        project = pm.open_folder(str(work), memory_backend='file')
+        runtime = MockRuntime(work)
+        result = await make_router().dispatch(
+            make_ctx('/memory backend vector', runtime))
+        assert 'Global memory backend default → vector' in result.content
+        assert 'this project is unchanged' in result.content
+        loaded = PersonalizationSettings().load()
+        assert loaded.memory_backend == 'vector'
+        still = pm.get(project.id)
+        assert still.memory_backend == 'file'
+
+    @pytest.mark.asyncio
+    async def test_project_backend_does_not_rewrite_global(
+            self, tmp_path, isolate_home):
+        work = tmp_path / 'repo'
+        work.mkdir()
+        pm = ProjectManager(base_dir=str(isolate_home))
+        project = pm.open_folder(str(work), memory_backend='file')
+        runtime = MockRuntime(work)
+        result = await make_router().dispatch(
+            make_ctx('/memory project backend vector', runtime))
+        assert 'Project memory backend → vector' in result.content
+        loaded = PersonalizationSettings().load()
+        assert loaded.memory_backend != 'vector'
+        updated = pm.get(project.id)
+        assert updated.memory_backend == 'vector'
+
+    @pytest.mark.asyncio
+    async def test_global_backend_alias(self, isolate_home):
+        result = await make_router().dispatch(
+            make_ctx('/memory global backend file'))
+        assert 'Global memory backend default → file' in result.content
+        loaded = PersonalizationSettings().load()
+        assert loaded.memory_backend == 'file'
+
+    @pytest.mark.asyncio
     async def test_vector_does_not_silent_file_fallback(
             self, tmp_path, isolate_home):
         work = tmp_path / 'repo'

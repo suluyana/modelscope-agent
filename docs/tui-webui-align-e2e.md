@@ -89,7 +89,7 @@ ms-agent tui --work-dir /tmp/align-work
 
 | # | 功能 | TUI | 通过标准 |
 |---|---|---|---|
-| E1 | 列表 | `/mcp list [global\|project]` | 与 WebUI MCP 页一致 |
+| E1 | 列表 | `/mcp`（当前列表 + usage）；`/mcp list [global\|project]` | 与 WebUI MCP 页一致 |
 | E2 | 添加 HTTP | `/mcp add <name> [global\|project] url=<url>` | WebUI 能看到同名同 URL |
 | E3 | 添加 stdio | `/mcp add <name> global command="npx -y …"` | command/args 拆对 |
 | E4 | 更新 | `/mcp update <name> [global\|project] url=\|command=` | 同一条被改，不是又建一条 |
@@ -104,7 +104,7 @@ ms-agent tui --work-dir /tmp/align-work
 
 | # | 功能 | TUI | 通过标准 |
 |---|---|---|---|
-| F1 | 列表 | `/skills` `/skills list` | 与 WebUI 技能页能对上 |
+| F1 | 列表 | `/skills`（当前列表 + usage）；`/skills list` | 与 WebUI 技能页能对上 |
 | F2 | 导入 | `/skills add <含 SKILL.md 的目录> [global\|project]` | 拷进 live tree；WebUI 能看到；源目录还在 |
 | F3 | 启用/停用 | `/skills enable\|disable <id> [global\|project]` | 写 skills.json disabled；本会话能跟上 |
 | F4 | 删除托管副本 | `/skills remove <id> [global\|project]` | 只删 live tree；**源目录不删**；WebUI 那条消失 |
@@ -123,7 +123,7 @@ ms-agent tui --work-dir /tmp/align-work
 | G2 | 全局默认 | `/memory global on\|off` | WebUI 个性化默认记忆一致；**已有项目不变** |
 | G3 | 新文件夹继承 | 全局 on 后，TUI 打开一个从没登记过的目录 | 该项目 memory_enabled 为 true |
 | G4 | 本项目开/关 | `/memory on\|off` 或 `/memory project on\|off` | WebUI 该项目记忆开关一致；file 时对话能走到 unified_memory |
-| G5 | 后端 | `/memory backend file\|vector` | file：TUI 用 MEMORY.md；vector：只落盘给 WebUI，**TUI 不得悄悄写成 file** |
+| G5 | 后端 | `/memory backend file\|vector`（全局默认）；`/memory project backend file\|vector`（本项目） | file：TUI 用 MEMORY.md；vector：只落盘给 WebUI，**TUI 不得悄悄写成 file** |
 | G6 | WebUI → TUI | WebUI 打开同一项目的 file 记忆 | 新开 TUI `/memory` 项目为 on |
 | G7 | 中途关掉 | 已经 load 过记忆后再 `/memory off` | 提示 `/new` 才卸工具 |
 
@@ -178,7 +178,8 @@ ms-agent tui --work-dir /tmp/align-work
 1. 清空 `$MS_AGENT_HOME`（不要先开 WebUI，不要手改 yaml）。
 2. `ms-agent tui --work-dir /tmp/align-work`
 3. 应出现会话 banner 和输入框，**不得**在启动时因 todo_list / MCP url 崩溃。
-4. 输入 `/quit` 正常退出即可。
+4. 空 home、还没有 API key：应提示 `/model provider key` / `/model openai/<model>`，**不得直接退出**。配好 key 后再发一句即可；`/quit` 仍能离开。
+5. 已有 key 时输入 `/quit` 正常退出即可。
 
 **失败：** 启动即 traceback，或日志里出现 `'url' or 'command' parameter is required`。
 
@@ -187,13 +188,12 @@ ms-agent tui --work-dir /tmp/align-work
 先前：`/model list` 读 `settings.json`，真正跑模型仍走 `Config.from_task(agent.yaml)`（包装里的 Qwen3-235B）。要对齐得手动 `/model openai/qwen3.7-plus`。
 
 1. 同一 `MS_AGENT_HOME`。WebUI 设置 → 模型，默认选 `openai/qwen3.7-plus`（或当前环境真实在用的那条）并保存。
-2. **不要**在该工作目录留 `<work>/.ms_agent/config.yaml` 的模型覆盖（有则先挪走），否则项目 patch 会盖过全局默认，这是预期。
-3. 新开 TUI：`ms-agent tui --work-dir /tmp/align-work`
-4. `/model`（无参数）或看 banner：当前模型应是 WebUI 刚设的那条，而不是 yaml 里的 `Qwen/Qwen3-235B-A22B-Instruct-2507`。
-5. 发一句短回复（如 `ping`）。请求应打到该默认模型，不必先 `/model openai/qwen3.7-plus`。
-6. （对照）`ms-agent tui --config /path/to/custom.yaml --work-dir ...`：应继续用 yaml 里写死的模型，不被 settings 改掉。
+2. 新开 TUI：`ms-agent tui --work-dir /tmp/align-work`。`/model` 只写两端共用的 `default_model`，不再给这个文件夹钉一份 `.ms_agent/config.yaml`；之后在 WebUI 改默认，下次打开 TUI（无 `--config`）应跟上。
+3. `/model`（无参数）或看 banner：当前模型应是 WebUI 刚设的那条，而不是 yaml 里的 `Qwen/Qwen3-235B-A22B-Instruct-2507`。
+4. 发一句短回复（如 `ping`）。请求应打到该默认模型，不必先 `/model openai/qwen3.7-plus`。
+5. （对照）`ms-agent tui --config /path/to/custom.yaml --work-dir ...`：应继续用 yaml 里写死的模型，不被 settings 改掉。
 
-**失败：** 默认 TUI 仍在用包装 yaml 的模型；或显式 `--config` 反而被 settings 覆盖。
+**失败：** 默认 TUI 仍在用包装 yaml 的模型；或显式 `--config` 反而被 settings 覆盖；或 TUI `/model` 之后 WebUI 再改默认，这个文件夹的 TUI 仍钉在旧模型上。
 
 ---
 
@@ -292,10 +292,11 @@ TUI 命令：
 
 ## 第 3 期：模型供应商 CRUD（key / base_url / catalog）
 
-磁盘：`$MS_AGENT_HOME/settings.json` 的 `providers` / `default_model` / `llm`（与 WebUI「模型设置」同一套）。内置供应商不能删；同名自定义条目是凭证覆盖。列表里的 key 只显示 set/missing，不打印明文。
+磁盘：`$MS_AGENT_HOME/settings.json` 的 `providers` / `default_model` / `llm`（与 WebUI「模型设置」同一套）。内置供应商不能删；同名自定义条目是凭证覆盖。列表里的 key 只显示 set/missing，不打印明文。`/model list live` 对已配 key 的供应商现拉 `/v1/models`，只展示对话/视觉理解 id（图生、视频生、embedding 会丢掉），结果不写回 json。
 
 ```
 /model list
+/model list live [provider]
 /model <provider>/<model>
 /model provider add <id> [key=] [url=] [protocol=openai|anthropic] [name=]
 /model provider set <id> [key=] [url=] [protocol=] [name=]
@@ -367,6 +368,7 @@ TUI 命令：
 /memory project on|off
 /memory global on|off
 /memory backend file|vector
+/memory project backend file|vector
 ```
 
 TUI 的 vector/mem0 不在本期接；选 vector 只落盘给 WebUI 用，**不会**悄悄改写成 file。当前会话若已加载过记忆工具，关记忆后需要 `/new`。

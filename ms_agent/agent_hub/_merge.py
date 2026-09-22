@@ -539,7 +539,11 @@ SEMANTIC_GROUPS = [
         'qwenpaw': 'MEMORY.md',
         'hermes': 'memories/MEMORY.md',
         'openhuman': 'MEMORY.md',
-        'qoder': 'memory/MEMORY.md'
+        'qoder': 'memory/MEMORY.md',
+        # Semantic slot only. convert_workspace peels ``memory/`` out of the
+        # global-home payload and writes it under
+        # ``<work>/.ms_agent/memory/MEMORY.md`` (the runtime/WebUI/TUI path).
+        'ms-agent': 'memory/MEMORY.md',
     },
     {
         'openclaw': 'IDENTITY.md',
@@ -678,9 +682,9 @@ def _resolve_target_path(source_product: str, source_path: str,
 # * openhuman injects ``MEMORY.md`` every session and keeps the bulk memory in
 #   the Obsidian-style ``wiki/`` vault (its Memory Tree mirror) -> detail
 #   routes into ``wiki/memory/``;
-# * ms-agent has no home-level memory slot at all (runtime memory is
-#   project-level) -> unmapped, the target-spec filter drops it like any
-#   other out-of-scope file.
+# * ms-agent runtime memory is one file under the project work dir; convert
+#   inlines loose detail into ``memory/MEMORY.md`` then peels that file out
+#   of the global-home payload.
 _MEMORY_LOOSE_HOME = {
     'hermes': 'memories/',
     'openclaw': 'memory/',
@@ -688,6 +692,7 @@ _MEMORY_LOOSE_HOME = {
     'qoder': 'memory/',
     'openhuman': 'wiki/memory/',
     'nanobot': None,
+    'ms-agent': None,
 }
 
 # The single memory file a ``None`` entry in :data:`_MEMORY_LOOSE_HOME`

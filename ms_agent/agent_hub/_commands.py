@@ -76,6 +76,81 @@ def _fail(message: str) -> int:
     return 1
 
 
+# Inbound memory for ms-agent is merged onto ``memory/MEMORY.md`` then peeled
+# out of the global-home payload. The runtime, TUI and WebUI all read
+# ``<work>/.ms_agent/memory/MEMORY.md``.
+_MS_AGENT_PROJECT_MEMORY_PREFIX = 'memory/'
+
+
+def peel_ms_agent_project_memory(
+        files: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Split ``memory/...`` files out of a convert payload.
+
+    Returns ``(home_files, project_memory_files)``. Project-memory keys are
+    relative to ``memory_dir(work)`` (so ``memory/MEMORY.md`` becomes
+    ``MEMORY.md``).
+    """
+    home: dict[str, str] = {}
+    project: dict[str, str] = {}
+    prefix = _MS_AGENT_PROJECT_MEMORY_PREFIX
+    for path, content in files.items():
+        if path.startswith(prefix):
+            project[path[len(prefix):]] = content
+        else:
+            home[path] = content
+    return home, project
+
+
+def _resolve_convert_work_dir(work_dir: str | None) -> Path:
+    if work_dir:
+        return Path(work_dir).expanduser().resolve()
+    return Path.cwd()
+
+
+def _write_ms_agent_project_memory(work: Path,
+                                   files: dict[str, str]) -> list[Path]:
+    from ms_agent.project.paths import memory_dir
+    dest_root = memory_dir(work)
+    written: list[Path] = []
+    for rel, content in files.items():
+        dest = dest_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            dest.write_bytes(content)
+        else:
+            dest.write_text(content, encoding='utf-8')
+        written.append(dest)
+    return written
+
+
+def _enable_ms_agent_project_memory(work: Path) -> None:
+    """Register *work* as a project and turn on file memory.
+
+    An existing vector-backend project is left alone: writing MEMORY.md must
+    not silently switch that project off vector.
+    """
+    from ms_agent.project.manager import ProjectManager
+    from ms_agent.project.paths import global_home
+    pm = ProjectManager(base_dir=str(global_home()))
+    proj = pm.open_folder(str(work))
+    if getattr(proj, 'memory_backend', None) == 'vector':
+        return
+    if proj.memory_enabled:
+        return
+    pm.update(proj.id, memory_enabled=True, memory_backend='file')
+
+
+def _print_ms_agent_memory_next_steps(work: Path) -> None:
+    from ms_agent.project.paths import memory_dir
+    dest = memory_dir(work)
+    logger.info(
+        '项目记忆已写入 %s。请用同一目录打开：'
+        '`ms-agent tui --work-dir %s`，或在 WebUI 中打开该文件夹。', dest, work)
+    logger.info(
+        'Project memory written to %s. Open this folder in TUI '
+        '(`ms-agent tui --work-dir %s`) or WebUI (same path).', dest, work)
+
+
 def api_error_message(e: APIError, action: str = 'request') -> str:
     """Return a user-friendly message based on the HTTP status code."""
     status = e.status_code or 0
@@ -916,8 +991,13 @@ def convert_workspace(
     target_fw: str,
     dst_spec: WorkspaceSpec,
     dry_run: bool = False,
+    work_dir: str | None = None,
 ) -> int:
     """Shared convert logic: merge -> filter defaults -> backup -> write.
+
+    ``work_dir`` is the project folder TUI/WebUI will open (default: cwd).
+    When the target is ms-agent, inbound MEMORY.md is written under
+    ``<work_dir>/.ms_agent/memory/`` rather than the global home.
 
     Returns 0 on success, 1 on failure.
     """
@@ -1015,6 +1095,12 @@ def convert_workspace(
         converted = result.merged_files
 
     dst_root = dst_spec.workspace_root
+    work_path = _resolve_convert_work_dir(work_dir)
+    project_mem: dict[str, str] = {}
+    if source_fw != target_fw and target_fw == 'ms-agent':
+        # Peel before the dst-spec filter so ``memory/MEMORY.md`` is not
+        # dropped as "not part of the global-home workspace".
+        converted, project_mem = peel_ms_agent_project_memory(converted)
     # Drop files that don't belong to the target framework's workspace spec.
     # merge_resources imports unmapped files (e.g. qwenpaw agent.json/skill.json)
     # as-is; without this filter they would leak into the target framework.
@@ -1050,8 +1136,11 @@ def convert_workspace(
     )
     display.meta('source', src_root)
     display.meta('target', dst_root)
+    if project_mem:
+        display.meta('work-dir', work_path)
     counts = [('in', len(resources), 'bold'),
-              ('written', len(effective), display.COLOR_WRITTEN)]
+              ('written',
+               len(effective) + len(project_mem), display.COLOR_WRITTEN)]
     if merge_pairs:
         counts.append(('merged', len(merge_pairs), display.COLOR_MERGED))
     if dropped:
@@ -1059,6 +1148,15 @@ def convert_workspace(
     display.summary(counts)
 
     display.file_list('Written', effective, color=display.COLOR_WRITTEN)
+    if project_mem:
+        display.file_list(
+            'Project memory',
+            {f'.ms_agent/memory/{k}': v
+             for k, v in project_mem.items()},
+            color=display.COLOR_WRITTEN,
+            root=work_path,
+            note='runtime / TUI / WebUI read this file',
+        )
     display.map_table(
         'Merged',
         merge_pairs,
@@ -1093,7 +1191,7 @@ def convert_workspace(
         print('\n[dry-run] nothing written.')
         return 0
 
-    if not effective:
+    if not effective and not project_mem:
         print('\nNo effective files to write.')
         return 0
 
@@ -1104,8 +1202,15 @@ def convert_workspace(
                                    f'{target_fw}_{dst_spec.agent_name}')
         display.meta('backup', backup_path)
 
-    written = dst_spec.apply(effective)
-    display.done(f'Wrote {len(written)} file(s) under {dst_root}')
+    if effective:
+        written = dst_spec.apply(effective)
+        display.done(f'Wrote {len(written)} file(s) under {dst_root}')
+    if project_mem:
+        mem_written = _write_ms_agent_project_memory(work_path, project_mem)
+        _enable_ms_agent_project_memory(work_path)
+        display.done(f'Wrote {len(mem_written)} project memory file(s) '
+                     f'under {work_path / ".ms_agent" / "memory"}')
+        _print_ms_agent_memory_next_steps(work_path)
     if target_fw == 'openhuman':
         _print_openhuman_next_steps(dst_root)
     return 0
@@ -1119,8 +1224,14 @@ def cmd_convert(
     local_dir=None,
     out_dir=None,
     dry_run: bool = False,
+    work_dir: str | None = None,
 ) -> int:
-    """Local-only format conversion: read a workspace, convert, write it out."""
+    """Local-only format conversion: read a workspace, convert, write it out.
+
+    ``work_dir`` (default: cwd) is the project folder that receives ms-agent
+    MEMORY.md when converting *to* ms-agent. Persona/skills still land in
+    ``out_dir`` / the global home.
+    """
     for fw, label in ((source_fw, '--from-framework'), (target_fw,
                                                         '--target-framework')):
         err = check_framework(fw, f'framework for {label}')
@@ -1156,7 +1267,13 @@ def cmd_convert(
             file=sys.stderr,
         )
     return convert_workspace(
-        src_spec, source_fw, target_fw, dst_spec, dry_run=dry_run)
+        src_spec,
+        source_fw,
+        target_fw,
+        dst_spec,
+        dry_run=dry_run,
+        work_dir=work_dir,
+    )
 
 
 def cmd_watch(

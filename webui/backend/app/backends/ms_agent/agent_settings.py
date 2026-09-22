@@ -56,25 +56,44 @@ def update_settings(body: AgentSettings) -> AgentSettings:
 
         ps = _ps()
         cur = ps.load()
+        memory_enabled = (
+            cur.memory_enabled if body.default_memory_enabled is None
+            else body.default_memory_enabled)
+        memory_backend = (
+            cur.memory_backend if body.default_memory_backend is None
+            else body.default_memory_backend)
         ps.save(
             PersonalizationConfig(
                 global_instruction=cur.global_instruction,  # preserve
-                memory_enabled=body.default_memory_enabled,
-                memory_backend=body.default_memory_backend,
+                memory_enabled=memory_enabled,
+                memory_backend=memory_backend,
             )
         )
-    sidecar.put("agent_settings", "global_mcp_auto_attach", body.global_mcp_auto_attach)
-    sidecar.put("agent_settings", "global_skill_auto_attach", body.global_skill_auto_attach)
-    sidecar.put(
-        "agent_settings",
-        "memory_models",
-        {
-            "llm_provider_id": body.memory_llm_provider_id,
-            "llm_model": body.memory_llm_model,
-            "embed_mode": body.memory_embed_mode,
-            "embed_provider_id": body.memory_embed_provider_id,
-            "embed_model": body.memory_embed_model,
-            "recall_top_k": body.memory_recall_top_k,
-        },
+    if body.global_mcp_auto_attach is not None:
+        sidecar.put("agent_settings", "global_mcp_auto_attach", body.global_mcp_auto_attach)
+    if body.global_skill_auto_attach is not None:
+        sidecar.put("agent_settings", "global_skill_auto_attach", body.global_skill_auto_attach)
+    mem_fields = (
+        body.memory_llm_provider_id,
+        body.memory_llm_model,
+        body.memory_embed_mode,
+        body.memory_embed_provider_id,
+        body.memory_embed_model,
+        body.memory_recall_top_k,
     )
+    if any(v is not None for v in mem_fields):
+        mem_cfg = sidecar.get("agent_settings", "memory_models", {}) or {}
+        if body.memory_llm_provider_id is not None:
+            mem_cfg["llm_provider_id"] = body.memory_llm_provider_id
+        if body.memory_llm_model is not None:
+            mem_cfg["llm_model"] = body.memory_llm_model
+        if body.memory_embed_mode is not None:
+            mem_cfg["embed_mode"] = body.memory_embed_mode
+        if body.memory_embed_provider_id is not None:
+            mem_cfg["embed_provider_id"] = body.memory_embed_provider_id
+        if body.memory_embed_model is not None:
+            mem_cfg["embed_model"] = body.memory_embed_model
+        if body.memory_recall_top_k is not None:
+            mem_cfg["recall_top_k"] = body.memory_recall_top_k
+        sidecar.put("agent_settings", "memory_models", mem_cfg)
     return get_settings()

@@ -427,7 +427,10 @@ class ConfigResolver:
             agent_llm = agent_fields.setdefault('llm', {})
             if not agent_llm.get('model'):
                 if '/' in default_model:
+                    from ms_agent.config.model_settings import (
+                        strip_provider_model_prefix)
                     prov, mdl = default_model.split('/', 1)
+                    mdl = strip_provider_model_prefix(prov, mdl)
                     agent_llm.setdefault('service', prov)
                     agent_llm['model'] = mdl
                 else:

@@ -13,6 +13,7 @@ All tests run fully offline via stub clients; no remote server is contacted.
 Usage:
     python -m pytest tests/agent/test_convert_targetname.py -v
 """
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -465,17 +466,27 @@ class TestFourFrameworkConvertMatrix(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
+        self._old_home = os.environ.get("MS_AGENT_HOME")
+        os.environ["MS_AGENT_HOME"] = str(self.base / "ms_home")
 
     def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("MS_AGENT_HOME", None)
+        else:
+            os.environ["MS_AGENT_HOME"] = self._old_home
         self.tmp.cleanup()
 
-    def _convert(self, src_files, source_fw, target_fw):
+    def _convert(self, src_files, source_fw, target_fw, *, work_dir=None):
         src = self.base / f"{source_fw}_src"
         out = self.base / f"{source_fw}_to_{target_fw}"
         _write(build_spec(source_fw, "bot-a", str(src)).workspace_root, src_files)
+        extra = {}
+        if target_fw == "ms-agent":
+            extra["work_dir"] = str(work_dir or (self.base / "work"))
         rc = cmd_convert(
             source_fw=source_fw, target_fw=target_fw,
             from_name="bot-a", local_dir=str(src), out_dir=str(out),
+            **extra,
         )
         self.assertEqual(rc, 0, f"{source_fw}->{target_fw} convert failed")
         return _read_all(build_spec(target_fw, "bot-a", str(out)).workspace_root)
@@ -541,24 +552,80 @@ class TestFourFrameworkConvertMatrix(unittest.TestCase):
         self.assertIn("memory/USER.md", files)
         self.assertIn("HM_USER_MARKER", files["memory/USER.md"])
 
-    def test_openclaw_to_ms_agent_memory_folds_into_agents(self):
-        """openclaw -> ms-agent: ms-agent has no memory slot (memory is
-        project-level at runtime), so MEMORY.md content is folded into the
-        catch-all AGENTS.md rather than written as a dead global file."""
+    def test_openclaw_to_ms_agent_memory_lands_in_work_dir(self):
+        """openclaw -> ms-agent: MEMORY.md lands in the project work dir
+        (``<work>/.ms_agent/memory/MEMORY.md``), not folded into AGENTS.md
+        and not written as a dead global-home file."""
+        work = self.base / "work"
         files = self._convert(
             {
                 "SOUL.md": "# Soul\nOC soul.\n",
                 "MEMORY.md": "# Memory\nOC_MEM_MARKER.\n",
             },
             "openclaw", "ms-agent",
+            work_dir=work,
         )
-        # no standalone memory file in the ms-agent global layout.
         self.assertNotIn("MEMORY.md", files)
-        # content is preserved by folding into the catch-all instructions file.
-        self.assertIn("AGENTS.md", files)
-        self.assertIn("OC_MEM_MARKER", files["AGENTS.md"])
-        # single-agent target: no agent-prefixed dirs.
+        agents = files.get("AGENTS.md", "")
+        self.assertNotIn("OC_MEM_MARKER", agents)
+        mem = work / ".ms_agent" / "memory" / "MEMORY.md"
+        self.assertTrue(mem.is_file(), f"missing project memory at {mem}")
+        self.assertIn("OC_MEM_MARKER", mem.read_text(encoding="utf-8"))
+        from ms_agent.project.manager import ProjectManager
+        proj = ProjectManager(
+            base_dir=os.environ["MS_AGENT_HOME"]).find_by_path(str(work))
+        self.assertIsNotNone(proj)
+        self.assertTrue(proj.memory_enabled)
+        self.assertEqual(proj.memory_backend or "file", "file")
         self.assertFalse(any("bot-a" in p for p in files))
+
+    def test_openclaw_to_ms_agent_does_not_switch_vector_backend(self):
+        """Convert still writes MEMORY.md, but must not flip an existing
+        vector-backend project onto file memory."""
+        from ms_agent.project.manager import ProjectManager
+        work = self.base / "vector-work"
+        work.mkdir()
+        pm = ProjectManager(base_dir=os.environ["MS_AGENT_HOME"])
+        proj = pm.open_folder(str(work))
+        pm.update(proj.id, memory_enabled=True, memory_backend="vector")
+        self._convert(
+            {
+                "SOUL.md": "# Soul\nOC soul.\n",
+                "MEMORY.md": "# Memory\nKEEP_VECTOR.\n",
+            },
+            "openclaw", "ms-agent",
+            work_dir=work,
+        )
+        mem = work / ".ms_agent" / "memory" / "MEMORY.md"
+        self.assertTrue(mem.is_file())
+        self.assertIn("KEEP_VECTOR", mem.read_text(encoding="utf-8"))
+        updated = pm.find_by_path(str(work))
+        self.assertEqual(updated.memory_backend, "vector")
+        self.assertTrue(updated.memory_enabled)
+
+    def test_ms_agent_work_dir_defaults_to_cwd(self):
+        """Omitted --work-dir writes MEMORY.md under the current directory."""
+        cwd = self.base / "cwd-work"
+        cwd.mkdir()
+        src = self.base / "openclaw_cwd_src"
+        _write(build_spec("openclaw", "bot-a", str(src)).workspace_root, {
+            "SOUL.md": "# Soul\n",
+            "MEMORY.md": "# Memory\nCWD_MEM_MARKER.\n",
+        })
+        out = self.base / "cwd-out"
+        old = os.getcwd()
+        os.chdir(cwd)
+        try:
+            rc = cmd_convert(
+                source_fw="openclaw", target_fw="ms-agent",
+                from_name="bot-a", local_dir=str(src), out_dir=str(out),
+            )
+        finally:
+            os.chdir(old)
+        self.assertEqual(rc, 0)
+        mem = cwd / ".ms_agent" / "memory" / "MEMORY.md"
+        self.assertTrue(mem.is_file())
+        self.assertIn("CWD_MEM_MARKER", mem.read_text(encoding="utf-8"))
 
 
 class TestQoderPersonaOutbound(unittest.TestCase):

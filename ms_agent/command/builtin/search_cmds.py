@@ -4,6 +4,7 @@ from __future__ import annotations
 from ms_agent.command.router import CommandRouter
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
+from ms_agent.command.usage import arg_error, same_as_webui, status_then_usage
 
 CMD_SEARCH = CommandDef(
     name='search',
@@ -11,17 +12,19 @@ CMD_SEARCH = CommandDef(
     category='config',
 )
 
-_USAGE = (
-    'usage:\n'
-    '  /search\n'
-    '  /search list\n'
-    '  /search engine <tavily|exa|serpapi|arxiv>\n'
-    '  /search key <value>\n'
-    '  /search key clear\n'
-    '  /search enable|disable\n'
-    'Saved to ~/.ms_agent/settings.json tools.web_search (shared with WebUI). '
-    'Takes effect on the next turn, or /new if search was already connected.'
-)
+
+def _usage() -> str:
+    return (
+        'usage:\n'
+        '  /search\n'
+        '  /search list\n'
+        '  /search engine <tavily|exa|serpapi|arxiv>\n'
+        '  /search key <value>\n'
+        '  /search key clear\n'
+        '  /search enable|disable\n'
+        f'{same_as_webui("settings.json")} '
+        'Takes effect on the next turn, or /new if search was already connected.'
+    )
 
 
 def _mgr():
@@ -69,7 +72,7 @@ async def cmd_search(ctx: CommandContext) -> CommandResult:
     if not arg or arg in ('help', '-h', '--help'):
         return CommandResult(
             type=CommandResultType.MESSAGE,
-            content=_status_text(mgr) + '\n\n' + _USAGE,
+            content=status_then_usage(_status_text(mgr), _usage()),
         )
 
     import shlex
@@ -81,7 +84,7 @@ async def cmd_search(ctx: CommandContext) -> CommandResult:
     rest = parts[1:]
 
     if action == 'list':
-        lines = ['Search engines (settings.json, shared with WebUI):']
+        lines = ['Search engines (shared with WebUI):']
         current = mgr.get().engine
         for row in mgr.list_engines():
             mark = '*' if row['id'] == current else ' '
@@ -110,8 +113,8 @@ async def cmd_search(ctx: CommandContext) -> CommandResult:
 
     if action == 'engine':
         if not rest:
-            return CommandResult(
-                type=CommandResultType.MESSAGE, content=_USAGE)
+            return arg_error(
+                '/search engine <tavily|exa|serpapi|arxiv>', ctx=ctx)
         try:
             cur = mgr.set_engine(rest[0])
         except ValueError as exc:
@@ -125,8 +128,7 @@ async def cmd_search(ctx: CommandContext) -> CommandResult:
 
     if action == 'key':
         if not rest:
-            return CommandResult(
-                type=CommandResultType.MESSAGE, content=_USAGE)
+            return arg_error('/search key <value>|clear', ctx=ctx)
         raw = ' '.join(rest)
         clear = raw.lower() in ('clear', 'none', '-')
         try:
@@ -141,7 +143,12 @@ async def cmd_search(ctx: CommandContext) -> CommandResult:
             content=f'API key {verb} for {mgr.get().engine}. {note}',
         )
 
-    return CommandResult(type=CommandResultType.MESSAGE, content=_USAGE)
+    return arg_error(
+        '/search engine|key|list|enable|disable ...',
+        reason=f'Unknown search action {action!r}',
+        note='Type /search for status and all commands',
+        ctx=ctx,
+    )
 
 
 def register_search_commands(router: CommandRouter) -> None:

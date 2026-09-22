@@ -38,10 +38,12 @@ def isolate_home(tmp_path, monkeypatch):
 
 class TestSearchCommand:
     @pytest.mark.asyncio
-    async def test_default_status(self):
+    async def test_default_status(self, isolate_home):
         result = await make_router().dispatch(make_ctx('/search'))
         assert 'Engine: tavily' in result.content
         assert '/search engine' in result.content
+        assert str(isolate_home) in result.content
+        assert 'MS_AGENT_HOME' in result.content
 
     @pytest.mark.asyncio
     async def test_list_marks_current(self):

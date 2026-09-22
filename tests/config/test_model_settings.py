@@ -28,8 +28,11 @@ def test_models_and_default(tmp_path):
     data = json.loads((tmp_path / 'settings.json').read_text())
     assert data['llm']['provider'] == 'acme'
     assert data['llm']['model'] == 'a-2'
+    m.set_default_model('acme glued-id', provider='acme')
+    assert m.get_default_model() == 'acme/glued-id'
     m.remove_model('acme', 'a-2')
     assert 'a-2' not in m.list_custom_providers()['acme']['models']
+    assert m.remove_model('acme', 'missing') is False
 
 
 def test_preserves_other_sections(tmp_path):
@@ -62,6 +65,10 @@ def test_resolver_consumes_default_model():
         {'default_model': 'deepseek/deepseek-chat'})
     assert cfg.llm.service == 'deepseek'
     assert cfg.llm.model == 'deepseek-chat'
+    glued = ConfigResolver._settings_to_agent_config(
+        {'default_model': 'minimax/minimax MiniMax-M2.1'})
+    assert glued.llm.service == 'minimax'
+    assert glued.llm.model == 'MiniMax-M2.1'
     # explicit llm.model wins over default_model
     cfg2 = ConfigResolver._settings_to_agent_config(
         {'llm': {'model': 'pinned'}, 'default_model': 'deepseek/x'})

@@ -13,11 +13,14 @@ Tester gaps this file locks down:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from omegaconf import OmegaConf
+from rich.console import Console
 
 from ms_agent.config.config import Config
 from ms_agent.config.resolver import ConfigResolver
@@ -103,6 +106,39 @@ def test_fresh_home_default_yaml_does_not_mcp_connect_todo_list(
             await manager.cleanup()
 
     asyncio.run(_connect())
+
+
+def test_default_tui_disables_snapshots(tmp_path, monkeypatch):
+    """TUI has no rollback slash; auto-snapshot must not run on first turn."""
+    from ms_agent.agent.llm_agent import LLMAgent
+
+    home = tmp_path / 'home'
+    monkeypatch.setenv('MS_AGENT_HOME', str(home))
+    work = tmp_path / 'work'
+    work.mkdir()
+
+    cfg = TuiApp._load_runtime_config('unused.yaml', str(work),
+                                      explicit_config=False)
+    cfg = TuiApp._prepare_config(cfg, None, str(work))
+    assert LLMAgent.resolve_enable_snapshots(cfg) is False
+
+
+def test_explicit_config_can_reenable_snapshots(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    monkeypatch.setenv('MS_AGENT_HOME', str(home))
+    work = tmp_path / 'work'
+    work.mkdir()
+    yaml_path = tmp_path / 'with-snaps.yaml'
+    yaml_path.write_text(
+        'enable_snapshots: true\n'
+        'llm:\n  service: modelscope\n  model: from-yaml\n'
+        'tools:\n  file_system:\n    mcp: false\n',
+        encoding='utf-8')
+
+    cfg = TuiApp._load_runtime_config(
+        str(yaml_path), str(work), explicit_config=True)
+    from ms_agent.agent.llm_agent import LLMAgent
+    assert LLMAgent.resolve_enable_snapshots(cfg) is True
 
 
 def test_default_tui_uses_webui_default_model(tmp_path, monkeypatch):
@@ -266,3 +302,89 @@ def test_fill_provider_catalog_does_not_clobber_llm_keys():
     assert cfg.llm.openai_api_key == 'sk-llm-block'
     assert cfg.llm.openai_base_url == 'https://example.invalid/v1'
     assert cfg.llm.protocol == 'openai'
+
+
+def test_missing_api_key_is_classed_as_setup_not_fatal():
+    from ms_agent.llm.credentials import (
+        is_missing_api_key_error,
+        missing_api_key_setup_text,
+    )
+    err = ValueError('No API key found for provider "modelscope"')
+    assert TuiApp._is_missing_api_key(err)
+    assert is_missing_api_key_error(err)
+    assert not TuiApp._is_missing_api_key(ValueError('boom'))
+    assert not is_missing_api_key_error(RuntimeError('No API key found'))
+    text = missing_api_key_setup_text(err)
+    assert '/model provider key' in text
+    assert '/quit' in text
+
+
+@pytest.mark.asyncio
+async def test_setup_until_ready_quit_returns_none():
+    from ms_agent.command import CommandRouter, register_builtin_commands
+    from ms_agent.agent.runtime import Runtime
+
+    app = TuiApp.__new__(TuiApp)
+    cfg = OmegaConf.create({'llm': {'model': 'm', 'service': 'modelscope'}})
+    router = CommandRouter()
+    register_builtin_commands(router)
+    app.agent = SimpleNamespace(
+        config=cfg, llm=None, runtime=Runtime(llm=None))
+    app.router = router
+    app.input = None
+    app.renderer = None
+    app.console = Console(file=io.StringIO())
+
+    with patch('builtins.input', return_value='/quit'):
+        queued = await app._setup_until_ready()
+    assert queued is None
+
+
+@pytest.mark.asyncio
+async def test_serve_keeps_repl_after_turn_api_error():
+    """A provider 400 must not print bye and exit the TUI."""
+    from unittest.mock import MagicMock
+
+    app = TuiApp.__new__(TuiApp)
+    buf = io.StringIO()
+    app.console = Console(file=buf, force_terminal=False, width=100)
+    app.renderer = MagicMock()
+    app._queued_query = None
+    app._pending_switch = None
+    app._model = 'm'
+    app._owned_session_ids = set()
+    session = SimpleNamespace(id='s1', name='Session 1')
+    app._sm = MagicMock()
+    app._sm.create.return_value = session
+    app.session = None
+    app._banner = lambda: None
+    applied = []
+
+    def _apply(sess, resume=False):
+        applied.append(resume)
+        app.session = sess
+
+    app._apply_session = _apply
+    app._name_session_from_log = lambda: None
+    app._prune_if_empty = lambda s: None
+
+    runs = {'n': 0}
+
+    async def fake_run(query=None, stream=True):
+        runs['n'] += 1
+        if runs['n'] == 1:
+            raise RuntimeError(
+                "Error code: 400 - {'error': {'message': "
+                "'The product is not activated'}}")
+        raise EOFError()
+
+    app.agent = SimpleNamespace(run=fake_run)
+
+    await app._serve()
+    out = buf.getvalue()
+    assert runs['n'] == 2
+    assert True in applied  # failed turn resumed, not a fresh session
+    assert 'session still open' in out
+    assert '/quit to exit' in out
+    assert 'The product is not activated' not in out  # no duplicate crash panel
+    assert out.strip().endswith('bye') or 'bye' in out

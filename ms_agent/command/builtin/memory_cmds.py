@@ -4,8 +4,10 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ms_agent.command.router import CommandRouter
+from ms_agent.command.scope import work_dir_of
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
+from ms_agent.command.usage import arg_error, status_then_usage
 
 CMD_MEMORY = CommandDef(
     name='memory',
@@ -19,7 +21,9 @@ _USAGE = (
     '  /memory on|off                 (this project)\n'
     '  /memory project on|off\n'
     '  /memory global on|off          (default for newly opened folders)\n'
-    '  /memory backend file|vector\n'
+    '  /memory backend file|vector    (global default for new folders)\n'
+    '  /memory global backend file|vector\n'
+    '  /memory project backend file|vector\n'
     'Project flag is what injects memory.unified_memory (same as WebUI). '
     'Global flag is the default for new projects. Vector stays WebUI-owned; '
     'TUI file backend writes MEMORY.md under <work>/.ms_agent/memory/.'
@@ -30,11 +34,7 @@ _OFF = frozenset({'off', 'false', '0', 'disable', 'disabled'})
 
 
 def _work_dir(ctx: CommandContext) -> str | None:
-    config = getattr(ctx.runtime, 'config', None) if ctx.runtime else None
-    if config is None:
-        return None
-    work = getattr(config, 'output_dir', None)
-    return str(work) if work else None
+    return work_dir_of(ctx)
 
 
 def _pm():
@@ -66,9 +66,7 @@ def _status_text(ctx: CommandContext) -> str:
         p_on = 'on' if project.memory_enabled else 'off'
         p_be = project.memory_backend or g_be
         lines.append(f'Project: {p_on}  backend={p_be}  id={project.id}')
-    lines.append('')
-    lines.append(_USAGE)
-    return '\n'.join(lines)
+    return status_then_usage('\n'.join(lines), _USAGE)
 
 
 def _parse_bool(token: str) -> bool | None:
@@ -92,8 +90,8 @@ async def _apply_live(ctx: CommandContext, project) -> str:
     if kind == 'vector-unavailable':
         return (
             'Saved vector backend for WebUI. TUI does not start vector/mem0 '
-            'this session (no silent file fallback). Use /memory backend file '
-            'or open the project in WebUI.')
+            'this session (no silent file fallback). Use /memory project '
+            'backend file or open the project in WebUI.')
     tools = getattr(agent, 'memory_tools', None) or []
     if tools:
         return 'Saved. Memory already loaded; /new to rebuild.'
@@ -121,11 +119,21 @@ async def cmd_memory(ctx: CommandContext) -> CommandResult:
     action = parts[0].lower()
     rest = parts[1:]
 
-    if action in ('global', 'project') or action in _ON or action in _OFF:
+    if action in ('global', 'project'):
+        if rest and rest[0].lower() == 'backend':
+            return _cmd_backend(ctx, rest[1:], scope=action)
+        return await _cmd_toggle(ctx, action, rest)
+    if action in _ON or action in _OFF:
         return await _cmd_toggle(ctx, action, rest)
     if action == 'backend':
         return _cmd_backend(ctx, rest)
-    return CommandResult(type=CommandResultType.MESSAGE, content=_USAGE)
+    return arg_error(
+        '/memory on|off | /memory global|project on|off | '
+        '/memory backend file|vector | /memory project backend file|vector',
+        reason=f'Unknown memory action {action!r}',
+        note='Type /memory for status and all commands',
+        ctx=ctx,
+    )
 
 
 async def _cmd_toggle(ctx: CommandContext, action: str,
@@ -137,12 +145,12 @@ async def _cmd_toggle(ctx: CommandContext, action: str,
     if action in ('global', 'project'):
         scope = action
         if not rest:
-            return CommandResult(
-                type=CommandResultType.MESSAGE, content=_USAGE)
+            return arg_error(
+                f'/memory {scope} on|off', ctx=ctx)
         token = rest[0]
     enabled = _parse_bool(token)
     if enabled is None:
-        return CommandResult(type=CommandResultType.MESSAGE, content=_USAGE)
+        return arg_error('/memory on|off', ctx=ctx)
 
     if scope == 'global':
         settings = PersonalizationSettings()
@@ -171,25 +179,51 @@ async def _cmd_toggle(ctx: CommandContext, action: str,
     )
 
 
-def _cmd_backend(ctx: CommandContext, rest: list[str]) -> CommandResult:
+def _cmd_backend(
+    ctx: CommandContext,
+    rest: list[str],
+    scope: str | None = None,
+) -> CommandResult:
     from ms_agent.personalization.settings import PersonalizationSettings
 
-    if not rest or rest[0].lower() not in ('file', 'vector'):
-        return CommandResult(type=CommandResultType.MESSAGE, content=_USAGE)
-    backend = rest[0].lower()
+    tokens = list(rest)
+    if scope is None:
+        if tokens and tokens[0].lower() in ('global', 'project'):
+            scope = tokens.pop(0).lower()
+        elif tokens and tokens[-1].lower() in ('global', 'project'):
+            scope = tokens.pop(-1).lower()
+        else:
+            scope = 'global'
+    if not tokens or tokens[0].lower() not in ('file', 'vector'):
+        return arg_error(
+            '/memory backend file|vector | /memory project backend file|vector',
+            ctx=ctx)
+    backend = tokens[0].lower()
+
+    if scope == 'project':
+        project = _project(ctx)
+        if project is None:
+            return CommandResult(
+                type=CommandResultType.MESSAGE,
+                content='Project backend needs a work dir (TUI --work-dir).',
+            )
+        _pm().update(project.id, memory_backend=backend)
+        return CommandResult(
+            type=CommandResultType.MESSAGE,
+            content=(
+                f'Project memory backend → {backend}. '
+                '/memory on (and /new) to apply. Vector is WebUI-owned.'),
+        )
+
     settings = PersonalizationSettings()
     loaded = settings.load()
     settings.save(replace(loaded, memory_backend=backend))
-    project = _project(ctx)
-    extra = ''
-    if project is not None:
-        _pm().update(project.id, memory_backend=backend)
-        extra = ' Project backend updated too.'
     return CommandResult(
         type=CommandResultType.MESSAGE,
         content=(
-            f'Memory backend → {backend}.{extra} '
-            '/memory on (and /new) to apply. Vector is WebUI-owned.'),
+            f'Global memory backend default → {backend}. '
+            'New folders inherit this; this project is unchanged. '
+            'Vector is WebUI-owned.'),
     )
 
 

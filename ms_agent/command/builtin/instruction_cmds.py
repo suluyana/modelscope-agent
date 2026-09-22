@@ -4,8 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from ms_agent.command.router import CommandRouter
+from ms_agent.command.scope import work_dir_of
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
+from ms_agent.command.usage import (arg_error, ledger_file, same_as_webui,
+                                    status_then_usage)
 
 CMD_INSTRUCTION = CommandDef(
     name='instruction',
@@ -20,37 +23,41 @@ CMD_PROFILE = CommandDef(
     category='config',
 )
 
-_INS_USAGE = (
-    'usage:\n'
-    '  /instruction\n'
-    '  /instruction global|project\n'
-    '  /instruction global|project <text>\n'
-    '  /instruction global|project clear\n'
-    'Global → ~/.ms_agent/AGENTS.md (user region under the seeded header).\n'
-    'Project → <work>/.ms_agent/AGENTS.md (never the repo-root AGENTS.md).\n'
-    'Takes effect on the next turn (files are read live).'
-)
 
-_PROFILE_USAGE = (
-    'usage:\n'
-    '  /profile\n'
-    '  /profile callme <name>\n'
-    '  /profile callme clear\n'
-    '  /profile about <text>\n'
-    '  /profile about clear\n'
-    'Writes ~/.ms_agent/PROFILE.md (Call me line + free region). '
-    'Takes effect on the next turn.'
-)
+def _ins_usage() -> str:
+    return (
+        'usage:\n'
+        '  /instruction\n'
+        '  /instruction global|project\n'
+        '  /instruction global|project <text>\n'
+        '  /instruction global|project clear\n'
+        f'Global → {ledger_file("AGENTS.md")} '
+        '(user region under the seeded header).\n'
+        'Project → <work>/.ms_agent/AGENTS.md (never the repo-root AGENTS.md).\n'
+        f'{same_as_webui("AGENTS.md")} '
+        'Takes effect on the next turn (files are read live).'
+    )
+
+
+def _profile_usage() -> str:
+    return (
+        'usage:\n'
+        '  /profile\n'
+        '  /profile callme <name>\n'
+        '  /profile callme clear\n'
+        '  /profile about <text>\n'
+        '  /profile about clear\n'
+        f'Writes {ledger_file("PROFILE.md")} (Call me line + free region). '
+        f'{same_as_webui("PROFILE.md")} '
+        'Takes effect on the next turn.'
+    )
+
 
 _CLEAR = frozenset({'clear', '-', 'none'})
 
 
 def _work_dir(ctx: CommandContext) -> str | None:
-    config = getattr(ctx.runtime, 'config', None) if ctx.runtime else None
-    if config is None:
-        return None
-    work = getattr(config, 'output_dir', None)
-    return str(work) if work else None
+    return work_dir_of(ctx)
 
 
 def _preview(text: str, empty: str = '(empty)') -> str:
@@ -64,11 +71,11 @@ def _preview(text: str, empty: str = '(empty)') -> str:
 
 def _show_instructions(work_dir: str | None) -> str:
     from ms_agent.prompting import workspace_files as wf
-    lines = ['Global (~/.ms_agent/AGENTS.md):', _preview(wf.read_global_instruction())]
+    lines = [f'Global ({ledger_file("AGENTS.md")}):', _preview(wf.read_global_instruction())]
     if work_dir:
         lines.extend([
             '',
-            'Project (<work>/.ms_agent/AGENTS.md):',
+            f'Project ({Path(work_dir) / ".ms_agent" / "AGENTS.md"}):',
             _preview(wf.read_project_instruction(work_dir)),
         ])
         root = Path(work_dir) / 'AGENTS.md'
@@ -84,8 +91,7 @@ def _show_instructions(work_dir: str | None) -> str:
             ])
     else:
         lines.extend(['', 'Project: (no work dir — start TUI with --work-dir)'])
-    lines.extend(['', _INS_USAGE])
-    return '\n'.join(lines)
+    return status_then_usage('\n'.join(lines), _ins_usage())
 
 
 async def cmd_instruction(ctx: CommandContext) -> CommandResult:
@@ -105,11 +111,14 @@ async def cmd_instruction(ctx: CommandContext) -> CommandResult:
     scope = parts[0].lower()
     rest = parts[1:]
     if scope not in ('global', 'project', 'help', '-h', '--help'):
-        return CommandResult(
-            type=CommandResultType.MESSAGE, content=_INS_USAGE)
+        return arg_error(
+            '/instruction global|project [text|clear]',
+            reason=f'Unknown instruction scope {scope!r}',
+            ctx=ctx,
+        )
     if scope in ('help', '-h', '--help'):
         return CommandResult(
-            type=CommandResultType.MESSAGE, content=_INS_USAGE)
+            type=CommandResultType.MESSAGE, content=_ins_usage())
 
     if scope == 'project' and not work_dir:
         return CommandResult(
@@ -120,10 +129,10 @@ async def cmd_instruction(ctx: CommandContext) -> CommandResult:
     if not rest:
         if scope == 'global':
             body = wf.read_global_instruction()
-            label = 'Global (~/.ms_agent/AGENTS.md)'
+            label = f'Global ({ledger_file("AGENTS.md")})'
         else:
             body = wf.read_project_instruction(work_dir)
-            label = 'Project (<work>/.ms_agent/AGENTS.md)'
+            label = f'Project ({Path(work_dir) / ".ms_agent" / "AGENTS.md"})'
         return CommandResult(
             type=CommandResultType.MESSAGE,
             content=f'{label}:\n{_preview(body)}',
@@ -132,10 +141,10 @@ async def cmd_instruction(ctx: CommandContext) -> CommandResult:
     text = '' if len(rest) == 1 and rest[0].lower() in _CLEAR else ' '.join(rest)
     if scope == 'global':
         wf.write_global_instruction(text)
-        dest = '~/.ms_agent/AGENTS.md'
+        dest = ledger_file('AGENTS.md')
     else:
         wf.write_project_instruction(work_dir, text)
-        dest = '<work>/.ms_agent/AGENTS.md'
+        dest = str(Path(work_dir) / '.ms_agent' / 'AGENTS.md')
     verb = 'cleared' if not text else 'saved'
     return CommandResult(
         type=CommandResultType.MESSAGE,
@@ -150,10 +159,8 @@ def _show_profile() -> str:
         f'Call me: {call_me or "(unset)"}',
         'About:',
         _preview(about),
-        '',
-        _PROFILE_USAGE,
     ]
-    return '\n'.join(lines)
+    return status_then_usage('\n'.join(lines), _profile_usage())
 
 
 async def cmd_profile(ctx: CommandContext) -> CommandResult:
@@ -183,7 +190,7 @@ async def cmd_profile(ctx: CommandContext) -> CommandResult:
         verb = 'cleared' if not value else f'set to {value}'
         return CommandResult(
             type=CommandResultType.MESSAGE,
-            content=f'Call me {verb}. Next turn uses ~/.ms_agent/PROFILE.md.',
+            content=f'Call me {verb}. Next turn uses {ledger_file("PROFILE.md")}.',
         )
     if action in ('about', 'desc', 'description', 'set'):
         if not rest:
@@ -197,9 +204,14 @@ async def cmd_profile(ctx: CommandContext) -> CommandResult:
         verb = 'cleared' if not value else 'saved'
         return CommandResult(
             type=CommandResultType.MESSAGE,
-            content=f'Profile about {verb}. Next turn uses ~/.ms_agent/PROFILE.md.',
+            content=f'Profile about {verb}. Next turn uses {ledger_file("PROFILE.md")}.',
         )
-    return CommandResult(type=CommandResultType.MESSAGE, content=_PROFILE_USAGE)
+    return arg_error(
+        '/profile callme <name>|clear   or   /profile about <text>|clear',
+        reason=f'Unknown profile action {action!r}',
+        note='Type /profile for all commands',
+        ctx=ctx,
+    )
 
 
 def register_instruction_commands(router: CommandRouter) -> None:

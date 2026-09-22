@@ -15,6 +15,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def strip_provider_model_prefix(provider: str | None, model: str | None) -> str:
+    """Drop a duplicated ``<provider> <model>`` prefix from a stored model id.
+
+    A failed space-form persist can leave ``default_model`` as
+    ``minimax/minimax MiniMax-M2.1``. First-slash split then yields
+    service=minimax and model=``minimax MiniMax-M2.1``, which is not a
+    vendor id.
+    """
+    provider = str(provider or '').strip()
+    model = str(model or '').strip()
+    if provider and model.lower().startswith(provider.lower() + ' '):
+        return model[len(provider):].strip()
+    return model
+
+
 class ModelSettingsManager:
     """CRUD for custom providers/models + default model in settings.json."""
 
@@ -149,12 +164,16 @@ class ModelSettingsManager:
             models.append(model)
             self._save_raw(data)
 
-    def remove_model(self, provider_id: str, model: str) -> None:
+    def remove_model(self, provider_id: str, model: str) -> bool:
+        """Remove ``model`` from the provider catalog. True if it was present."""
         data = self._load_raw()
         entry = data.get('providers', {}).get(provider_id)
-        if entry and model in entry.get('models', []):
-            entry['models'].remove(model)
-            self._save_raw(data)
+        models = (entry or {}).get('models') or []
+        if entry is None or model not in models:
+            return False
+        models.remove(model)
+        self._save_raw(data)
+        return True
 
     # -- default model --
 
@@ -165,6 +184,7 @@ class ModelSettingsManager:
     def set_default_model(self,
                           model: str,
                           provider: Optional[str] = None) -> None:
+        model = strip_provider_model_prefix(provider, model)
         data = self._load_raw()
         data['default_model'] = f'{provider}/{model}' if provider else model
         # Same shape WebUI writes: llm.provider + llm.model, so the next
