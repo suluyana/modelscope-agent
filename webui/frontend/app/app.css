@@ -256,6 +256,15 @@ a {
 
    Unlayered on purpose: these must outrank antd's layered styles, and the
    WebKit pseudo-elements below already override the `color-scheme` bar. */
+
+/* How much width a scrollbar steals from the content box. 0 is the overlay
+   case (macOS default, mobile) and the SSR default; a blocking script at the top
+   of <body> overwrites it on <html> with the real measurement before the app
+   lays out. See ScrollArea. */
+:root {
+  --msa-scrollbar-w: 0px;
+}
+
 * {
   scrollbar-width: thin;
   /* thumb track — transparent until hover (Firefox has no hover pseudo). */
@@ -263,8 +272,7 @@ a {
 }
 
 *:hover {
-  scrollbar-color: color-mix(in srgb, var(--msa-text-3) 45%, transparent)
-    transparent;
+  scrollbar-color: color-mix(in srgb, var(--msa-text-3) 45%, transparent) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -324,6 +332,21 @@ a {
   select:focus-visible,
   [contenteditable]:focus-visible {
     outline: none;
+  }
+
+  /* Segmented: drop antd's raised look. The selected item + moving thumb carry
+     `box-shadow: boxShadowTertiary` (a global alias token, not a Segmented
+     component token), so it can't be turned off in msaTheme.ts — the flat MSA
+     control keeps only the white pill fill. Layer precedence beats the baked
+     `antd` rule without stacking `.ant-*` selectors. */
+  .ant-segmented .ant-segmented-item-selected,
+  .ant-segmented .ant-segmented-thumb {
+    box-shadow: none;
+  }
+
+  .ant-dropdown-menu-submenu-title {
+    display: flex;
+    align-items: center;
   }
 }
 

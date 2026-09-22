@@ -3,7 +3,7 @@ import {
   type TransformMessage,
   type XRequestOptions,
 } from "@ant-design/x-sdk";
-import { readFailure } from "~/lib/api";
+import { ApiError, readFailure } from "~/lib/api";
 import { dispatchImageDelivery } from "~/lib/imageDelivery";
 import { dispatchWorkspaceChanged } from "~/lib/events";
 
@@ -43,7 +43,16 @@ export async function assertChatStream(response: Response): Promise<Response> {
     body = undefined;
   }
   const failure = readFailure(body);
-  const err = new Error(failure?.message || `HTTP ${response.status}`);
+  // Throw the same ApiError the REST client raises, so the failure reads
+  // identically wherever it surfaces (via `describeFailure`): a bare status
+  // when the body carried no message, the message when it did. `name` marks it
+  // as a chat-stream rejection so callers can tell it from an abort.
+  const err = new ApiError(
+    failure?.message ?? "",
+    response.status,
+    failure?.code ?? response.status,
+    response.statusText
+  );
   err.name = CHAT_STREAM_ERROR;
   throw err;
 }
@@ -91,6 +100,7 @@ export type MessageSegment =
 
 export interface AgentInput {
   session_id?: string | null;
+  model_id?: string;
   project_id?: string | null;
   /** The CURRENT turn's user message. Conversation context is NOT sent — the
    * backend's ms-agent SessionLog (on disk) is the source of truth. */
@@ -264,6 +274,7 @@ export class AgentChatProvider extends AbstractChatProvider<
     return {
       ...(options?.params || {}),
       session_id: requestParams.session_id ?? null,
+      model_id: requestParams.model_id,
       project_id: requestParams.project_id ?? null,
       message: requestParams.message ?? { role: "user", content: "" },
     };

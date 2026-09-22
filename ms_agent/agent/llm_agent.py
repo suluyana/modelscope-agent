@@ -20,6 +20,7 @@ from ms_agent.agent.runtime import Runtime
 from ms_agent.callbacks import Callback, callbacks_mapping
 from ms_agent.knowledge_search import SirchmunkSearch
 from ms_agent.llm import multimodal
+from ms_agent.llm.io import run_in_llm_executor
 from ms_agent.llm.llm import LLM
 from ms_agent.llm.message_text import (append_text, flatten_message_text,
                                        prepend_text)
@@ -54,6 +55,7 @@ from ms_agent.ui.events import (ContentDelta, ContentEnd, ContextCompacted,
                                 TurnCompleted, UsageInfo)
 from ms_agent.utils import (async_retry, is_retryable_error, read_history,
                             save_history)
+from ms_agent.utils.atomic_file import atomic_write_json
 from ms_agent.utils.constants import DEFAULT_TAG, DEFAULT_USER
 from ms_agent.utils.logger import get_logger
 from ms_agent.utils.snapshot import take_snapshot
@@ -227,7 +229,6 @@ class LLMAgent(Agent):
                     'enable_snapshots'] is not None:
                 return LLMAgent._coerce_enable_snapshots_value(
                     config['enable_snapshots'])
-            return False
         return False
 
     TOTAL_PROMPT_TOKENS = 0
@@ -1713,16 +1714,11 @@ class LLMAgent(Agent):
         if path is None:
             return
         try:
-            tmp = path.with_suffix('.json.tmp')
-            tmp.write_text(
-                json.dumps({
+            atomic_write_json(
+                path, {
                     'version': 1,
                     'sources': surface
-                },
-                           ensure_ascii=False,
-                           indent=1),
-                encoding='utf-8')
-            tmp.replace(path)
+                }, indent=1)
         except OSError as e:
             logger.warning(f'[prompt-surface] sidecar save failed: {e}')
 
@@ -2071,6 +2067,49 @@ class LLMAgent(Agent):
         messages.append(Message(role='user', content=body))
         return messages
 
+    @staticmethod
+    def _close_llm_stream(llm, response=None) -> None:
+        """Best-effort cleanup, including a response returned after cancellation."""
+        for close in (getattr(llm, 'interrupt',
+                              None), getattr(response, 'close', None)):
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # teardown must not mask the original error
+                    pass
+
+    async def _generate_response(self, messages, tools):
+        """Open a synchronous model request without blocking the event loop.
+
+        Cancellation cannot stop a Python worker thread. If the request returns
+        after its caller has gone, the worker closes that response instead of
+        abandoning it. The lock covers only ownership transfer, never I/O.
+        """
+        lock = threading.Lock()
+        llm = self.llm
+        abandoned = False
+        response = None
+
+        def generate():
+            nonlocal response
+            result = llm.generate(messages, tools=tools)
+            with lock:
+                discard = abandoned
+                if not discard:
+                    response = result
+            if discard:
+                self._close_llm_stream(llm, result)
+            return result
+
+        try:
+            return await run_in_llm_executor(generate)
+        except asyncio.CancelledError:
+            with lock:
+                abandoned = True
+                result = response
+            self._close_llm_stream(llm, result)
+            raise
+
     # retry_if: a hard 4xx (bad payload, content filter, auth) is a verdict on
     # the request, not a transient fault — retrying it 5× only adds ~40s of
     # backoff before the same failure surfaces.
@@ -2149,9 +2188,10 @@ class LLMAgent(Agent):
                 # ui.events.ToolCallComposing).
                 _composing: Dict[int, int] = {}
                 _reported_images = False
-                _gen = self.llm.generate(messages, tools=tools)
-                _loop = asyncio.get_running_loop()
+                _llm = self.llm
+                _gen = await self._generate_response(messages, tools)
                 _NO_MORE = object()
+                _stopped = threading.Event()
 
                 def _next_chunk(_g=_gen):
                     # Step the BLOCKING sync LLM stream off the event loop, so
@@ -2164,10 +2204,15 @@ class LLMAgent(Agent):
                         return next(_g)
                     except StopIteration:
                         return _NO_MORE
+                    finally:
+                        # A cancelled await leaves next() running in its worker.
+                        # Close the iterator there once that read has unwound.
+                        if _stopped.is_set():
+                            self._close_llm_stream(_llm, _g)
 
                 try:
                     while True:
-                        _chunk = await _loop.run_in_executor(None, _next_chunk)
+                        _chunk = await run_in_llm_executor(_next_chunk)
                         if _chunk is _NO_MORE:
                             break
                         _response_message = _chunk
@@ -2220,24 +2265,13 @@ class LLMAgent(Agent):
                         messages[-1] = _response_message
                         yield messages
                 finally:
+                    _stopped.set()
                     if not _reported_images:
                         # A turn that produced nothing still attached images, and
                         # what became of them is still worth saying.
                         self._record_image_deliveries(messages)
                         _reported_images = True
-                    # Turn abandoned mid-stream (client disconnect / stop): ask
-                    # the provider to close the live upstream response so the
-                    # server stops generating, instead of leaving it to run to
-                    # completion into a dropped connection. Only the data-driven
-                    # provider layer implements interrupt(); the legacy LLM does
-                    # not, so this is a no-op there (unchanged). Harmless on a
-                    # normal finish (the stream is already exhausted).
-                    _interrupt = getattr(self.llm, 'interrupt', None)
-                    if callable(_interrupt):
-                        try:
-                            _interrupt()
-                        except Exception:  # noqa: BLE001 - teardown never raises
-                            pass
+                    self._close_llm_stream(_llm, _gen)
                 if self.stream_output:
                     if _printed_reasoning_header and not _printed_reasoning_footer:
                         self._emit_reasoning_end()
@@ -2253,7 +2287,8 @@ class LLMAgent(Agent):
 
                     self._emit_content_end()
             else:
-                _response_message = self.llm.generate(messages, tools=tools)
+                _response_message = await self._generate_response(
+                    messages, tools)
                 if self.show_reasoning:
                     reasoning_text = (
                         getattr(_response_message, 'reasoning_content', '')

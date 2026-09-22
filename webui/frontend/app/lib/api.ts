@@ -47,6 +47,12 @@ export interface ApiEnvelope<T = unknown> {
   data: T
 }
 
+export interface RecoveryStatus {
+  required: boolean
+  backup_path: string | null
+  error: 'backup_failed' | 'repair_failed' | 'startup_failed' | null
+}
+
 /**
  * Error thrown by the REST client when a request fails (non-2xx, envelope
  * `code !== 0`, or a network/parse failure). Carries the resolved,
@@ -72,6 +78,26 @@ export class ApiError extends Error {
     this.code = code
     this.statusText = statusText
   }
+}
+
+/** User-facing text for a failed request: the backend's own message when it
+ * sent one, otherwise the HTTP status first (`502 Bad Gateway`) and a
+ * server-vs-client headline second. `code` — not `status` — picks both the
+ * headline and the bare-number detail, since a gateway rejection can arrive
+ * with a 2xx status while `code` holds the real one. Shared by the REST toast
+ * bridge and the chat-stream paths so a failure reads the same everywhere. */
+export function describeFailure(
+  err: ApiError,
+  s: { server: string; requestFailed: string; network: string }
+): string {
+  if (err.message) return err.message
+  if (err.status === 0) return s.network
+  const detail =
+    err.code === err.status && err.statusText
+      ? `${err.status} ${err.statusText}`
+      : String(err.code)
+  const headline = err.code >= 500 ? s.server : s.requestFailed
+  return `${detail}: ${headline}`
 }
 
 // Global error reporter, registered once in the browser by the app shell (see
@@ -242,6 +268,12 @@ const fp = (path: string) =>
  * useXChat (see app/lib/agentProvider.ts), not this module.
  */
 export const api = {
+  getRecoveryStatus: () => json<RecoveryStatus>('/api/recovery', undefined, { silent: true }),
+  repairDefaultProject: () =>
+    json<RecoveryStatus>('/api/recovery/default-project', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true })
+    }, { silent: true }),
   // Projects
   listProjects: () => json<Project[]>('/api/projects'),
   createProject: (body: {
@@ -291,10 +323,16 @@ export const api = {
     title: string
     project_id?: string
     preview?: string
+    model_id?: string
   }) =>
     json<Session>('/api/sessions', {
       method: 'POST',
       body: JSON.stringify(body)
+    }),
+  updateSessionModel: (id: string, modelId: string) =>
+    json<{ session: Session; settings: AgentSettings }>(`/api/sessions/${pid(id)}/model`, {
+      method: 'PATCH',
+      body: JSON.stringify({ model_id: modelId })
     }),
   deleteSession: (id: string) =>
     json<void>(`/api/sessions/${pid(id)}`, { method: 'DELETE' }),
@@ -314,6 +352,13 @@ export const api = {
     ),
   listArtifacts: (sessionId: string) =>
     json<Artifact[]>(`/api/sessions/${pid(sessionId)}/artifacts`),
+  // Browser-only URL for a credentialed Blob download (see download.ts).
+  sessionExportUrl: (
+    sessionId: string,
+    format: 'markdown' | 'html',
+    detail: 'full' | 'compact' | 'user-only'
+  ) =>
+    `/api/sessions/${pid(sessionId)}/export${q({ format, detail })}`,
 
   // MCPs
   listMcps: (scope?: Scope) => json<Mcp[]>(`/api/mcps${q({ scope })}`),
@@ -359,6 +404,10 @@ export const api = {
     json<{ path: string; content: string | null }>(
       `/api/skills/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`
     ),
+  /** URL for a skill file's raw bytes — what a previewed document in the skill
+   * viewer loads its images and styles from. Browser-only usage. */
+  skillFileRawUrl: (id: string, path: string) =>
+    `/api/skills/${encodeURIComponent(id)}/raw/${fp(path)}`,
   createSkill: (
     body: Omit<Skill, 'id' | 'created_at' | 'origin' | 'removable'> & {
       /** Bundle imports only: replace a same-named skill in this scope instead
@@ -481,10 +530,12 @@ export const api = {
       opts
     )
   },
-  // URL for raw file bytes (media <img>/<video>/<audio> src, or download).
-  // Relative so the same-origin proxy routes it; browser-only usage.
+  // URL for raw file bytes (media <img>/<video>/<audio> src, an HTML preview's
+  // iframe, or download). Relative so the same-origin proxy routes it;
+  // browser-only usage. The path is the URL tail so a previewed document's own
+  // relative references resolve back into this route.
   workspaceFileRawUrl: (projectId: string, path: string) =>
-    `/api/projects/${pid(projectId)}/workspace/files/${fp(path)}/raw`,
+    `/api/projects/${pid(projectId)}/workspace/raw/${fp(path)}`,
   // URL for a zip of the workspace, or of one folder in it. The server builds
   // and streams the archive; `path` is omitted for the whole workspace. Not
   // under `/files/` — that route's catch-all would swallow the segment.
@@ -576,6 +627,11 @@ export const api = {
     }),
   deleteProvider: (id: string) =>
     json<void>(`/api/providers/${pid(id)}`, { method: 'DELETE' }),
+  reorderProviders: (order: string[]) =>
+    json<Provider[]>('/api/providers/order', {
+      method: 'PUT',
+      body: JSON.stringify({ order })
+    }),
   listProviderModels: (id: string, opts?: ApiCallOpts) =>
     json<string[]>(
       `/api/providers/${pid(id)}/available-models`,
@@ -628,7 +684,7 @@ export const api = {
     json<Model>(`/api/models/${pid(id)}/vision/retry`, { method: 'POST' }),
 
   getAgentSettings: () => json<AgentSettings>('/api/agent-settings'),
-  putAgentSettings: (body: AgentSettings) =>
+  putAgentSettings: (body: Partial<AgentSettings>) =>
     json<AgentSettings>('/api/agent-settings', {
       method: 'PUT',
       body: JSON.stringify(body)
@@ -671,6 +727,17 @@ export const api = {
     json<{ running: string[] }>('/api/presence', { method: 'POST' })
 }
 
+/** Status a loader failure reaches the error page as.
+ *
+ * `Response` rejects anything outside 200-599, and an `ApiError` may carry no
+ * HTTP status (0 when the backend is unreachable) or a 2xx for a body-declared
+ * rejection. 502 stands for "no answer from the backend"; the error page turns
+ * it back into the network message. */
+function errorPageStatus(status: number): number {
+  if (status === 0) return 502
+  return status >= 400 && status <= 599 ? status : 500
+}
+
 /**
  * Turn an API failure inside a route loader into a thrown `Response`.
  *
@@ -678,14 +745,15 @@ export const api = {
  * loader error to the client as a plain Error, dropping both the class and the
  * `status`. The error page would then render 404 on the server and "unexpected
  * error" after hydration — a visible downgrade. A thrown Response carries its
- * status across intact, so both sides agree.
+ * status across intact, so both sides agree. Every server-side loader must go
+ * through here, `Promise.all` batches included.
  */
 export async function orThrow<T>(promise: Promise<T>): Promise<T> {
   try {
     return await promise
   } catch (err) {
     if (err instanceof ApiError)
-      throw new Response(err.message, { status: err.status })
+      throw new Response(err.message, { status: errorPageStatus(err.status) })
     throw err
   }
 }
