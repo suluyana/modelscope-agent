@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 from pathlib import Path
 from typing import Any
 
+from ms_agent.hooks.defaults import DEFAULT_ENABLED_EXECUTORS
 from ms_agent.plugins.agents import PluginAgentRegistry
 from ms_agent.plugins.config_manager import PluginConfigManager
 from ms_agent.plugins.installer import PluginInstaller
@@ -43,7 +44,7 @@ class PluginRuntime:
     _config: Any | None = field(default=None, init=False)
     _configured_plugin_ids: set[str] = field(default_factory=set, init=False)
     _enabled_executors: frozenset[str] = field(
-        default_factory=lambda: frozenset({'command'}),
+        default_factory=lambda: DEFAULT_ENABLED_EXECUTORS,
         init=False,
     )
 
@@ -61,7 +62,7 @@ class PluginRuntime:
             session_id: str,
             *,
             config: Any | None = None,
-            enabled_executors: frozenset[str] = frozenset({'command'}),
+            enabled_executors: frozenset[str] = DEFAULT_ENABLED_EXECUTORS,
     ) -> None:
         async with self._reload_lock:
             self._start_unlocked(
@@ -77,7 +78,7 @@ class PluginRuntime:
             session_id: str,
             *,
             config: Any | None = None,
-            enabled_executors: frozenset[str] = frozenset({'command'}),
+            enabled_executors: frozenset[str] = DEFAULT_ENABLED_EXECUTORS,
     ) -> None:
         self._start_unlocked(
             project_path,

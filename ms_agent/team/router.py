@@ -114,8 +114,10 @@ class AtRouter:
         targets: list[RouteTarget] = []
         for at_name in mentions:
             endpoint = self._lookup(at_name)
-            caller_is_owner = InvokeGate.check(
-                endpoint, msg.sender_user_id, self._flags)
+            caller_is_owner = True
+            if getattr(msg, 'source', 'user') != 'coordinator':
+                caller_is_owner = InvokeGate.check(
+                    endpoint, msg.sender_user_id, self._flags)
             if require_online:
                 self._check_status(endpoint)
             tier = RemoteProfileEnforcer.permission_tier(

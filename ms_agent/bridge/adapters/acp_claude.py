@@ -39,7 +39,7 @@ class AcpClaudeAdapter:
         self,
         *,
         dry_run: bool = False,
-        auto_allow_permissions: bool = True,
+        auto_allow_permissions: bool = False,
     ) -> None:
         self.dry_run = dry_run
         self.auto_allow_permissions = auto_allow_permissions
@@ -91,6 +91,7 @@ class AcpClaudeAdapter:
         cwd: str | None = None,
         attachments: list[dict] | None = None,
         session_mode: str = 'fresh',
+        mcp_servers: list[dict] | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         del permission_tier, attachments
         if self.dry_run or not await self.discover():
@@ -122,6 +123,7 @@ class AcpClaudeAdapter:
                 cwd=cwd,
                 session_mode=session_mode,
                 auto_allow=self.auto_allow_permissions,
+                mcp_servers=mcp_servers,
         ):
             yield ev
 

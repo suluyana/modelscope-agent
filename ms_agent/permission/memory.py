@@ -45,8 +45,8 @@ class PermissionMemory:
         if global_path is not None:
             self._global_file = Path(global_path)
         else:
-            self._global_file = Path.home(
-            ) / '.ms_agent' / 'permission_memory.json'
+            from ms_agent.project.paths import global_home
+            self._global_file = global_home() / 'permission_memory.json'
 
         self._project_entries: list[MemoryEntry] = []
         self._global_entries: list[MemoryEntry] = []
@@ -117,6 +117,10 @@ class PermissionMemory:
             self._save('project')
             self._save('global')
         return count
+
+    def reload(self) -> None:
+        """Re-read disk after an out-of-process CRUD (settings page)."""
+        self._load()
 
     def list_all(self) -> list[MemoryEntry]:
         return list(self._project_entries) + list(self._global_entries)

@@ -46,7 +46,9 @@ def test_invalid_mode_raises():
         agent.set_permission_mode('bogus')
 
 
-def test_no_toolmanager_is_safe():
-    agent = LLMAgent.__new__(LLMAgent)
-    agent.tool_manager = None
-    assert agent.set_permission_mode('auto') == 'auto'  # no crash
+def test_accept_edits_and_plan_are_valid():
+    agent, tm, enf = _agent_with_enforcer()
+    assert agent.set_permission_mode('acceptEdits') == 'accept_edits'
+    assert enf._config.mode == 'accept_edits'
+    assert agent.set_permission_mode('plan') == 'plan'
+    assert enf._config.mode == 'plan'

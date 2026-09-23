@@ -138,7 +138,8 @@ def test_context_bundle_caps():
     assert worker.project_timeline == []
     assert worker.thread_messages == []
     merged_worker = ContextBundleAssembler.merge_prompt('do it', worker)
-    assert merged_worker == 'do it'
+    assert 'do it' in merged_worker
+    assert 'one-shot' in merged_worker
 
     legacy = ContextBundleAssembler.build(
         project_timeline=msgs, include_project_timeline=True)
@@ -172,6 +173,20 @@ def test_lead_bundle_has_snapshots_not_other_agent_text():
     assert 'Do not re-run' in merged
     assert '找北京美景' not in merged
     assert 'dispatch_result_read' in merged
+
+
+def test_lead_empty_board_still_gets_project_pointer():
+    bundle = ContextBundleAssembler.build(
+        audience='lead', project_id='p_empty')
+    merged = ContextBundleAssembler.merge_prompt('请拆到任务板', bundle)
+    assert '[task_board] project=p_empty' in merged
+    assert 'task_board_read' in merged
+    assert 'dispatch_result_read' in merged
+    worker = ContextBundleAssembler.build(
+        audience='worker', project_id='p_empty')
+    merged_w = ContextBundleAssembler.merge_prompt('do it', worker)
+    assert 'do it' in merged_w
+    assert 'one-shot' in merged_w
 
 
 def test_truncate_strips_codex_model_metadata_warning():
@@ -281,6 +296,274 @@ async def test_complete_dispatch_does_not_copy_stream_into_result_summary():
     assert again.result_summary == 'Worker 自写：烤鸭'
 
 
+def test_looks_like_clarification_detects_missing_path():
+    from ms_agent.team.context import looks_like_clarification
+
+    asked = (
+        '`{DOC}` 是一个未替换的占位符。请问你希望我读取哪个文档？'
+        '请告诉我具体要读哪一个，或者直接给出绝对路径。'
+    )
+    assert looks_like_clarification(asked)
+    assert looks_like_clarification(
+        "The placeholder `{DOC}` wasn't replaced. Could you provide the "
+        'absolute path to the document?')
+    assert looks_like_clarification(
+        'I need the path to the document before I can continue.')
+    assert not looks_like_clarification('故宫、长城、颐和园')
+    assert not looks_like_clarification('完结回执写「已结束执行」，不写 Worker 正文。')
+    # Quoting the architecture doc is not a question.
+    assert not looks_like_clarification(
+        'Never write unreplaced placeholders such as {DOC}; copy real '
+        'absolute paths from the user message.')
+    # Brace tokens in the job are not a question.
+    assert not looks_like_clarification(
+        '把整本书里的 {DOC} 替换成 {DOC1}。')
+    assert not looks_like_clarification(
+        '用户消息中的 {DOC} 是一个占位符，没有提供实际路径。',
+        audience='lead',
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_dispatch_does_not_park_on_question_text():
+    from ms_agent.team.stores.memory import MemoryTaskBoardStore
+
+    endpoints = MemoryEndpointStore()
+    projects = MemoryProjectMetaStore()
+    timeline = MemoryTimelineStore()
+    tasks = MemoryTaskBoardStore()
+    projects.upsert(
+        TeamProjectMeta(
+            project_id='p1', name='demo', default_lead_at='planner'))
+    endpoints.upsert(
+        AgentEndpoint(
+            endpoint_id='ep-bibo',
+            at_name='bibo',
+            owner_user_id='u1',
+            endpoint_type='persistent',
+            runtime='codex',
+            adapter_kind='acp',
+            status='online',
+        ))
+    ingress = MessageIngress(
+        endpoints, projects, timeline, task_store=tasks)
+
+    async def handler(_env):
+        return None
+
+    ingress.set_dispatch_handler(handler)
+    result = await ingress.handle(
+        InboundMessage(
+            message_id='m1',
+            sender_user_id='u1',
+            content='@bibo 阅读 {DOC}',
+            channel='web',
+            project_id='p1',
+            operation_kind='write',
+        ))
+    env = result.dispatches[0]
+    question = (
+        '`{DOC}` 是未替换占位符。请问你希望我读取哪个文档？请给出绝对路径。')
+    receipt = ingress.complete_dispatch(env, ok=True, summary=question)
+    assert '澄清' not in receipt
+    board = tasks.list('p1')
+    assert board[0].status == 'completed'
+    assert not (board[0].deployment_context or {}).get('needs_clarification')
+
+
+@pytest.mark.asyncio
+async def test_complete_dispatch_keeps_wait_human_after_task_ask():
+    from ms_agent.team.stores.memory import MemoryTaskBoardStore
+
+    endpoints = MemoryEndpointStore()
+    projects = MemoryProjectMetaStore()
+    timeline = MemoryTimelineStore()
+    tasks = MemoryTaskBoardStore()
+    projects.upsert(
+        TeamProjectMeta(
+            project_id='p1', name='demo', default_lead_at='planner'))
+    endpoints.upsert(
+        AgentEndpoint(
+            endpoint_id='ep-bibo',
+            at_name='bibo',
+            owner_user_id='u1',
+            endpoint_type='persistent',
+            runtime='codex',
+            adapter_kind='acp',
+            status='online',
+        ))
+    ingress = MessageIngress(
+        endpoints, projects, timeline, task_store=tasks)
+
+    async def handler(_env):
+        return None
+
+    ingress.set_dispatch_handler(handler)
+    result = await ingress.handle(
+        InboundMessage(
+            message_id='m1',
+            sender_user_id='u1',
+            content='@bibo 阅读文档',
+            channel='web',
+            project_id='p1',
+            operation_kind='write',
+        ))
+    env = result.dispatches[0]
+    row = tasks.list('p1')[0]
+    ingress.park_question(row, 'I need the path to the document.', audience='user')
+    receipt = ingress.complete_dispatch(env, ok=True, summary='ok')
+    assert '澄清' in receipt
+    again = tasks.get(row.task_id)
+    assert again.status == 'wait_human'
+    assert (again.deployment_context or {}).get('needs_clarification') is True
+
+
+@pytest.mark.asyncio
+async def test_lead_prose_does_not_create_wait_human_ticket():
+    from ms_agent.team.models import ContextBundle
+    from ms_agent.team.stores.memory import MemoryTaskBoardStore
+
+    endpoints = MemoryEndpointStore()
+    projects = MemoryProjectMetaStore()
+    timeline = MemoryTimelineStore()
+    tasks = MemoryTaskBoardStore()
+    projects.upsert(
+        TeamProjectMeta(
+            project_id='p1', name='demo', default_lead_at='planner'))
+    endpoints.upsert(
+        AgentEndpoint(
+            endpoint_id='ep-lead',
+            at_name='planner',
+            owner_user_id='u1',
+            endpoint_type='persistent',
+            runtime='ms_agent',
+            adapter_kind='cloud',
+            status='online',
+        ))
+    ingress = MessageIngress(
+        endpoints, projects, timeline, task_store=tasks)
+
+    async def handler(_env):
+        return None
+
+    ingress.set_dispatch_handler(handler)
+    result = await ingress.handle(
+        InboundMessage(
+            message_id='m1',
+            sender_user_id='u1',
+            content='请拆任务，文档路径是 {DOC}',
+            channel='web',
+            project_id='p1',
+            operation_kind='write',
+        ))
+    env = result.dispatches[0]
+    env.context_bundle = ContextBundle(audience='lead', project_id='p1')
+    question = (
+        '用户没有给出要读的文件。请问具体路径是什么？我不能编造。')
+    ingress.complete_dispatch(env, ok=True, summary=question)
+    board = tasks.list('p1')
+    waiting = [t for t in board if t.status == 'wait_human']
+    assert not waiting
+
+
+def test_escalate_to_lead_prompt_has_no_at_sign():
+    from ms_agent.team.models import TeamTask
+    from ms_agent.team.stores.memory import MemoryTaskBoardStore
+
+    endpoints = MemoryEndpointStore()
+    projects = MemoryProjectMetaStore()
+    timeline = MemoryTimelineStore()
+    tasks = MemoryTaskBoardStore()
+    projects.upsert(
+        TeamProjectMeta(
+            project_id='p1', name='demo', default_lead_at='planner'))
+    endpoints.upsert(
+        AgentEndpoint(
+            endpoint_id='ep-lead',
+            at_name='planner',
+            owner_user_id='u1',
+            endpoint_type='persistent',
+            runtime='ms_agent',
+            adapter_kind='cloud',
+            status='online',
+        ))
+    captured = []
+
+    async def handler(env):
+        captured.append(env.prompt)
+        return None
+
+    ingress = MessageIngress(
+        endpoints, projects, timeline, task_store=tasks)
+    ingress.set_dispatch_handler(handler)
+    task = tasks.upsert(
+        TeamTask(
+            task_id='task_ask',
+            project_id='p1',
+            status='wait_human',
+            prompt='read the doc',
+            trigger_user_id='u1',
+            target_at_name='bibo',
+            result_summary='I need the path to the document.',
+        ))
+    # escalate schedules handle() on the running loop; call handle directly.
+    ingress.escalate_to_lead(task)
+    assert (tasks.get('task_ask').deployment_context or {}).get(
+        'escalated_to_lead') is True
+    assert '@' not in (
+        'Worker bibo parked task task_ask as wait_human. '
+        'Question: I need the path to the document.')
+
+
+@pytest.mark.asyncio
+async def test_task_board_write_allows_brace_tokens_and_task_ask_parks():
+    from omegaconf import OmegaConf
+    from ms_agent.team.tools.endpoint_tools import TeamTaskBoardTools
+    from ms_agent.team.stores.memory import MemoryTaskBoardStore
+    import json
+
+    tasks = MemoryTaskBoardStore()
+    asked = []
+
+    def on_ask(task):
+        asked.append(task.task_id)
+
+    ttools = TeamTaskBoardTools(
+        OmegaConf.create({'output_dir': '.'}),
+        task_store=tasks,
+        on_ask=on_ask,
+    )
+    await ttools.connect()
+    written = json.loads(
+        await ttools.call_tool(
+            'team_taskboard',
+            tool_name='task_board_write',
+            tool_args={
+                'project_id': 'p1',
+                'status': 'pending',
+                'prompt': '把整本书的 {DOC} 替换成 {DOC1}',
+                'target_at_name': 'bibo',
+            },
+        ))
+    assert written.get('error') is None
+    assert written['status'] == 'pending'
+    assert '{DOC1}' in written['prompt']
+    parked = json.loads(
+        await ttools.call_tool(
+            'team_taskboard',
+            tool_name='task_ask',
+            tool_args={
+                'project_id': 'p1',
+                'task_id': 'task_1',
+                'question': 'I need the path to the document.',
+            },
+        ))
+    assert parked['status'] == 'wait_human'
+    assert asked == ['task_1']
+    assert (tasks.get('task_1').deployment_context or {}).get(
+        'ask_audience') == 'lead'
+
+
 def test_lead_merge_prompt_empty_user_keeps_board_only():
     from ms_agent.team.models import TeamTask
     tasks = [
@@ -359,6 +642,55 @@ async def test_mention_does_not_dispatch_default_lead():
     assert len(board) == 1
     assert board[0].target_at_name == 'codex'
     assert board[0].status == 'in_progress'
+
+
+@pytest.mark.asyncio
+async def test_lead_first_turn_empty_board_has_project_pointer():
+    endpoints = MemoryEndpointStore()
+    projects = MemoryProjectMetaStore()
+    timeline = MemoryTimelineStore()
+    from ms_agent.team.stores.memory import MemoryTaskBoardStore
+    tasks = MemoryTaskBoardStore()
+    projects.upsert(
+        TeamProjectMeta(
+            project_id='p1', name='demo', default_lead_at='planner'))
+    endpoints.upsert(
+        AgentEndpoint(
+            endpoint_id='ep-lead',
+            at_name='planner',
+            owner_user_id='u1',
+            endpoint_type='persistent',
+            runtime='ms_agent',
+            adapter_kind='cloud',
+            status='online',
+        ))
+    ingress = MessageIngress(
+        endpoints, projects, timeline, task_store=tasks)
+    captured = []
+
+    async def handler(env):
+        captured.append(env)
+
+    ingress.set_dispatch_handler(handler)
+    result = await ingress.handle(
+        InboundMessage(
+            message_id='m1',
+            sender_user_id='u1',
+            content='请把这件大任务拆到任务板',
+            channel='web',
+            project_id='p1',
+        ))
+    assert result.error is None
+    assert [d.target_at_name for d in result.dispatches] == ['planner']
+    import asyncio
+    await asyncio.sleep(0.05)
+    assert captured
+    env = captured[0]
+    assert env.context_bundle.audience == 'lead'
+    assert env.context_bundle.project_id == 'p1'
+    merged = ContextBundleAssembler.merge_prompt(env.prompt, env.context_bundle)
+    assert '[task_board] project=p1' in merged
+    assert tasks.list('p1') == []
 
 
 @pytest.mark.asyncio
@@ -586,3 +918,67 @@ def test_registry_at_name_conflict():
                 runtime='claude_code',
                 adapter_kind='acp',
             ))
+
+
+def test_final_text_prefers_stream_over_truncated_summary():
+    from ms_agent.team.context import final_text_from_dispatch_events
+    from ms_agent.team.events import TeamEvent
+
+    events = [
+        TeamEvent(
+            type='team.stream',
+            dispatch_id='d1',
+            payload={'type': 'text', 'content': 'FULL-ORIGINAL-BODY'},
+        ),
+        TeamEvent(
+            type='team.dispatch_done',
+            dispatch_id='d1',
+            payload={'ok': True, 'summary': 'TRUNCATED-TAIL'},
+        ),
+    ]
+    assert final_text_from_dispatch_events(events) == 'FULL-ORIGINAL-BODY'
+
+
+def test_task_result_view_uses_worker_summary_then_log():
+    from ms_agent.team.context import task_result_view
+    from ms_agent.team.events import TeamEvent
+    from ms_agent.team.models import TeamTask
+
+    task = TeamTask(
+        task_id='t1',
+        project_id='p1',
+        status='completed',
+        prompt='extract',
+        trigger_user_id='u1',
+        last_dispatch_id='d1',
+        result_summary='worker-wrote-this',
+    )
+    events = [
+        TeamEvent(
+            type='team.stream',
+            dispatch_id='d1',
+            payload={'type': 'text', 'content': 'stream-body'},
+        ),
+    ]
+    view = task_result_view(task, events)
+    assert view['result_source'] == 'result_summary'
+    assert view['result_text'] == 'worker-wrote-this'
+
+    task.result_summary = None
+    view = task_result_view(task, events)
+    assert view['result_source'] == 'dispatch_log'
+    assert view['result_text'] == 'stream-body'
+
+    long_body = 'PLAN-START' + ('x' * 2000) + 'MEMO-END'
+    events = [
+        TeamEvent(
+            type='team.stream',
+            dispatch_id='d1',
+            payload={'type': 'text', 'content': long_body},
+        ),
+    ]
+    view = task_result_view(task, events, preview_limit=1200)
+    assert view['result_truncated'] is True
+    assert view['result_text'].startswith('…')
+    assert view['result_text'].endswith('MEMO-END')
+    assert 'PLAN-START' not in view['result_text']

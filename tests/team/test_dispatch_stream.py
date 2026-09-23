@@ -99,6 +99,14 @@ def test_dispatch_get_and_stream_replay(api: TestClient):
     assert any(getattr(e, 'dispatch_id', None) == did for e in events)
     assert any(getattr(e, 'at_name', None) == 'codex' for e in events)
 
+    snap = api.get(f'/api/v1/team/dispatches/{did}/events')
+    assert snap.status_code == 200, snap.text
+    body = snap.json()
+    assert body['dispatch_id'] == did
+    assert isinstance(body.get('events'), list)
+    assert len(body['events']) >= 1
+    assert 'final_text' in detail
+
 
 def test_acp_update_maps_tool_calls():
     from ms_agent.bridge.adapters.acp_runtime import _acp_update_to_events

@@ -7,6 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 from typing import Any
 
+from ms_agent.hooks.defaults import DEFAULT_ENABLED_EXECUTORS
 from ms_agent.hooks.executor import HookExecutor
 from ms_agent.hooks.loaders.claude import ClaudeSettingsLoader
 from ms_agent.hooks.loaders.cursor import CursorHooksLoader
@@ -40,7 +41,8 @@ def _parse_hooks_meta(
     enabled_sources = frozenset(
         raw.get('enabled_sources', ['native']) or ['native'])
     enabled_executors = frozenset(
-        raw.get('enabled_executors', ['command']) or ['command'])
+        raw.get('enabled_executors', list(DEFAULT_ENABLED_EXECUTORS))
+        or list(DEFAULT_ENABLED_EXECUTORS))
     fail_closed = bool(raw.get('fail_closed', False))
     default_model = str(raw.get('default_model', 'qwen-plus'))
     return enabled_sources, enabled_executors, fail_closed, default_model
@@ -209,6 +211,7 @@ def build_hook_runtime(
         working_dir=working_dir,
         enabled_executors=enabled_executors,
         fail_closed=fail_closed,
+        default_model=default_model,
     )
 
     return HookRuntime(

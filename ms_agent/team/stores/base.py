@@ -125,6 +125,9 @@ class ArtifactStore(ABC):
     def get_bytes(self, artifact_id: str) -> bytes | None:
         ...
 
+    def list(self, project_id: str | None = None) -> list[Artifact]:
+        return []
+
 
 class TaskBoardStore(ABC):
 
@@ -139,6 +142,17 @@ class TaskBoardStore(ABC):
     @abstractmethod
     def list(self, project_id: str) -> list[TeamTask]:
         ...
+
+    def claim(
+        self,
+        task_id: str,
+        *,
+        claimant_at_name: str,
+        expected_version: int,
+        claimant_capabilities: list | None = None,
+    ) -> TeamTask:
+        """Optimistic lock. Override in stores that have a mutex."""
+        raise NotImplementedError
 
 
 class ProjectMetaStore(ABC):

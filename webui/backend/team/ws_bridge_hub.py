@@ -139,6 +139,37 @@ class BridgeHub:
         })
         return {'ok': True, 'dispatch_id': dispatch_id}
 
+    async def resolve_permission(
+        self,
+        *,
+        dispatch_id: str,
+        endpoint_id: str | None,
+        call_id: str,
+        action: str = 'allow_once',
+        option_id: str | None = None,
+        request_id: str | None = None,
+        acp_id: Any = None,
+    ) -> dict[str, Any]:
+        """Forward a human decision to the Bridge ACP process."""
+        bridge_id = self._resolve_bridge_id(endpoint_id)
+        ws = self._conns.get(bridge_id) if bridge_id else None
+        if ws is None and endpoint_id is None:
+            for conn in self._conns.values():
+                ws = conn
+                break
+        if ws is None:
+            return {'ok': False, 'error': 'BRIDGE_UNREACHABLE'}
+        await ws.send_json({
+            'type': 'permission_resolve',
+            'dispatch_id': dispatch_id,
+            'call_id': call_id,
+            'request_id': request_id,
+            'acp_id': acp_id,
+            'action': action,
+            'option_id': option_id,
+        })
+        return {'ok': True, 'dispatch_id': dispatch_id, 'call_id': call_id}
+
     async def notify_agents_updated(self, bridge_id: str) -> bool:
         """Push current Agent rows so the daemon can sync slots immediately."""
         ws = self._conns.get(bridge_id)
@@ -314,13 +345,44 @@ async def bridge_ws(websocket: WebSocket):
                 endpoint_id = (
                     msg.get('endpoint_id')
                     or (msg.get('event') or {}).get('endpoint_id'))
+                raw = msg.get('event') or {}
+                if raw.get('type') == 'permission_request':
+                    await state._fanout_event(  # noqa: SLF001
+                        TeamEvent(
+                            type='team.permission_requested',
+                            dispatch_id=msg.get('dispatch_id'),
+                            endpoint_id=endpoint_id,
+                            payload=raw,
+                        ))
+                    await state._fanout_event(  # noqa: SLF001
+                        TeamEvent(
+                            type='team.dispatch_waiting_approval',
+                            dispatch_id=msg.get('dispatch_id'),
+                            endpoint_id=endpoint_id,
+                            payload={
+                                'call_id': (raw.get('payload') or {}).get(
+                                    'call_id') or '',
+                            },
+                        ))
                 ev = TeamEvent(
                     type='team.stream',
                     dispatch_id=msg.get('dispatch_id'),
                     endpoint_id=endpoint_id,
-                    payload=msg.get('event') or {},
+                    payload=raw,
                 )
                 await state._fanout_event(ev)  # noqa: SLF001
+            elif mtype == 'permission_resolved':
+                await state._fanout_event(  # noqa: SLF001
+                    TeamEvent(
+                        type='team.permission_resolved',
+                        dispatch_id=msg.get('dispatch_id'),
+                        payload={
+                            'call_id': msg.get('call_id'),
+                            'request_id': msg.get('request_id'),
+                            'action': msg.get('action'),
+                            'ok': msg.get('ok', True),
+                        },
+                    ))
             elif mtype == 'dispatch_done':
                 hub.complete_dispatch(
                     msg.get('dispatch_id'),

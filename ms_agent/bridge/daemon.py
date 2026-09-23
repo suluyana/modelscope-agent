@@ -181,6 +181,25 @@ class BridgeDaemon:
                 'summary': 'cancelled',
                 'artifacts': [],
             })
+        elif mtype == 'permission_resolve':
+            from ms_agent.bridge.adapters.acp_client import get_acp_pool
+            lookup = str(
+                msg.get('call_id') or msg.get('request_id')
+                or msg.get('acp_id') or '')
+            action = str(msg.get('action') or 'allow_once')
+            deny = action in ('deny', 'reject', 'cancelled')
+            option_id = str(msg.get('option_id') or (
+                'reject' if deny else 'allow-once'))
+            ok = False
+            if lookup:
+                ok = await get_acp_pool().answer_permission(
+                    lookup, option_id=option_id, deny=deny)
+            await self._send({
+                'type': 'permission_resolved',
+                'dispatch_id': msg.get('dispatch_id'),
+                'call_id': lookup,
+                'ok': ok,
+            })
         elif mtype in ('revoke', 'policy_update', 'remote_profile_change'):
             logger.info('Received frame: %s', mtype)
         elif mtype == 'registered':
@@ -313,6 +332,13 @@ class BridgeDaemon:
 
         summary_parts: list[str] = []
         had_error = False
+        from ms_agent.bridge.adapters.acp_runtime import team_ask_mcp_servers
+
+        mcp = team_ask_mcp_servers(
+            api_base=self.api_base,
+            project_id=envelope.project_id,
+            task_id=envelope.referenced_task_id,
+        )
         try:
             async for event in slot.adapter.execute(
                     prompt=prompt,
@@ -320,6 +346,7 @@ class BridgeDaemon:
                     permission_tier=envelope.permission_tier,
                     cwd=cwd,
                     session_mode=envelope.session_mode,
+                    mcp_servers=mcp or None,
             ):
                 await self._send({
                     'type': 'stream_event',

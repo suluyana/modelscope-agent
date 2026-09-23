@@ -37,6 +37,40 @@ app.add_middleware(
 app.include_router(api_router, prefix='/api')
 app.include_router(ws_router, prefix='/ws')
 
+# Agent Team control plane (same routers as ms-agent-webui). The product UI
+# for /team still lives in ms-agent-webui; this exposes the API if this
+# server is the one a Team UI is pointed at.
+_TEAM_HTTP = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_TEAM_HTTP, '..', '..'))
+for _p in (_REPO_ROOT, _TEAM_HTTP):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+if os.path.isdir(os.path.join(_TEAM_HTTP, 'team')):
+    from team import router as team_router
+    app.include_router(team_router)
+
+
+@app.get('/team')
+async def team_product_entry():
+    """This repo's SPA has no /team. Point people at the product UI."""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(
+        '''<!doctype html><html lang="zh"><head>
+<meta charset="utf-8"><title>Agent Team</title>
+<style>
+body{font:14px/1.5 system-ui,sans-serif;max-width:40rem;margin:12vh auto;padding:0 1.5rem;color:#1f1f1f}
+code{background:#f4f4f5;padding:.1rem .35rem;border-radius:4px}
+a{color:#1677ff}
+</style></head><body>
+<h1>编排台不在这个 WebUI</h1>
+<p>本仓库自带页面没有舰队、看板和配对。用户入口是
+<strong>ms-agent-webui</strong> 的 <code>/team</code>。</p>
+<p>如果编排台已经指向这台服务，控制面 API 在
+<code>/api/v1/team</code>（健康检查 <a href="/health">/health</a>）。</p>
+</body></html>''',
+        headers={'Cache-Control': 'no-store'},
+    )
+
 # Serve static files in production
 STATIC_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 if os.path.exists(STATIC_DIR):

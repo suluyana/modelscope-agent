@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
+from ms_agent.permission.matcher import matches_if_condition
 from ms_agent.utils import get_logger
 from ms_agent.utils.pattern_matcher import match_pattern
 
@@ -23,6 +24,7 @@ class HookHandlerConfig:
     prompt: str | None = None
     model: str | None = None
     max_turns: int = 20
+    if_condition: str | None = None
     source_plugin_id: str | None = None
     source_plugin_root: str | None = None
     source_plugin_data_dir: str | None = None
@@ -59,8 +61,13 @@ def _filter_handlers_by_executor(
 
 def _parse_hook_handler(h: dict[str, Any]) -> HookHandlerConfig | None:
     t = h.get('type', 'command')
-    timeout = float(h.get('timeout', 30.0))
+    if 'timeout' in h:
+        timeout = float(h['timeout'])
+    else:
+        timeout = 60.0 if t == 'agent' else 30.0
     fail_closed = bool(h.get('failClosed', h.get('fail_closed', False)))
+    if_raw = h.get('if', h.get('if_condition'))
+    if_condition = str(if_raw).strip() if if_raw else None
     if t == 'command':
         if not h.get('command'):
             return None
@@ -69,6 +76,7 @@ def _parse_hook_handler(h: dict[str, Any]) -> HookHandlerConfig | None:
             command=h['command'],
             timeout=timeout,
             fail_closed=fail_closed,
+            if_condition=if_condition,
         )
     if t == 'http':
         if not h.get('url'):
@@ -81,6 +89,7 @@ def _parse_hook_handler(h: dict[str, Any]) -> HookHandlerConfig | None:
                 h.get('allowedEnvVars', h.get('allowed_env_vars', []))),
             timeout=timeout,
             fail_closed=fail_closed,
+            if_condition=if_condition,
         )
     if t in ('prompt', 'agent'):
         if not h.get('prompt'):
@@ -92,6 +101,7 @@ def _parse_hook_handler(h: dict[str, Any]) -> HookHandlerConfig | None:
             max_turns=int(h.get('maxTurns', h.get('max_turns', 20))),
             timeout=timeout,
             fail_closed=fail_closed,
+            if_condition=if_condition,
         )
     logger.warning('Unknown hook handler type: %s', t)
     return None
@@ -192,17 +202,32 @@ class HookRegistry:
         self,
         event_type: str,
         tool_name: str | None = None,
+        tool_args: dict[str, Any] | None = None,
     ) -> list[HookHandlerConfig]:
         groups = self._index.get(event_type, [])
         result: list[HookHandlerConfig] = []
         for group in groups:
             if event_type not in self.TOOL_EVENTS:
-                result.extend(group.hooks)
+                matched = True
             elif group.matcher is None:
-                result.extend(group.hooks)
+                matched = True
             elif tool_name is not None and match_pattern(
                     group.matcher, tool_name):
-                result.extend(group.hooks)
+                matched = True
+            else:
+                matched = False
+            if not matched:
+                continue
+            for handler in group.hooks:
+                if handler.if_condition:
+                    if event_type not in self.TOOL_EVENTS:
+                        continue
+                    if tool_args is None:
+                        continue
+                    if not matches_if_condition(
+                            handler.if_condition, tool_name or '', tool_args):
+                        continue
+                result.append(handler)
         return result
 
     @property

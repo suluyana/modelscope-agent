@@ -44,6 +44,16 @@ class TestInteractiveMode:
         assert result.reason == 'test reason'
 
 
+class TestDelegateMode:
+    """delegate mode keeps SafetyGuard ask, like interactive."""
+
+    def test_read_outside_stays_ask(self) -> None:
+        decision = SafetyDecision(
+            action='ask', reason='outside', category='read_outside_dirs')
+        result = resolve_ask(decision, mode='delegate', read_policy='loose')
+        assert result.action == 'ask'
+
+
 class TestAutoMode:
     """auto mode: per-category resolution."""
 

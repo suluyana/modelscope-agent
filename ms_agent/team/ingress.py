@@ -14,6 +14,7 @@ from ms_agent.team.context import (
     ContextBundleAssembler,
     format_dispatch_receipt,
     format_done_receipt,
+    truncate_summary,
 )
 from ms_agent.team.errors import (
     CIRCUIT_OPEN,
@@ -191,6 +192,8 @@ class MessageIngress:
         self._handlers: Dict[str, DispatchHandler] = {}
         self._default_handler: DispatchHandler | None = None
         self._envelopes: Dict[str, DispatchEnvelope] = {}
+        self.coordinator = None
+        self.roster = None
 
     def set_dispatch_handler(
         self,
@@ -245,6 +248,11 @@ class MessageIngress:
             for e in self.endpoints.list()
         }
         router = AtRouter(by_at, self.flags)
+        src = getattr(msg, 'source', 'user') or 'user'
+        if src == 'escalation':
+            # Structured Lead tick: no @ in content (would dispatch workers).
+            msg.mentions = []
+            msg.target_at_name = None
         targets = router.resolve_targets(
             msg, default_lead_at=default_lead, require_online=True)
 
@@ -255,8 +263,8 @@ class MessageIngress:
                 http_status=400,
             )
 
-        # Persist inbound human message.
-        if project_id:
+        # Persist inbound human message (Coordinator / escalate ticks are not).
+        if project_id and src not in ('coordinator', 'escalation'):
             self.timeline.append(
                 TimelineMessage(
                     message_id=msg.message_id or new_id('msg_'),
@@ -281,10 +289,19 @@ class MessageIngress:
         receipts: list[dict[str, Any]] = []
 
         for target in targets:
-            prompt = (
-                AtMentionParser.clause_for(
-                    msg.content, target.endpoint.at_name)
-                or msg.content)
+            is_explicit = bool(msg.mentions or msg.target_at_name)
+            audience = 'worker' if is_explicit else 'lead'
+            if src == 'coordinator':
+                prompt = msg.content
+                audience = 'worker'
+            elif src == 'escalation':
+                prompt = msg.content
+                audience = 'lead'
+            else:
+                prompt = (
+                    AtMentionParser.clause_for(
+                        msg.content, target.endpoint.at_name)
+                    or msg.content)
             # Reject write to degraded endpoints (reads still allowed via policy later).
             if (msg.operation_kind == 'write'
                     and target.endpoint.status == 'degraded'):
@@ -303,7 +320,13 @@ class MessageIngress:
                     project_id=project_id,
                     endpoint_id=target.endpoint.endpoint_id,
                     at_name=target.endpoint.at_name,
-                    payload={'fingerprint': fp},
+                    payload={
+                        'fingerprint': fp,
+                        'reason': (
+                            'Too many recent failures for this task '
+                            'fingerprint (same agent + same prompt).'
+                        ),
+                    },
                 )
                 await self._emit(ev)
                 raise TeamError(
@@ -313,8 +336,6 @@ class MessageIngress:
                     details={'fingerprint': fp},
                 )
 
-            is_explicit = bool(msg.mentions or msg.target_at_name)
-            audience = 'worker' if is_explicit else 'lead'
             lead_thread = None
             if audience == 'lead':
                 lead_thread = _lead_thread_messages(
@@ -323,13 +344,23 @@ class MessageIngress:
                 audience=audience,
                 thread_messages=lead_thread,
                 referenced_task_id=msg.referenced_task_id,
+                project_id=project_id if audience == 'lead' else None,
                 task_snapshots=(
                     ContextBundleAssembler.snapshots_from_tasks(board_tasks)
                     if audience == 'lead' else None),
                 task_inbox=(
                     ContextBundleAssembler.inbox_from_tasks(
-                        board_tasks, at_name=target.endpoint.at_name)
+                        board_tasks,
+                        at_name=target.endpoint.at_name,
+                        capabilities=list(
+                            getattr(target.endpoint, 'capabilities', None)
+                            or []),
+                    )
                     if audience == 'worker' else None),
+                roster_lines=(
+                    self.roster.preview_lines()
+                    if audience == 'lead' and self.roster is not None
+                    else None),
             )
 
             env = self._build_envelope(
@@ -337,10 +368,18 @@ class MessageIngress:
             self._envelopes[env.dispatch_id] = env
             envelopes.append(env)
 
-            task = self._upsert_dispatch_task(env, prompt)
+            task = self._upsert_dispatch_task(env, prompt, project_meta)
             if task:
                 env.referenced_task_id = (
                     env.referenced_task_id or task.task_id)
+                from ms_agent.team.plan_gate import (
+                    apply_plan_prefix,
+                    task_needs_plan_pass,
+                )
+                audience = getattr(env.context_bundle, 'audience', '') or ''
+                if audience != 'lead' and task_needs_plan_pass(
+                        task, project_meta):
+                    env.prompt = apply_plan_prefix(env.prompt)
 
             session_ev = TeamEvent(
                 type='team.session',
@@ -424,14 +463,14 @@ class MessageIngress:
         summary: str | None = None,
         error_code: str | None = None,
     ) -> None:
-        del summary  # idle: transcript stays off the receipt / board
         fp = fingerprint(
             envelope.project_id, envelope.target_endpoint_id, envelope.prompt)
         if ok:
             self.circuit.record_success(fp)
         else:
             self.circuit.record_failure(fp)
-        self.complete_dispatch(envelope, ok=ok, error_code=error_code)
+        self.complete_dispatch(
+            envelope, ok=ok, summary=summary, error_code=error_code)
 
     def complete_dispatch(
         self,
@@ -443,16 +482,32 @@ class MessageIngress:
     ) -> str:
         """Write an idle receipt + board status. No transcript, no LLM summary.
 
-        ``summary`` is accepted for callers but never copied onto the
-        timeline or ``result_summary``. Worker conclusions are opt-in via
-        ``task_board_write``.
+        Questions are explicit ``task_ask`` tickets, not scanned from the
+        reply. If the row is already ``wait_human``, a successful turn does
+        not mark it completed.
         """
-        del summary  # idle notify: output stays on the private stream
+        waiting = False
+        task_id = envelope.referenced_task_id
+        existing = None
+        if self.tasks and task_id:
+            existing = self.tasks.get(task_id)
+            waiting = bool(
+                existing is not None and (
+                    existing.status == 'wait_human' or (
+                        existing.deployment_context or {}
+                    ).get('needs_clarification') or (
+                        ok and (existing.plan_status or '') == 'required')))
         receipt_text = format_done_receipt(
             at_name=envelope.target_at_name,
             ok=ok,
             error_code=error_code,
         )
+        if waiting and ok:
+            if existing is not None and (existing.plan_status or '') == 'required':
+                receipt_text = (
+                    f'@{envelope.target_at_name} 已提交 plan，等待人工批准后再改代码')
+            else:
+                receipt_text = f'@{envelope.target_at_name} 需要澄清才能继续'
         if envelope.project_id:
             self.timeline.append(
                 TimelineMessage(
@@ -471,24 +526,164 @@ class MessageIngress:
                         'ok': ok,
                         'at_name': envelope.target_at_name,
                         'error_code': error_code,
+                        'needs_clarification': waiting,
                     },
                 ))
-        task_id = envelope.referenced_task_id
-        if self.tasks and task_id:
-            existing = self.tasks.get(task_id)
-            if existing:
-                existing.status = 'completed' if ok else 'failed'
-                existing.last_dispatch_id = envelope.dispatch_id
-                existing.updated_at = _now().isoformat()
-                self.tasks.upsert(existing)
+        if existing is not None:
+            if not ok:
+                existing.status = 'failed'
+            elif waiting:
+                existing.status = 'wait_human'
+                if (existing.plan_status or '') == 'required':
+                    existing.plan_status = 'ready'
+            else:
+                existing.status = 'completed'
+            existing.last_dispatch_id = envelope.dispatch_id
+            existing.updated_at = _now().isoformat()
+            self.tasks.upsert(existing)
+            if waiting and ok:
+                self._record_roster(existing, 'wait_human')
+            elif not ok:
+                self._record_roster(existing, 'failed')
+            else:
+                self._record_roster(existing, 'completed')
+        if not waiting:
+            self._kick_coordinator(envelope.project_id)
         return receipt_text
+
+    def park_question(
+        self,
+        task: TeamTask,
+        question: str,
+        *,
+        audience: str = 'lead',
+        last_dispatch_id: str | None = None,
+    ) -> TeamTask:
+        """Park a row as wait_human. Does not dump the private stream."""
+        task.status = 'wait_human'
+        task.result_summary = truncate_summary(question, 500)
+        if last_dispatch_id:
+            task.last_dispatch_id = last_dispatch_id
+        ctx = dict(task.deployment_context or {})
+        ctx['needs_clarification'] = True
+        ctx['ask_audience'] = audience
+        task.deployment_context = ctx
+        task.updated_at = _now().isoformat()
+        if self.tasks is not None:
+            self.tasks.upsert(task)
+        self._record_roster(task, 'wait_human')
+        if audience == 'lead':
+            self.escalate_to_lead(task)
+        return task
+
+    def escalate_to_lead(self, task: TeamTask) -> None:
+        """Ask Lead to patch a wait_human row. Never @-mention a worker."""
+        ctx = dict(task.deployment_context or {})
+        if ctx.get('escalated_to_lead'):
+            return
+        project = (
+            self.projects.get(task.project_id) if task.project_id else None)
+        lead = (getattr(project, 'default_lead_at', None) or '').lstrip('@')
+        worker = (task.target_at_name or '').lstrip('@')
+        if not lead or worker == lead:
+            return
+        ctx['escalated_to_lead'] = True
+        task.deployment_context = ctx
+        if self.tasks is not None:
+            self.tasks.upsert(task)
+        question = (task.result_summary or 'missing fact').replace('@', '')
+        worker_label = worker or 'teammate'
+        content = (
+            f'Worker {worker_label} parked task {task.task_id} as wait_human. '
+            f'Question: {question}\n'
+            'Patch that row with task_board_write: put the missing fact into '
+            'the prompt, status=pending. Do not treat the question as a '
+            'finished extract. If you cannot answer, call task_ask with '
+            'audience=user and stop. Do not mention teammates with an at-sign.'
+        )
+        msg = InboundMessage(
+            message_id=new_id('msg_'),
+            sender_user_id='system',
+            content=content,
+            channel='web',
+            project_id=task.project_id,
+            thread_id=task.thread_id,
+            operation_kind='write',
+            source='escalation',
+            session_mode='attach',
+            referenced_task_id=task.task_id,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.handle(msg))
+
+    def escalate_unclaimed(self, task: TeamTask) -> InboundMessage | None:
+        """Timeout: tell Lead to assign. Do not guess a worker.
+
+        Returns the inbound tick so the Coordinator can ``await handle``
+        after releasing its lock.
+        """
+        ctx = dict(task.deployment_context or {})
+        if ctx.get('unclaimed_escalated'):
+            return None
+        project = (
+            self.projects.get(task.project_id) if task.project_id else None)
+        lead = (getattr(project, 'default_lead_at', None) or '').lstrip('@')
+        if not lead:
+            return None
+        ctx['unclaimed_escalated'] = True
+        task.deployment_context = ctx
+        if self.tasks is not None:
+            self.tasks.upsert(task)
+        prompt = (task.prompt or '').replace('@', '')[:240]
+        content = (
+            f'Unclaimed task {task.task_id} waited past the claim timeout. '
+            f'Prompt: {prompt}\n'
+            'Assign with task_board_write target_at_name (plain name) or add '
+            'tags that match a teammate capability so they can self-claim. '
+            'Do not mention teammates with an at-sign.'
+        )
+        return InboundMessage(
+            message_id=new_id('msg_'),
+            sender_user_id='system',
+            content=content,
+            channel='web',
+            project_id=task.project_id,
+            thread_id=task.thread_id,
+            operation_kind='write',
+            source='escalation',
+            session_mode='attach',
+        )
+
+    def _record_roster(self, task: TeamTask, outcome: str) -> None:
+        roster = self.roster
+        if roster is None:
+            return
+        try:
+            roster.record(
+                at_name=task.target_at_name or '',
+                outcome=outcome,
+                task_id=task.task_id,
+                tags=list(getattr(task, 'tags', None) or []),
+                project_id=task.project_id or '',
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug('roster record failed', exc_info=True)
 
     def _upsert_dispatch_task(
         self,
         envelope: DispatchEnvelope,
         prompt: str,
+        project_meta=None,
     ) -> TeamTask | None:
         if self.tasks is None or not envelope.project_id:
+            return None
+        audience = getattr(envelope.context_bundle, 'audience', '') or ''
+        if audience == 'lead' and not envelope.referenced_task_id:
+            # Lead turns are not board rows. Collect must not treat the
+            # decompose prompt as a worker last_dispatch_id.
             return None
         if envelope.referenced_task_id:
             existing = self.tasks.get(envelope.referenced_task_id)
@@ -499,8 +694,17 @@ class MessageIngress:
                 existing.target_at_name = envelope.target_at_name
                 if envelope.thread_id and not existing.thread_id:
                     existing.thread_id = envelope.thread_id
+                from ms_agent.team.plan_gate import project_wants_plan
+                if (
+                    audience != 'lead'
+                    and project_wants_plan(project_meta)
+                    and (existing.plan_status or '') not in ('approved', 'ready')
+                ):
+                    existing.plan_status = 'required'
                 existing.updated_at = _now().isoformat()
                 return self.tasks.upsert(existing)
+        from ms_agent.team.plan_gate import project_wants_plan
+        plan_status = 'required' if project_wants_plan(project_meta) else ''
         task = TeamTask(
             task_id=new_id('task_'),
             project_id=envelope.project_id,
@@ -511,8 +715,47 @@ class MessageIngress:
             target_at_name=envelope.target_at_name,
             last_dispatch_id=envelope.dispatch_id,
             thread_id=envelope.thread_id,
+            plan_status=plan_status,
         )
         return self.tasks.upsert(task)
+
+    async def dispatch_board_task(self, task: TeamTask) -> IngressResult:
+        """Enqueue a board row to its assigned endpoint. Not a Lead turn."""
+        if not task.target_at_name:
+            task.status = 'wait_human'
+            if self.tasks is not None:
+                self.tasks.upsert(task)
+            return IngressResult(project_id=task.project_id)
+        project = self.projects.get(task.project_id) if self.projects else None
+        from ms_agent.team.plan_gate import task_needs_plan_pass
+        operation_kind = (
+            'read' if task_needs_plan_pass(task, project) else 'write')
+        msg = InboundMessage(
+            message_id=new_id('msg_'),
+            sender_user_id='coordinator',
+            content=task.prompt,
+            channel='web',
+            project_id=task.project_id,
+            thread_id=task.thread_id,
+            mentions=[task.target_at_name],
+            target_at_name=task.target_at_name,
+            referenced_task_id=task.task_id,
+            operation_kind=operation_kind,
+            source='coordinator',
+        )
+        return await self.handle(msg)
+
+    def _kick_coordinator(self, project_id: str | None) -> None:
+        coord = getattr(self, 'coordinator', None)
+        if coord is None or not getattr(coord, 'enabled', False):
+            return
+        if not project_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(coord.on_dispatch_done(project_id))
 
     def _build_envelope(
         self,

@@ -78,10 +78,29 @@ def test_web_permission_roundtrip():
     asyncio.run(run())
 
 
-def test_web_permission_times_out_to_deny():
+def test_web_permission_default_wait_is_unbounded():
+    async def run():
+        handler = WebPermissionHandler(_Emitter())
+        assert handler._timeout is None
+        task = asyncio.create_task(
+            handler.ask('shell', {'cmd': 'rm'}, '', call_id='c1'))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        request_id = handler._event_emitter.events[0]['request_id']
+        handler.resolve(
+            request_id,
+            PermissionResponse(action=PermissionAction.ALLOW_ONCE))
+        assert (await task).action == PermissionAction.ALLOW_ONCE
+
+    asyncio.run(run())
+
+
+def test_web_permission_explicit_timeout_denies_as_timeout_not_refusal():
     async def run():
         handler = WebPermissionHandler(_Emitter(), timeout=0.05)
         resp = await handler.ask('shell', {'cmd': 'rm'}, '')
         assert resp.action == PermissionAction.DENY
+        assert 'TIMEOUT' in (resp.feedback or '')
+        assert 'not a refusal' in (resp.feedback or '')
 
     asyncio.run(run())

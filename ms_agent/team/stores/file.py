@@ -312,6 +312,12 @@ class FileArtifactStore(ArtifactStore):
             return blob.read_bytes()
         return None
 
+    def list(self, project_id: str | None = None) -> list[Artifact]:
+        rows = list(self._meta.values())
+        if project_id:
+            rows = [a for a in rows if a.project_id == project_id]
+        return rows
+
 
 class FileTaskBoardStore(TaskBoardStore):
 
@@ -352,6 +358,24 @@ class FileTaskBoardStore(TaskBoardStore):
 
     def list(self, project_id: str) -> list[TeamTask]:
         return self._mem.list(project_id)
+
+    def claim(
+        self,
+        task_id: str,
+        *,
+        claimant_at_name: str,
+        expected_version: int,
+        claimant_capabilities: list | None = None,
+    ) -> TeamTask:
+        with self._lock:
+            t = self._mem.claim(
+                task_id,
+                claimant_at_name=claimant_at_name,
+                expected_version=expected_version,
+                claimant_capabilities=claimant_capabilities,
+            )
+            self._save()
+            return t
 
 
 class FileProjectMetaStore(ProjectMetaStore):

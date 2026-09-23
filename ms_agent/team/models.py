@@ -52,7 +52,8 @@ ChannelKind = Literal['web', 'dingtalk', 'feishu', 'wecom']
 PermissionTier = Literal['owner', 'restricted']
 OperationKind = Literal['read', 'write']
 TaskStatus = Literal['pending', 'in_progress', 'completed', 'failed',
-                     'cancelled']
+                     'cancelled', 'wait_human', 'waiting_approval']
+PlanStatus = Literal['', 'required', 'ready', 'approved']
 SessionMode = Literal['attach', 'fresh']
 SessionModeHint = Literal['attach', 'fresh', 'auto']
 SessionResolutionReason = Literal[
@@ -75,6 +76,7 @@ class TeamFeatureFlags:
     dingtalk_enabled: bool = True
     feishu_enabled: bool = False
     wecom_enabled: bool = False
+    coordinator_enabled: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> TeamFeatureFlags:
@@ -91,6 +93,8 @@ class TeamFeatureFlags:
                 (channels.get('feishu') or {}).get('enabled', False)),
             wecom_enabled=bool(
                 (channels.get('wecom') or {}).get('enabled', False)),
+            coordinator_enabled=bool(
+                data.get('coordinator_enabled', True)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,6 +113,7 @@ class TeamFeatureFlags:
                     'enabled': self.wecom_enabled
                 },
             },
+            'coordinator_enabled': self.coordinator_enabled,
         }
 
 
@@ -271,8 +276,10 @@ class ContextBundle:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     deployment_context: dict[str, Any] | None = None
     audience: str = 'worker'
+    project_id: str | None = None
     task_snapshots: list[dict[str, Any]] = field(default_factory=list)
     task_inbox: list[dict[str, Any]] = field(default_factory=list)
+    roster_lines: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -288,8 +295,10 @@ class ContextBundle:
             artifacts=list(data.get('artifacts') or []),
             deployment_context=data.get('deployment_context'),
             audience=data.get('audience') or 'worker',
+            project_id=data.get('project_id') or None,
             task_snapshots=list(data.get('task_snapshots') or []),
             task_inbox=list(data.get('task_inbox') or []),
+            roster_lines=list(data.get('roster_lines') or []),
         )
 
 
@@ -380,6 +389,7 @@ class InboundMessage:
     referenced_task_id: str | None = None
     session_mode: SessionModeHint = 'auto'
     target_at_name: str | None = None
+    source: str = 'user'
 
 
 @dataclass
@@ -429,6 +439,10 @@ class TeamTask:
     result_summary: str | None = None
     last_dispatch_id: str | None = None
     thread_id: str | None = None
+    parent_task_id: str | None = None
+    claim_version: int = 0
+    tags: list[str] = field(default_factory=list)
+    plan_status: PlanStatus = ''
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
 
@@ -451,6 +465,10 @@ class TeamTask:
             result_summary=data.get('result_summary'),
             last_dispatch_id=data.get('last_dispatch_id'),
             thread_id=data.get('thread_id'),
+            parent_task_id=data.get('parent_task_id'),
+            claim_version=int(data.get('claim_version') or 0),
+            tags=[str(x).strip() for x in (data.get('tags') or []) if str(x).strip()],
+            plan_status=data.get('plan_status') or '',
             created_at=data.get('created_at', _now_iso()),
             updated_at=data.get('updated_at', _now_iso()),
         )
@@ -560,6 +578,7 @@ class TeamProjectMeta:
     name: str
     workspace_path: str = ''
     default_lead_at: str | None = None
+    plan_gate: bool = False
     release_config: dict[str, Any] = field(default_factory=dict)
     members: list[dict[str, str]] = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
@@ -575,6 +594,7 @@ class TeamProjectMeta:
             name=data.get('name', data['project_id']),
             workspace_path=data.get('workspace_path', ''),
             default_lead_at=data.get('default_lead_at'),
+            plan_gate=bool(data.get('plan_gate', False)),
             release_config=dict(data.get('release_config') or {}),
             members=list(data.get('members') or []),
             created_at=data.get('created_at', _now_iso()),

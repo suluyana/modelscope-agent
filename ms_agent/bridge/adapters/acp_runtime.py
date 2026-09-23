@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ms_agent.bridge.adapters.acp_client import (
@@ -42,6 +44,43 @@ def looks_like_acp_session_id(session_id: str | None) -> bool:
     if len(sid) >= 16 and '-' in sid and not sid.startswith('sess'):
         return True
     return False
+
+
+def team_ask_mcp_servers(
+    *,
+    api_base: str | None,
+    project_id: str | None,
+    task_id: str | None,
+) -> list[dict[str, Any]]:
+    """Stdio MCP so ACP workers can file ``task_ask`` on the Team API."""
+    if not api_base or not project_id or not task_id:
+        return []
+    try:
+        import ms_agent as _ms_agent
+        root = str(Path(_ms_agent.__file__).resolve().parents[1])
+    except Exception:  # noqa: BLE001
+        root = os.getcwd()
+    pythonpath = os.pathsep.join(
+        p for p in (root, os.environ.get('PYTHONPATH', '')) if p)
+    return [{
+        'name': 'team-ask',
+        'command': sys.executable,
+        'args': ['-m', 'ms_agent.team.mcp_ask'],
+        'env': {
+            'MS_AGENT_TEAM_API': str(api_base).rstrip('/'),
+            'MS_AGENT_TEAM_PROJECT_ID': project_id,
+            'MS_AGENT_TEAM_TASK_ID': task_id,
+            'PYTHONPATH': pythonpath,
+            'PYTHONUNBUFFERED': '1',
+        },
+    }]
+
+
+def _session_mcp_params(
+    workdir: str,
+    mcp_servers: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    return {'cwd': workdir, 'mcpServers': list(mcp_servers or [])}
 
 
 def _chunk_text(content: Any) -> str:
@@ -119,6 +158,45 @@ def _acp_update_to_events(
     return []
 
 
+def permission_msg_to_event(
+    msg: dict[str, Any],
+    runtime_sid: str,
+) -> BridgeEvent | None:
+    """Map ACP ``session/request_permission`` into a host-visible event."""
+    if msg.get('method') != 'session/request_permission':
+        return None
+    params = msg.get('params') or {}
+    if not isinstance(params, dict):
+        params = {}
+    tool_call = params.get('toolCall') or params.get('tool_call') or {}
+    if not isinstance(tool_call, dict):
+        tool_call = {}
+    call_id = str(
+        tool_call.get('toolCallId')
+        or tool_call.get('tool_call_id')
+        or tool_call.get('id')
+        or '')
+    title = (
+        tool_call.get('title')
+        or tool_call.get('kind')
+        or params.get('title')
+        or 'permission')
+    options = params.get('options') or []
+    return BridgeEvent(
+        type='permission_request',
+        content=str(title),
+        payload={
+            'runtime_session_id': runtime_sid,
+            'acp_id': msg.get('id'),
+            'call_id': call_id,
+            'tool_name': str(title),
+            'tool_args': tool_call.get('rawInput') or tool_call.get('raw_input')
+            or {},
+            'options': options,
+        },
+    )
+
+
 async def run_acp_turn(
     *,
     runtime: str,
@@ -129,8 +207,9 @@ async def run_acp_turn(
     session_mode: str,
     auth_method_id: str | None = None,
     env: dict[str, str] | None = None,
-    auto_allow: bool = True,
-    prompt_timeout: float = 300.0,
+    auto_allow: bool = False,
+    prompt_timeout: float | None = None,
+    mcp_servers: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[BridgeEvent]:
     """Reuse pooled ACP process; attach via session/load or create fresh."""
     pool = get_acp_pool()
@@ -160,6 +239,7 @@ async def run_acp_turn(
 
     workdir = cwd or os.getcwd()
     runtime_sid = session_id
+    session_params = _session_mcp_params(workdir, mcp_servers)
     try:
         want_attach = (
             session_mode == 'attach' and looks_like_acp_session_id(session_id))
@@ -175,20 +255,13 @@ async def run_acp_turn(
                     'Team sess_* is not an ACP sessionId; using session/new',
                 },
             )
-            created = await acp.request(
-                'session/new',
-                {'cwd': workdir, 'mcpServers': []},
-            )
+            created = await acp.request('session/new', session_params)
             runtime_sid = (created or {}).get('sessionId') or session_id
         elif want_attach:
             try:
                 loaded = await acp.request(
                     'session/load',
-                    {
-                        'sessionId': session_id,
-                        'cwd': workdir,
-                        'mcpServers': [],
-                    },
+                    {'sessionId': session_id, **session_params},
                 )
                 runtime_sid = (loaded or {}).get('sessionId') or session_id
                 yield BridgeEvent(
@@ -213,16 +286,10 @@ async def run_acp_turn(
                     content='attach_fallback_fresh',
                     payload={'error': str(exc)},
                 )
-                created = await acp.request(
-                    'session/new',
-                    {'cwd': workdir, 'mcpServers': []},
-                )
+                created = await acp.request('session/new', session_params)
                 runtime_sid = (created or {}).get('sessionId') or session_id
         else:
-            created = await acp.request(
-                'session/new',
-                {'cwd': workdir, 'mcpServers': []},
-            )
+            created = await acp.request('session/new', session_params)
             runtime_sid = (created or {}).get('sessionId') or session_id
     except AuthRequired as exc:
         yield BridgeEvent(
@@ -244,12 +311,20 @@ async def run_acp_turn(
             pass
 
     async def on_update(msg: dict[str, Any]) -> None:
+        perm = permission_msg_to_event(msg, runtime_sid)
+        if perm is not None:
+            _put(perm)
+            return
         for ev in _acp_update_to_events(msg, runtime_sid):
             if ev.type == 'text' and ev.content:
                 text_parts.append(ev.content)
             _put(ev)
 
     acp.on_notification = on_update
+
+    turn_timeout = prompt_timeout
+    if turn_timeout is None and auto_allow:
+        turn_timeout = 300.0
 
     async def _prompt() -> None:
         try:
@@ -262,7 +337,7 @@ async def run_acp_turn(
                         'text': prompt
                     }],
                 },
-                timeout=prompt_timeout,
+                timeout=turn_timeout,
             )
             if not text_parts and result is not None:
                 _put(

@@ -4,6 +4,7 @@
 Platform = post office + locker. Lead Agents orchestrate via Tools.
 """
 from ms_agent.team.context import ContextBundleAssembler
+from ms_agent.team.coordinator import Coordinator
 from ms_agent.team.errors import TeamError
 from ms_agent.team.events import TeamEvent
 from ms_agent.team.health import HealthMonitor
@@ -35,6 +36,7 @@ __all__ = [
     'AtRouter',
     'ContextBundle',
     'ContextBundleAssembler',
+    'Coordinator',
     'DispatchEnvelope',
     'EndpointHealth',
     'EndpointRegistryService',

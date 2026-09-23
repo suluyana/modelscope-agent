@@ -52,6 +52,7 @@ class HookExecutionContext:
     messages: list | None = None
     abort_signal: asyncio.Event | None = None
     tool_manager: Any | None = None
+    default_model: str = 'qwen-plus'
 
 
 def plugin_compat_payload(

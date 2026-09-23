@@ -60,22 +60,29 @@ class CloudAgentRuntime:
         endpoint_store=None,
         artifact_store=None,
         task_store=None,
+        dispatch_log=None,
         endpoint_token_store=None,
         project_store=None,
+        coordinator=None,
         event_sink=None,
         agent_config_path: str | None = None,
         dry_run: bool | None = None,
+        permission_store=None,
     ) -> None:
         self.endpoint_store = endpoint_store
         self.artifact_store = artifact_store
         self.task_store = task_store
+        self.dispatch_log = dispatch_log
         self.endpoint_token_store = endpoint_token_store
         self.project_store = project_store
+        self.coordinator = coordinator
         self.event_sink = event_sink
         self.agent_config_path = agent_config_path
+        self._permission_store = permission_store
         if dry_run is None:
             dry_run = _env_flag('MS_AGENT_TEAM_CLOUD_DRY_RUN', False)
         self.dry_run = bool(dry_run)
+        self._permission_handlers: dict[str, Any] = {}
 
     async def run(self, envelope: DispatchEnvelope) -> dict[str, Any]:
         parts: list[str] = []
@@ -170,7 +177,6 @@ class CloudAgentRuntime:
 
         sink = _TeamEventSink()
         agent = self._build_agent(envelope, sink)
-        await self._maybe_attach_tools(agent, envelope)
 
         final_text_parts: list[str] = []
 
@@ -193,6 +199,7 @@ class CloudAgentRuntime:
 
         task = asyncio.create_task(_drive())
         had_text = False
+        stream_text: list[str] = []
         try:
             while True:
                 item = await sink.queue.get()
@@ -205,6 +212,7 @@ class CloudAgentRuntime:
                     if not text:
                         continue
                     had_text = True
+                    stream_text.append(text)
                     yield TeamEvent(
                         type='team.stream',
                         project_id=envelope.project_id,
@@ -261,7 +269,31 @@ class CloudAgentRuntime:
                     return
                 elif et == 'content_end' or isinstance(item, ContentEnd):
                     continue
+                elif isinstance(item, dict) and item.get(
+                        'type') == 'permission_request':
+                    payload = dict(item)
+                    payload['source'] = 'cloud'
+                    yield TeamEvent(
+                        type='team.permission_requested',
+                        project_id=envelope.project_id,
+                        dispatch_id=envelope.dispatch_id,
+                        endpoint_id=envelope.target_endpoint_id,
+                        at_name=envelope.target_at_name,
+                        payload=payload,
+                    )
+                    yield TeamEvent(
+                        type='team.dispatch_waiting_approval',
+                        project_id=envelope.project_id,
+                        dispatch_id=envelope.dispatch_id,
+                        endpoint_id=envelope.target_endpoint_id,
+                        at_name=envelope.target_at_name,
+                        payload={
+                            'call_id': payload.get('call_id') or '',
+                            'request_id': payload.get('request_id') or '',
+                        },
+                    )
         finally:
+            self.drop_permission_handler(envelope.dispatch_id)
             if not task.done():
                 task.cancel()
                 try:
@@ -291,7 +323,12 @@ class CloudAgentRuntime:
             dispatch_id=envelope.dispatch_id,
             endpoint_id=envelope.target_endpoint_id,
             at_name=envelope.target_at_name,
-            payload={'ok': True},
+            payload={
+                'ok': True,
+                'summary': (
+                    ''.join(stream_text) or ''.join(final_text_parts)
+                )[-4000:],
+            },
         )
 
     def _workspace(self, envelope: DispatchEnvelope) -> str:
@@ -306,12 +343,150 @@ class CloudAgentRuntime:
         return str(_ms_agent_home() / 'team_workspaces' / (
             envelope.project_id or 'default'))
 
+    def _teammate_at_names(self) -> list[str]:
+        if self.endpoint_store is None:
+            return []
+        try:
+            endpoints = self.endpoint_store.list()
+        except Exception:  # noqa: BLE001
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for ep in endpoints:
+            name = (getattr(ep, 'at_name', '') or '').lstrip('@').strip()
+            key = name.lower()
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        return names
+
+    def _plan_only(self, envelope: DispatchEnvelope) -> bool:
+        if not envelope.referenced_task_id or self.task_store is None:
+            return False
+        try:
+            task = self.task_store.get(envelope.referenced_task_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if task is None:
+            return False
+        project = None
+        if self.project_store is not None and envelope.project_id:
+            try:
+                project = self.project_store.get(envelope.project_id)
+            except Exception:  # noqa: BLE001
+                project = None
+        from ms_agent.team.plan_gate import task_needs_plan_pass
+        return task_needs_plan_pass(task, project)
+
+    def _system_prompt(self, envelope: DispatchEnvelope) -> str:
+        audience = ''
+        bundle = envelope.context_bundle
+        if bundle is not None:
+            audience = getattr(bundle, 'audience', '') or ''
+        workspace = self._workspace(envelope)
+        teammate_line = (
+            ', '.join(self._teammate_at_names()) or '(none registered)')
+        has_board = bool(getattr(bundle, 'task_snapshots', None)) if bundle else False
+        if audience == 'lead':
+            collect = (
+                'To collect results: task_board_read, then '
+                'dispatch_result_read with last_dispatch_id. Never glob/find/ls '
+                'for teammate output, and never rewrite their final answers. '
+                'Never use todo_write for teammate work — that is a local '
+                'checklist. Only task_board_write creates dispatchable rows.\n'
+            )
+            if has_board:
+                return (
+                    f'You are {envelope.target_at_name}, the Team Lead.\n'
+                    f'Project workspace: {workspace}\n'
+                    'Teammates you may assign with task_board_write.target_at_name '
+                    f'(plain names, never an at-sign): {teammate_line}.\n'
+                    'The board already has rows. Do not write a second decompose. '
+                    'Call task_board_read, then dispatch_result_read for completed '
+                    'workers. Report status only. Only call task_board_write if a '
+                    'needed row is missing or a wait_human row asked a question '
+                    '(rewrite that prompt with the missing fact, status=pending).\n'
+                    + collect
+                )
+            return (
+                f'You are {envelope.target_at_name}, the Team Lead.\n'
+                f'Project workspace: {workspace}\n'
+                'Teammates you may assign with task_board_write.target_at_name '
+                f'(plain names, never an at-sign): {teammate_line}.\n'
+                'On a large job:\n'
+                '1. Split work with task_board_write. Each prompt MUST be a '
+                'complete instruction the worker can execute without the '
+                'original user message. If the job itself contains brace '
+                'tokens, copy them. If a required path or fact is missing, '
+                'call task_ask with audience=user and stop — do not invent.\n'
+                '2. New teammate work uses status=pending plus target_at_name. '
+                'Independent tasks omit blocked_by. Dependent tasks set '
+                'blocked_by to the blocking task_id values returned by '
+                'previous writes.\n'
+                '3. Do not mention teammates with an at-sign in chat — that '
+                'bypasses the board.\n'
+                '4. Do not solve extract or worker subtasks yourself. After '
+                'writing the board, stop. Do not reply with a prose plan in '
+                'chat instead of board rows — the board is the plan.\n'
+                '5. Do not invent missing facts or write vague '
+                '"read related docs" rows.\n'
+                '6. If task_board_read shows wait_human with a question, that '
+                'worker is blocked. Patch that row\'s prompt with the missing '
+                'fact and set status=pending. Do not treat the question as a '
+                'finished extract.\n'
+                + collect
+            )
+        worker = (
+            f'You are {envelope.target_at_name}, a teammate on MS-Agent Team. '
+            f'Work inside {workspace}.\n'
+            'If this task is to collect or merge teammate results: call '
+            'task_board_read, then dispatch_result_read for each '
+            'last_dispatch_id. Do not glob/find/ls for their output. Do not '
+            're-solve their work. Quote their final replies; do not paraphrase.\n'
+            'Otherwise use files, shell, and search as needed and reply with '
+            'the result. If a required path or fact is missing, call '
+            'task_ask (defaults to Lead; audience=user only if the human '
+            'must answer). Stop after the tool. A question in the reply is '
+            'treated as a finished answer.\n'
+        )
+        if self._plan_only(envelope):
+            return (
+                worker
+                + 'PLAN GATE is on: read-only this turn. Do not write or '
+                'edit files, and do not run mutating or network shell. '
+                'Write the plan via task_board_write.result_summary and stop.'
+            )
+        return worker
+
+    async def _on_board_write(self, task) -> None:
+        coord = self.coordinator
+        project_id = getattr(task, 'project_id', None)
+        if coord is None or not project_id:
+            return
+        await coord.run(project_id)
+
+    def _on_ask(self, task) -> None:
+        ingress = getattr(self.coordinator, 'ingress', None)
+        if ingress is None:
+            return
+        ingress.escalate_to_lead(task)
+
     def _build_agent(self, envelope: DispatchEnvelope, sink: _TeamEventSink):
         from ms_agent.agent.llm_agent import LLMAgent
         from ms_agent.agent.loader import AgentLoader
         from ms_agent.config import ConfigResolver
-        from ms_agent.permission.handler import AutoPermissionHandler
+        from ms_agent.permission.handler import WebPermissionHandler
         from omegaconf import OmegaConf
+
+        handler = WebPermissionHandler(
+            sink,
+            store=self._permission_store,
+            project_id=envelope.project_id or '',
+            dispatch_id=envelope.dispatch_id,
+            session_id=envelope.runtime_session_id or envelope.dispatch_id,
+        )
+        self._permission_handlers[envelope.dispatch_id] = handler
 
         if self.agent_config_path:
             agent = AgentLoader.build(
@@ -319,7 +494,13 @@ class CloudAgentRuntime:
                 trust_remote_code=True,
                 event_sink=sink,
             )
-            agent.set_permission_handler(AutoPermissionHandler())
+            agent.set_permission_handler(handler)
+            agent.set_permission_approval_store(self._permission_store)
+            try:
+                agent.set_permission_mode(
+                    'plan' if self._plan_only(envelope) else 'delegate')
+            except Exception:  # noqa: BLE001
+                logger.debug('could not set permission mode', exc_info=True)
             self._ensure_llm_credentials(agent.config)
             return agent
 
@@ -347,12 +528,7 @@ class CloudAgentRuntime:
             },
         )
 
-        system = (
-            f'You are @{envelope.target_at_name}, a coding agent on '
-            'MS-Agent Team. Work inside the project workspace. Use tools '
-            '(files, shell, search) to complete the user request. Reply with '
-            'what you did and any important results or file paths.'
-        )
+        system = self._system_prompt(envelope)
         # Team cloud is non-interactive: drop stdin input_callback and pin
         # local_dir so register_callback_from_config does not assert.
         existing_cbs = list(OmegaConf.select(cfg, 'callbacks') or [])
@@ -377,8 +553,17 @@ class CloudAgentRuntime:
                 'prompt.system': system,
                 'session_log.enabled': True,
                 'output_dir': workspace,
+                'permission.mode': (
+                    'plan' if self._plan_only(envelope) else 'delegate'),
         }.items():
             OmegaConf.update(cfg, key, value, merge=True)
+
+        audience = ''
+        if envelope.context_bundle is not None:
+            audience = getattr(envelope.context_bundle, 'audience', '') or ''
+        if audience == 'lead':
+            OmegaConf.update(
+                cfg, 'tools.todo_list.enabled', False, merge=True)
 
         self._ensure_llm_credentials(cfg, force_env=True)
         agent = LLMAgent(
@@ -387,8 +572,48 @@ class CloudAgentRuntime:
             trust_remote_code=True,
             event_sink=sink,
         )
-        agent.set_permission_handler(AutoPermissionHandler())
+        agent.set_permission_handler(handler)
+        agent.set_permission_approval_store(self._permission_store)
+        orig_prepare = agent.prepare_tools
+
+        async def _prepare_and_attach():
+            await orig_prepare()
+            await self._maybe_attach_tools(agent, envelope)
+
+        agent.prepare_tools = _prepare_and_attach
         return agent
+
+    def resolve_permission(
+        self,
+        dispatch_id: str,
+        request_id: str,
+        action: str = 'allow_once',
+        pattern: str | None = None,
+    ) -> bool:
+        """Wake a live cloud ``WebPermissionHandler`` Future."""
+        from ms_agent.permission.handler import (
+            PermissionAction,
+            PermissionResponse,
+        )
+
+        handler = self._permission_handlers.get(dispatch_id)
+        if handler is None:
+            return False
+        mapped = {
+            'allow_once': PermissionAction.ALLOW_ONCE,
+            'allow_session': PermissionAction.ALLOW_SESSION,
+            'allow_always': PermissionAction.ALLOW_ALWAYS,
+            'deny': PermissionAction.DENY,
+            'reject': PermissionAction.DENY,
+        }.get(action, PermissionAction.ALLOW_ONCE)
+        handler.resolve(
+            request_id,
+            PermissionResponse(action=mapped, pattern=pattern),
+        )
+        return True
+
+    def drop_permission_handler(self, dispatch_id: str) -> None:
+        self._permission_handlers.pop(dispatch_id, None)
 
     def _ensure_llm_credentials(self, cfg, *, force_env: bool = False) -> None:
         """Fill llm.api_key / base_url from env when settings left them empty."""
@@ -466,16 +691,36 @@ class CloudAgentRuntime:
                     owner_user_id=envelope.sender_user_id,
                 ),
                 TeamArtifactTools(cfg, artifact_store=self.artifact_store),
-                TeamTaskBoardTools(cfg, task_store=self.task_store),
+                TeamTaskBoardTools(
+                    cfg,
+                    task_store=self.task_store,
+                    dispatch_log=self.dispatch_log,
+                    on_change=self._on_board_write,
+                    on_ask=self._on_ask,
+                    endpoint_store=self.endpoint_store,
+                ),
             ]
             tm = getattr(agent, 'tool_manager', None)
             if tm is None:
+                logger.warning(
+                    'Team tools skipped: tool_manager is not ready')
                 return
             extra = getattr(tm, 'extra_tools', None)
             if isinstance(extra, list):
                 extra.extend(tools)
+            index = getattr(tm, 'index_extra_tool', None)
+            if callable(index):
+                for tool in tools:
+                    maybe = index(tool)
+                    if hasattr(maybe, '__await__'):
+                        await maybe
+            logger.info(
+                'Attached team tools for %s: %s',
+                envelope.target_at_name,
+                [type(t).__name__ for t in tools],
+            )
         except Exception:  # noqa: BLE001
-            logger.debug('Could not attach team tools', exc_info=True)
+            logger.warning('Could not attach team tools', exc_info=True)
 
 
 def _read_settings() -> dict:

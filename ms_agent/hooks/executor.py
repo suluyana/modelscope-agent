@@ -27,6 +27,7 @@ class HookExecutor:
         response_adapter: ResponseAdapter | None = None,
         enabled_executors: frozenset[str] = frozenset({'command'}),
         fail_closed: bool = False,
+        default_model: str = 'qwen-plus',
     ) -> None:
         adapter = response_adapter or ResponseAdapter()
         self._backends: dict[str, Any] = {}
@@ -34,6 +35,18 @@ class HookExecutor:
             self._backends['command'] = command or CommandHookExecutor(
                 working_dir=working_dir,
                 response_adapter=adapter,
+                fail_closed=fail_closed,
+            )
+        if 'prompt' in enabled_executors:
+            from ms_agent.hooks.executors.prompt import PromptHookExecutor
+            self._backends['prompt'] = PromptHookExecutor(
+                default_model=default_model,
+                fail_closed=fail_closed,
+            )
+        if 'agent' in enabled_executors:
+            from ms_agent.hooks.executors.agent import AgentHookExecutor
+            self._backends['agent'] = AgentHookExecutor(
+                default_model=default_model,
                 fail_closed=fail_closed,
             )
         self._ctx: HookExecutionContext | None = None
@@ -138,4 +151,5 @@ def _context_for_handler(
         messages=ctx.messages,
         abort_signal=ctx.abort_signal,
         tool_manager=ctx.tool_manager,
+        default_model=getattr(ctx, 'default_model', 'qwen-plus'),
     )

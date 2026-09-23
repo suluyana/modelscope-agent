@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from ms_agent.llm.utils import Tool
 from ms_agent.team.errors import ARTIFACT_NOT_FOUND, ENDPOINT_NOT_FOUND, TeamError
@@ -427,6 +430,9 @@ class TeamTaskBoardTools(ToolBase):
         super().__init__(config)
         self._store = kwargs.get('task_store')
         self._dispatch_log = kwargs.get('dispatch_log')
+        self._on_change: Optional[Callable] = kwargs.get('on_change')
+        self._on_ask: Optional[Callable] = kwargs.get('on_ask')
+        self._endpoints = kwargs.get('endpoint_store')
         tool_cfg = getattr(getattr(config, 'tools', None), 'team_taskboard',
                            None)
         if tool_cfg is not None:
@@ -445,9 +451,17 @@ class TeamTaskBoardTools(ToolBase):
                     tool_name='task_board_write',
                     server_name=self.SERVER_NAME,
                     description=(
-                        'Create or update a task-board entry for humans to '
-                        'observe progress. blocked_by is informational — the '
-                        'platform will NOT auto-dispatch when blockers complete.'
+                        'Create or update a task-board entry. New teammate '
+                        'work MUST use status=pending plus target_at_name '
+                        '(plain name, no at-sign). blocked_by is a dependency '
+                        'DAG: Coordinator auto-dispatches when enabled, or a '
+                        'human clicks 按板执行. Never send the original user '
+                        'prompt back through Lead. Each prompt must be '
+                        'self-contained. If a fact you need is missing, call '
+                        'task_ask instead of inventing. Brace tokens in the '
+                        'user job (for example replacing {DOC} with {DOC1}) '
+                        'are allowed. Use parent_task_id for subtasks of a '
+                        'larger job.'
                     ),
                     parameters={
                         'type': 'object',
@@ -463,7 +477,7 @@ class TeamTaskBoardTools(ToolBase):
                                 'string',
                                 'enum': [
                                     'pending', 'in_progress', 'completed',
-                                    'failed', 'cancelled'
+                                    'failed', 'cancelled', 'wait_human'
                                 ],
                             },
                             'prompt': {
@@ -477,6 +491,17 @@ class TeamTaskBoardTools(ToolBase):
                                 'items': {
                                     'type': 'string'
                                 }
+                            },
+                            'parent_task_id': {
+                                'type': 'string'
+                            },
+                            'tags': {
+                                'type': 'array',
+                                'items': {'type': 'string'},
+                                'description':
+                                'Skill tags for self-claim. Empty tags stay '
+                                'out of the unclaimed pool; Coordinator never '
+                                'guesses an assignee.',
                             },
                             'output_artifacts': {
                                 'type': 'array',
@@ -544,6 +569,60 @@ class TeamTaskBoardTools(ToolBase):
                         },
                     },
                 ),
+                Tool(
+                    tool_name='task_ask',
+                    server_name=self.SERVER_NAME,
+                    description=(
+                        'Park this task as wait_human and ask for a missing '
+                        'fact. Default audience is lead: the Lead patches the '
+                        'prompt (your transcript is not dumped). audience=user '
+                        'surfaces the question for the human on this rail. '
+                        'Call this and stop instead of inventing files or '
+                        'writing a question in the reply — a reply is treated '
+                        'as a finished answer. Do not mention teammates with '
+                        'an at-sign.'
+                    ),
+                    parameters={
+                        'type': 'object',
+                        'properties': {
+                            'project_id': {'type': 'string'},
+                            'task_id': {'type': 'string'},
+                            'question': {'type': 'string'},
+                            'audience': {
+                                'type': 'string',
+                                'enum': ['user', 'lead'],
+                            },
+                        },
+                        'required': ['project_id', 'question'],
+                    },
+                ),
+                Tool(
+                    tool_name='task_claim',
+                    server_name=self.SERVER_NAME,
+                    description=(
+                        'Optimistic-lock claim of a pending task for this '
+                        '@agent (Claude-style file lock). Pass claim_version '
+                        'from the inbox / task_board_read. Concurrent claims '
+                        'on the same task: only one succeeds.'
+                    ),
+                    parameters={
+                        'type': 'object',
+                        'properties': {
+                            'task_id': {
+                                'type': 'string'
+                            },
+                            'at_name': {
+                                'type': 'string'
+                            },
+                            'expected_version': {
+                                'type': 'integer'
+                            },
+                        },
+                        'required': [
+                            'task_id', 'at_name', 'expected_version'
+                        ],
+                    },
+                ),
             ]
         }
 
@@ -558,25 +637,135 @@ class TeamTaskBoardTools(ToolBase):
         if tool_name == 'task_board_write':
             tid = tool_args.get('task_id') or new_id('task_')
             existing = self._store.get(tid)
+            if 'target_at_name' in tool_args:
+                target_at = tool_args.get('target_at_name')
+            else:
+                target_at = existing.target_at_name if existing else None
+            if target_at:
+                target_at = str(target_at).lstrip('@').strip() or None
+            if 'parent_task_id' in tool_args:
+                parent_id = tool_args.get('parent_task_id')
+            else:
+                parent_id = existing.parent_task_id if existing else None
+            if 'blocked_by' in tool_args:
+                blocked = list(tool_args.get('blocked_by') or [])
+            else:
+                blocked = list(
+                    existing.blocked_by if existing else [])
+            status = tool_args['status']
+            live_id = existing.last_dispatch_id if existing else None
+            # Lead often writes in_progress meaning "to do". Coordinator owns
+            # inflight; assigned rows with no live dispatch start pending.
+            if status == 'in_progress' and target_at and not live_id:
+                status = 'pending'
+            if 'tags' in tool_args:
+                tags = [
+                    str(x).strip() for x in (tool_args.get('tags') or [])
+                    if str(x).strip()
+                ]
+            else:
+                tags = list(existing.tags if existing else [])
             task = TeamTask(
                 task_id=tid,
                 project_id=tool_args['project_id'],
-                status=tool_args['status'],
+                status=status,
                 prompt=tool_args.get('prompt')
                 or (existing.prompt if existing else ''),
                 trigger_user_id=tool_args.get('trigger_user_id')
                 or (existing.trigger_user_id if existing else ''),
-                target_at_name=tool_args.get('target_at_name'),
-                blocked_by=list(tool_args.get('blocked_by') or []),
+                target_at_name=target_at,
+                target_endpoint_id=(
+                    existing.target_endpoint_id if existing else None),
+                blocked_by=blocked,
                 output_artifacts=list(
-                    tool_args.get('output_artifacts') or []),
-                deployment_context=tool_args.get('deployment_context'),
-                result_summary=tool_args.get('result_summary'),
+                    tool_args.get('output_artifacts')
+                    or (existing.output_artifacts if existing else [])),
+                deployment_context=tool_args.get('deployment_context')
+                if 'deployment_context' in tool_args else (
+                    existing.deployment_context if existing else None),
+                result_summary=tool_args.get('result_summary')
+                if 'result_summary' in tool_args else (
+                    existing.result_summary if existing else None),
+                last_dispatch_id=(
+                    existing.last_dispatch_id if existing else None),
+                thread_id=existing.thread_id if existing else None,
+                parent_task_id=parent_id,
+                claim_version=existing.claim_version if existing else 0,
+                tags=tags,
                 created_at=existing.created_at if existing else _now_iso(),
                 updated_at=_now_iso(),
             )
+            from ms_agent.team.board import parent_completion_blocked
+            from ms_agent.team.errors import PARENT_INCOMPLETE
+            board = [
+                t for t in self._store.list(task.project_id)
+                if t.task_id != task.task_id
+            ] + [task]
+            blocked = parent_completion_blocked(board, task)
+            if blocked:
+                return json.dumps({
+                    'error': PARENT_INCOMPLETE,
+                    'message': blocked,
+                })
             self._store.upsert(task)
+            await self._maybe_kick(task)
             return json.dumps(task.to_dict())
+
+        if tool_name == 'task_claim':
+            from ms_agent.team.errors import TeamError
+            at_name = str(tool_args['at_name'])
+            caps: list[str] = []
+            if self._endpoints is not None:
+                ep = self._endpoints.get_by_at_name(at_name.lstrip('@'))
+                if ep is not None:
+                    caps = list(ep.capabilities or [])
+            try:
+                claimed = self._store.claim(
+                    str(tool_args['task_id']),
+                    claimant_at_name=at_name,
+                    expected_version=int(tool_args['expected_version']),
+                    claimant_capabilities=caps,
+                )
+            except TeamError as exc:
+                return json.dumps({
+                    'error': exc.code,
+                    'message': exc.message,
+                    'details': exc.details,
+                })
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({'error': str(exc)})
+            return json.dumps(claimed.to_dict())
+
+        if tool_name == 'task_ask':
+            from ms_agent.team.context import truncate_summary
+            question = str(tool_args.get('question') or '').strip()
+            if not question:
+                return json.dumps({'error': 'question_required'})
+            tid = tool_args.get('task_id') or new_id('task_')
+            existing = self._store.get(tid)
+            audience = str(tool_args.get('audience') or 'lead')
+            if audience not in ('user', 'lead'):
+                audience = 'lead'
+            task = existing or TeamTask(
+                task_id=tid,
+                project_id=str(tool_args.get('project_id') or ''),
+                status='wait_human',
+                prompt=question,
+                trigger_user_id='',
+            )
+            task.status = 'wait_human'
+            task.result_summary = truncate_summary(question, 500)
+            ctx = dict(task.deployment_context or {})
+            ctx['needs_clarification'] = True
+            ctx['ask_audience'] = audience
+            task.deployment_context = ctx
+            task.updated_at = _now_iso()
+            self._store.upsert(task)
+            if audience == 'lead' and self._on_ask is not None:
+                maybe = self._on_ask(task)
+                if hasattr(maybe, '__await__'):
+                    await maybe
+            return json.dumps(self._index_row(task))
 
         if tool_name == 'task_board_read':
             if tool_args.get('task_id'):
@@ -587,6 +776,19 @@ class TeamTaskBoardTools(ToolBase):
             return json.dumps([self._index_row(t) for t in tasks])
 
         return json.dumps({'error': f'Unknown tool {tool_name}'})
+
+    async def _maybe_kick(self, task: TeamTask) -> None:
+        """Ask Coordinator to scan after a pending row is written."""
+        cb = self._on_change
+        if cb is None or task.status != 'pending':
+            return
+        try:
+            maybe = cb(task)
+            if hasattr(maybe, '__await__'):
+                await maybe
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                'task_board_write on_change failed', exc_info=True)
 
     @staticmethod
     def _index_row(task: TeamTask) -> dict[str, Any]:
@@ -603,6 +805,10 @@ class TeamTaskBoardTools(ToolBase):
             'result_summary': summary,
             'read': ('dispatch_result_read'
                      if task.last_dispatch_id else None),
+            'parent_task_id': task.parent_task_id,
+            'blocked_by': list(task.blocked_by or []),
+            'claim_version': int(task.claim_version or 0),
+            'tags': list(getattr(task, 'tags', None) or []),
         }
 
     def _dispatch_result(self, tool_args: dict) -> dict[str, Any]:

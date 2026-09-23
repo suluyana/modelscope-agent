@@ -50,3 +50,17 @@ async def test_whitelist_allows_without_force(tmp_path):
         memory=PermissionMemory(project_path=str(tmp_path)))
     out = await enf.check('code_executor---shell_executor', {'command': 'ls'})
     assert handler.asked is False and out.action == 'allow'
+
+
+@pytest.mark.asyncio
+async def test_delegate_force_ask_not_auto_allowed(tmp_path):
+    cfg = PermissionConfig.from_dict({'mode': 'delegate'})
+    enf = PermissionEnforcer(
+        config=cfg, memory=PermissionMemory(project_path=str(tmp_path)))
+    out = await enf.check(
+        'file_system---read_file',
+        {'path': '/etc/passwd'},
+        force_decision=PermissionDecision(action='ask', reason='outside'),
+    )
+    assert out.action == 'deny'
+    assert 'outside' in out.reason

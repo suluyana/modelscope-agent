@@ -6,6 +6,14 @@ import hashlib
 import threading
 from typing import Dict
 
+from datetime import datetime, timezone
+
+from ms_agent.team.errors import (
+    CLAIM_CONFLICT,
+    TASK_NOT_CLAIMABLE,
+    TASK_NOT_FOUND,
+    TeamError,
+)
 from ms_agent.team.models import (
     AgentEndpoint,
     Artifact,
@@ -183,6 +191,12 @@ class MemoryArtifactStore(ArtifactStore):
     def get_bytes(self, artifact_id: str) -> bytes | None:
         return self._blob.get(artifact_id)
 
+    def list(self, project_id: str | None = None) -> list[Artifact]:
+        rows = list(self._meta.values())
+        if project_id:
+            rows = [a for a in rows if a.project_id == project_id]
+        return rows
+
 
 class MemoryTaskBoardStore(TaskBoardStore):
 
@@ -200,6 +214,72 @@ class MemoryTaskBoardStore(TaskBoardStore):
 
     def list(self, project_id: str) -> list[TeamTask]:
         return [t for t in self._tasks.values() if t.project_id == project_id]
+
+    def claim(
+        self,
+        task_id: str,
+        *,
+        claimant_at_name: str,
+        expected_version: int,
+        claimant_capabilities: list | None = None,
+    ) -> TeamTask:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise TeamError(
+                    TASK_NOT_FOUND,
+                    f'task {task_id} not found',
+                    http_status=404,
+                )
+            if int(task.claim_version or 0) != int(expected_version):
+                raise TeamError(
+                    CLAIM_CONFLICT,
+                    'task already claimed or version mismatch',
+                    http_status=409,
+                    details={
+                        'task_id': task_id,
+                        'claim_version': task.claim_version,
+                    },
+                )
+            if task.status not in ('pending', 'wait_human'):
+                raise TeamError(
+                    TASK_NOT_CLAIMABLE,
+                    f'task status is {task.status}',
+                    http_status=409,
+                    details={'status': task.status},
+                )
+            assigned = (task.target_at_name or '').lstrip('@')
+            claimant = (claimant_at_name or '').lstrip('@')
+            if assigned and assigned != claimant:
+                raise TeamError(
+                    TASK_NOT_CLAIMABLE,
+                    f'task is assigned to @{assigned}',
+                    http_status=409,
+                )
+            if not assigned:
+                from ms_agent.team.board import can_self_claim
+                if not can_self_claim(task, claimant_capabilities or []):
+                    raise TeamError(
+                        TASK_NOT_CLAIMABLE,
+                        'unclaimed task is not in this agent\'s claim pool',
+                        http_status=409,
+                    )
+            by_id = self._tasks
+            for bid in list(task.blocked_by or []):
+                blocker = by_id.get(bid)
+                if blocker is None or blocker.status != 'completed':
+                    raise TeamError(
+                        TASK_NOT_CLAIMABLE,
+                        'task is still blocked',
+                        http_status=409,
+                        details={'blocked_by': bid},
+                    )
+            task.status = 'in_progress'
+            task.target_at_name = claimant
+            task.claim_version = int(task.claim_version or 0) + 1
+            task.updated_at = datetime.now(timezone.utc).isoformat()
+            self._tasks[task.task_id] = task
+            return task
 
 
 class MemoryProjectMetaStore(ProjectMetaStore):

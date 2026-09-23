@@ -36,6 +36,7 @@ class HookRuntime:
     tool_name_mapper: ToolNameMapper
     on_hook_event: HookEventCallback | None = None
     default_model: str = 'qwen-plus'
+    llm: Any = None
 
     BLOCKABLE_EVENTS = frozenset({
         'PreToolUse',
@@ -56,6 +57,9 @@ class HookRuntime:
         return HookExecutionContext(
             session_id=self.session_id,
             project_path=self.project_path,
+            llm=getattr(self, 'llm', None),
+            messages=getattr(self, 'messages', None),
+            default_model=self.default_model,
         )
 
     def _build_payload(self, event_obj: Any) -> dict[str, Any]:
@@ -92,7 +96,11 @@ class HookRuntime:
         event_obj: Any,
         tool_name: str | None = None,
     ) -> HookResult:
-        handlers = self.registry.get_handlers(event_type, tool_name)
+        handlers = self.registry.get_handlers(
+            event_type,
+            tool_name,
+            getattr(event_obj, 'tool_args', None),
+        )
         if not handlers:
             return HookResult(action='pass')
 

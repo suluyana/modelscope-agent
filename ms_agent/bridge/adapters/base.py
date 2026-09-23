@@ -13,7 +13,7 @@ def _now_iso() -> str:
 
 @dataclass
 class BridgeEvent:
-    type: str  # text | tool_call | tool_result | status | error | done
+    type: str  # text | tool_call | tool_result | status | error | done | permission_request
     content: str = ''
     payload: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now_iso)
@@ -38,6 +38,7 @@ class RuntimeAdapter(Protocol):
         cwd: str | None = None,
         attachments: list[dict] | None = None,
         session_mode: str = 'fresh',
+        mcp_servers: list[dict] | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         ...
 

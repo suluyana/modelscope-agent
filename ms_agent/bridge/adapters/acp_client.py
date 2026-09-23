@@ -13,6 +13,40 @@ logger = logging.getLogger(__name__)
 NotificationHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
+def _ask_text(params: Any) -> str:
+    """Best-effort question text from ACP ask/permission params."""
+    if not isinstance(params, dict):
+        return str(params or '').strip()
+    for key in ('question', 'title', 'message', 'prompt', 'toolCall'):
+        val = params.get(key)
+        if isinstance(val, dict):
+            text = str(val.get('title') or val.get('kind') or val.get('id') or '')
+            if text:
+                return text
+        elif val:
+            return str(val)
+    questions = params.get('questions') or params.get('options') or []
+    if isinstance(questions, list) and questions:
+        first = questions[0]
+        if isinstance(first, dict):
+            return str(first.get('question') or first.get('header') or first)
+        return str(first)
+    return json.dumps(params, ensure_ascii=False)[:800]
+
+
+def _permission_call_id(params: Any) -> str:
+    if not isinstance(params, dict):
+        return ''
+    tool_call = params.get('toolCall') or params.get('tool_call') or {}
+    if isinstance(tool_call, dict):
+        return str(
+            tool_call.get('toolCallId')
+            or tool_call.get('tool_call_id')
+            or tool_call.get('id')
+            or '')
+    return str(params.get('toolCallId') or params.get('call_id') or '')
+
+
 class AuthRequired(RuntimeError):
     """ACP agent requires interactive / CLI login."""
 
@@ -26,7 +60,7 @@ class AcpSession:
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
-        auto_allow: bool = True,
+        auto_allow: bool = False,
         auth_method_id: str | None = None,
     ) -> None:
         self.command = list(command)
@@ -43,6 +77,8 @@ class AcpSession:
         self._init_result: dict[str, Any] | None = None
         self._ready = False
         self.on_notification: NotificationHandler | None = None
+        # call_id / request_id → ACP JSON-RPC id for session/request_permission
+        self._permission_asks: dict[str, Any] = {}
 
     @property
     def alive(self) -> bool:
@@ -154,7 +190,7 @@ class AcpSession:
         method: str,
         params: dict[str, Any],
         *,
-        timeout: float = 60.0,
+        timeout: float | None = 60.0,
     ) -> dict[str, Any]:
         if not self.alive:
             await self.start()
@@ -173,7 +209,10 @@ class AcpSession:
         self.proc.stdin.write((json.dumps(payload) + '\n').encode('utf-8'))
         await self.proc.stdin.drain()
         try:
-            result = await asyncio.wait_for(fut, timeout=timeout)
+            if timeout is None:
+                result = await fut
+            else:
+                result = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(req_id, None)
             detail = self._stderr_tail()
@@ -256,18 +295,70 @@ class AcpSession:
             return
 
         method = msg.get('method') or ''
-        if method == 'session/request_permission' and self.auto_allow:
-            await self._respond(
-                msg['id'],
-                {
-                    'outcome': {
-                        'outcome': 'selected',
-                        'optionId': 'allow-once',
-                    }
-                },
-            )
+        if method == 'session/request_permission':
+            params = msg.get('params') or {}
+            if self.auto_allow:
+                if self.on_notification:
+                    try:
+                        note = self.on_notification({
+                            'method': 'session/update',
+                            'params': {
+                                'update': {
+                                    'sessionUpdate': 'agent_message_chunk',
+                                    'content': {
+                                        'type': 'text',
+                                        'text': (
+                                            '[permission auto-approved] '
+                                            + _ask_text(params)
+                                        ),
+                                    },
+                                },
+                            },
+                        })
+                        if asyncio.iscoroutine(note):
+                            await note
+                    except Exception:  # noqa: BLE001
+                        logger.debug('permission notice failed', exc_info=True)
+                await self._respond(
+                    msg['id'],
+                    {
+                        'outcome': {
+                            'outcome': 'selected',
+                            'optionId': 'allow-once',
+                        }
+                    },
+                )
+                return
+            self._remember_permission_ask(msg)
+            if self.on_notification:
+                try:
+                    note = self.on_notification(msg)
+                    if asyncio.iscoroutine(note):
+                        await note
+                except Exception:  # noqa: BLE001
+                    logger.debug('permission forward failed', exc_info=True)
             return
         if method in ('cursor/ask_question', 'cursor/create_plan'):
+            params = msg.get('params') or {}
+            question = _ask_text(params)
+            if self.on_notification and question:
+                try:
+                    note = self.on_notification({
+                        'method': 'session/update',
+                        'params': {
+                            'update': {
+                                'sessionUpdate': 'agent_message_chunk',
+                                'content': {
+                                    'type': 'text',
+                                    'text': question,
+                                },
+                            },
+                        },
+                    })
+                    if asyncio.iscoroutine(note):
+                        await note
+                except Exception:  # noqa: BLE001
+                    logger.debug('ask_question notice failed', exc_info=True)
             await self._respond(
                 msg['id'],
                 {'outcome': {
@@ -282,6 +373,47 @@ class AcpSession:
                     await result
             except Exception:  # noqa: BLE001
                 logger.debug('notification handler failed', exc_info=True)
+
+    def _remember_permission_ask(self, msg: dict[str, Any]) -> None:
+        acp_id = msg.get('id')
+        if acp_id is None:
+            return
+        params = msg.get('params') or {}
+        call_id = _permission_call_id(params)
+        if call_id:
+            self._permission_asks[str(call_id)] = acp_id
+        self._permission_asks[str(acp_id)] = acp_id
+
+    def _forget_permission_ask(self, acp_id: Any) -> None:
+        for key, value in list(self._permission_asks.items()):
+            if value == acp_id:
+                self._permission_asks.pop(key, None)
+
+    async def answer_permission(
+        self,
+        lookup: str,
+        *,
+        option_id: str = 'allow-once',
+        deny: bool = False,
+    ) -> bool:
+        """Respond to a pending ``session/request_permission`` by call_id or rpc id."""
+        acp_id = self._permission_asks.get(str(lookup))
+        if acp_id is None:
+            return False
+        self._forget_permission_ask(acp_id)
+        if deny:
+            await self._respond(acp_id, {'outcome': {'outcome': 'cancelled'}})
+        else:
+            await self._respond(
+                acp_id,
+                {
+                    'outcome': {
+                        'outcome': 'selected',
+                        'optionId': option_id or 'allow-once',
+                    }
+                },
+            )
+        return True
 
     async def _respond(self, req_id: Any, result: dict) -> None:
         assert self.proc and self.proc.stdin
@@ -307,7 +439,7 @@ class AcpProcessPool:
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
-        auto_allow: bool = True,
+        auto_allow: bool = False,
         auth_method_id: str | None = None,
     ) -> AcpSession:
         key = self._key(runtime, cwd)
@@ -315,6 +447,7 @@ class AcpProcessPool:
         async with lock:
             sess = self._sessions.get(key)
             if sess is not None and sess.alive and sess._ready:
+                sess.auto_allow = auto_allow
                 return sess
             if sess is not None:
                 await sess.close()
@@ -334,6 +467,23 @@ class AcpProcessPool:
         sess = self._sessions.pop(key, None)
         if sess is not None:
             await sess.close()
+
+
+    async def answer_permission(
+        self,
+        lookup: str,
+        *,
+        option_id: str = 'allow-once',
+        deny: bool = False,
+    ) -> bool:
+        """Resolve a pending ACP permission ask on any pooled session."""
+        for sess in list(self._sessions.values()):
+            if not sess.alive:
+                continue
+            if await sess.answer_permission(
+                    lookup, option_id=option_id, deny=deny):
+                return True
+        return False
 
     async def close_all(self) -> None:
         keys = list(self._sessions.keys())

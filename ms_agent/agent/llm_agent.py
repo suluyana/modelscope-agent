@@ -271,6 +271,12 @@ class LLMAgent(Agent):
         # Optional injected PermissionHandler (TUI/WebUI/Server). When None,
         # _select_permission_handler() picks by mode + interactivity.
         self._permission_handler = kwargs.get('permission_handler', None)
+        self._permission_decision_provider = kwargs.get(
+            'permission_decision_provider', None)
+        self._permission_llm_provider = kwargs.get(
+            'permission_llm_provider', None)
+        self._permission_agent_provider = kwargs.get(
+            'permission_agent_provider', None)
 
         # Structured event sink — the UI-agnostic output seam (ms_agent.ui).
         # When set, the agent emits semantic AgentEvents (content / reasoning /
@@ -704,13 +710,13 @@ class LLMAgent(Agent):
         - An explicitly injected handler (``set_permission_handler`` / the
           ``permission_handler`` kwarg) always wins — this is how the TUI /
           WebUI / Server supply their own confirmation UI.
-        - ``interactive`` (alias ``restricted``) in an interactive terminal
-          session -> ``CLIPermissionHandler`` (the ``[y/s/a/e/n]`` prompt),
-          so non-whitelisted tools actually ask the user.
+        - ``interactive`` (alias ``restricted``) or ``delegate`` in an
+          interactive terminal session -> ``CLIPermissionHandler``, so
+          non-whitelisted tools (and uncertain delegate routes) ask the user.
         - Everything else (``auto`` / ``strict`` / non-interactive) ->
           ``AutoPermissionHandler`` (SafetyGuard still enforces the floor).
         """
-        if self._permission_handler is not None:
+        if getattr(self, '_permission_handler', None) is not None:
             return self._permission_handler
         from ms_agent.permission import (AutoPermissionHandler,
                                          CLIPermissionHandler)
@@ -718,7 +724,8 @@ class LLMAgent(Agent):
         # ``PermissionConfig.from_dict`` already normalizes ``restricted`` ->
         # ``interactive``; accept both so a direct caller passing the raw alias
         # still gets the interactive prompt (not a silent AutoPermissionHandler).
-        if mode in ('interactive', 'restricted') and self._interactive:
+        if mode in ('interactive', 'restricted', 'delegate', 'accept_edits',
+                    'plan') and getattr(self, '_interactive', False):
             return CLIPermissionHandler()
         return AutoPermissionHandler()
 
@@ -752,14 +759,114 @@ class LLMAgent(Agent):
 
         handler = self._select_permission_handler(perm_config.mode)
         memory = PermissionMemory(project_path=workspace_root)
+        llm_provider, agent_provider = self._build_delegate_providers(
+            perm_config, workspace_root)
+        approval_store = getattr(self, '_permission_approval_store', None)
+        if approval_store is None:
+            approval_store = getattr(handler, '_store', None)
         enforcer = PermissionEnforcer(
-            config=perm_config, handler=handler, memory=memory)
+            config=perm_config,
+            handler=handler,
+            memory=memory,
+            provider=getattr(self, '_permission_decision_provider', None),
+            llm_provider=llm_provider,
+            agent_provider=agent_provider,
+            approval_store=approval_store,
+        )
 
         return safety_guard, enforcer, perm_config
+
+    def _build_delegate_providers(self, perm_config, workspace_root: str):
+        """LLM classifier + independent verifier. Lead/self cannot approve."""
+        from ms_agent.permission import (LlmDecisionProvider,
+                                        VerifierAgentDecisionProvider)
+
+        llm_injected = getattr(self, '_permission_llm_provider', None)
+        agent_injected = (
+            getattr(self, '_permission_agent_provider', None)
+            or getattr(self, '_permission_decision_provider', None)
+        )
+        if perm_config.mode != 'delegate':
+            return llm_injected, agent_injected
+
+        llm = getattr(self, 'llm', None)
+        llm_provider = llm_injected
+        if llm_provider is None and llm is not None:
+            llm_provider = LlmDecisionProvider(llm)
+
+        agent_provider = agent_injected
+        if agent_provider is None and llm is not None:
+            requester_id = (
+                getattr(self, 'tag', None) or 'session-requester')
+            # Built-in independent verifier. Distinct from the requester
+            # (Lead / Worker tag) so self-approve is impossible.
+            agent_provider = VerifierAgentDecisionProvider(
+                llm,
+                workspace_root=workspace_root,
+                requester_id=str(requester_id),
+            )
+        return llm_provider, agent_provider
 
     def set_permission_handler(self, handler) -> None:
         """Inject a custom PermissionHandler (TUI/WebUI/Server) before run."""
         self._permission_handler = handler
+        tm = getattr(self, 'tool_manager', None)
+        enforcer = getattr(tm, '_permission_enforcer', None)
+        if enforcer is not None:
+            enforcer._handler = handler
+
+    def set_permission_approval_store(self, store) -> None:
+        """Share the unified ApprovalStore (asks ledger) with the enforcer."""
+        self._permission_approval_store = store
+        tm = getattr(self, 'tool_manager', None)
+        enforcer = getattr(tm, '_permission_enforcer', None)
+        if enforcer is not None:
+            enforcer._approval_store = store
+
+    def _attach_permission_continuations(self, messages: List[Message]) -> None:
+        """Bind resume_queued tokens. Do not replay stored tool args."""
+        tm = getattr(self, 'tool_manager', None)
+        enforcer = getattr(tm, '_permission_enforcer', None)
+        if enforcer is None or not hasattr(enforcer, 'attach_continuations'):
+            return
+        handler = getattr(self, '_permission_handler', None)
+        names = enforcer.attach_continuations(
+            session_id=str(getattr(self.runtime, 'session_id', '') or ''),
+            dispatch_id=str(getattr(handler, '_dispatch_id', '') or ''),
+        )
+        if not names:
+            return
+        listed = ', '.join(dict.fromkeys(names))
+        notice = (
+            '<system-reminder>A previous approval did not run because the '
+            'process restarted. Re-issue the same tool call if it is still '
+            'needed. Do not assume it already executed. Queued tools: '
+            f'{listed}. Arguments are not replayed.</system-reminder>'
+        )
+        messages.append(Message(role='user', content=notice))
+
+    def set_permission_decision_provider(self, provider) -> None:
+        """Inject a fallback provider used when a route-specific slot is empty."""
+        self._permission_decision_provider = provider
+        tm = getattr(self, 'tool_manager', None)
+        enforcer = getattr(tm, '_permission_enforcer', None)
+        if enforcer is not None:
+            enforcer._provider = provider
+
+    def set_permission_llm_provider(self, provider) -> None:
+        self._permission_llm_provider = provider
+        tm = getattr(self, 'tool_manager', None)
+        enforcer = getattr(tm, '_permission_enforcer', None)
+        if enforcer is not None:
+            enforcer._llm_provider = provider
+
+    def set_permission_agent_provider(self, provider) -> None:
+        """Inject an independent verifier. Must not be the requesting agent."""
+        self._permission_agent_provider = provider
+        tm = getattr(self, 'tool_manager', None)
+        enforcer = getattr(tm, '_permission_enforcer', None)
+        if enforcer is not None:
+            enforcer._agent_provider = provider
 
     def set_permission_mode(self, mode: str) -> str:
         """Change the permission mode at runtime; returns the normalized mode.
@@ -770,10 +877,15 @@ class LLMAgent(Agent):
         ``interactive`` (the canonical asking mode).
         """
         from dataclasses import replace
-        mode = {'restricted': 'interactive'}.get(mode, mode)
-        if mode not in ('auto', 'strict', 'interactive'):
+        mode = {
+            'restricted': 'interactive',
+            'acceptEdits': 'accept_edits',
+        }.get(mode, mode)
+        if mode not in ('auto', 'strict', 'interactive', 'delegate',
+                        'accept_edits', 'plan'):
             raise ValueError(f"Unknown permission mode '{mode}' "
-                             '(auto | restricted | strict | interactive)')
+                             '(auto | restricted | strict | interactive | '
+                             'delegate | accept_edits | plan)')
         tm = self.tool_manager
         if tm is not None:
             tm._permission_mode = mode
@@ -783,6 +895,21 @@ class LLMAgent(Agent):
             enf = getattr(tm, '_permission_enforcer', None)
             if enf is not None and getattr(enf, '_config', None) is not None:
                 enf._config = replace(enf._config, mode=mode)
+                enf._handler = self._select_permission_handler(mode)
+                if mode == 'delegate':
+                    workspace = ''
+                    config = getattr(self, 'config', None)
+                    if config is not None:
+                        from ms_agent.utils.workspace_context import \
+                            resolve_workspace_root
+                        workspace = str(resolve_workspace_root(config))
+                    llm_provider, agent_provider = (
+                        self._build_delegate_providers(
+                            enf._config, workspace))
+                    if llm_provider is not None:
+                        enf._llm_provider = llm_provider
+                    if agent_provider is not None:
+                        enf._agent_provider = agent_provider
         return mode
 
     async def prepare_tools(self):
@@ -790,6 +917,7 @@ class LLMAgent(Agent):
         import uuid
 
         from ms_agent.hooks.bridge import CallbackToHookBridge
+        from ms_agent.hooks.defaults import DEFAULT_ENABLED_EXECUTORS
         from ms_agent.hooks.factory import build_hook_runtime
         from ms_agent.plugins.runtime import PluginRuntime
         from ms_agent.utils.workspace_context import resolve_workspace_root
@@ -806,7 +934,8 @@ class LLMAgent(Agent):
             raw_hooks = OmegaConf.to_container(
                 self.config.hooks, resolve=True) or {}
         enabled_executors = frozenset(
-            raw_hooks.get('enabled_executors', ['command']) or ['command'])
+            raw_hooks.get('enabled_executors', list(DEFAULT_ENABLED_EXECUTORS))
+            or list(DEFAULT_ENABLED_EXECUTORS))
         self._plugin_runtime = PluginRuntime(
             skill_runtime=self._skill_runtime,
             mcp_runtime=self.mcp_runtime,
@@ -870,6 +999,7 @@ class LLMAgent(Agent):
             self.register_callback(
                 CallbackToHookBridge(self.config, hook_runtime))
         self._hook_runtime = hook_runtime
+        hook_runtime.llm = getattr(self, 'llm', None)
         if not self.runtime.session_id:
             self.runtime.session_id = hook_runtime.session_id
         if mcp_rt is not None and not mcp_rt.is_started:
@@ -2163,6 +2293,7 @@ class LLMAgent(Agent):
                 if message.role != 'system':
                     self.log_output('[' + message.role + ']:')
                     self.log_output(message.content)
+            self._attach_permission_continuations(messages)
             while not self.runtime.should_stop:
                 # Rebuild context view from SessionLog (non-destructive
                 # compression). This is the canonical history for the round, so

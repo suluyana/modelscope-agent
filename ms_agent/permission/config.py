@@ -6,9 +6,13 @@ dataclasses consumed by SafetyGuard and PermissionEnforcer.
 
 from __future__ import annotations
 
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from .routes import (DelegateProvider, DelegateRoute, merge_delegate_routes,
+                     parse_delegate_routes)
 
 # Default safety rules baked into SafetyConfig when none are configured.
 _DEFAULT_SAFETY_PATTERNS: tuple[str, ...] = (
@@ -99,14 +103,44 @@ _DEFAULT_BLACKLIST: tuple[str, ...] = (
 )
 
 
+_VALID_MODES = frozenset({
+    'auto',
+    'strict',
+    'interactive',
+    'delegate',
+    'accept_edits',
+    'plan',
+})
+_MODE_ALIASES = {
+    'restricted': 'interactive',
+    'acceptEdits': 'accept_edits',
+}
+
+
+def _positive_timeout(value: Any, name: str) -> float:
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f'{name} must be finite and greater than zero')
+    return timeout
+
+
 @dataclass(frozen=True)
 class PermissionConfig:
     """Top-level permission configuration from agent YAML."""
-    mode: Literal['auto', 'strict', 'interactive'] = 'auto'
+    mode: Literal[
+        'auto', 'strict', 'interactive', 'delegate', 'accept_edits',
+        'plan'] = 'auto'
     whitelist: tuple[str, ...] = ()
-    blacklist: tuple[str, ...] = _DEFAULT_BLACKLIST
+    blacklist: tuple[str, ...] = ()
     ask_rules: tuple[str, ...] = ()
     safety: SafetyConfig = SafetyConfig()
+    delegate_routes: tuple[DelegateRoute, ...] = field(
+        default_factory=lambda: merge_delegate_routes())
+    default_delegate_provider: DelegateProvider = 'human'
+    # One-shot LLM classifier. Agent verifier is a multi-turn repo
+    # inspect (see agent_provider_timeout).
+    provider_timeout: float = 30.0
+    agent_provider_timeout: float = 60.0
 
     @classmethod
     def from_dict(cls,
@@ -116,17 +150,21 @@ class PermissionConfig:
             return cls()
 
         raw_mode = d.get('mode', 'auto')
-        _MODE_ALIASES = {'restricted': 'interactive'}
         mode = _MODE_ALIASES.get(raw_mode, raw_mode)
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"Unknown permission mode {raw_mode!r} "
+                '(auto | restricted | strict | interactive | delegate | '
+                'accept_edits | plan)')
         whitelist = tuple(d.get('whitelist', ()))
         ask_rules = tuple(d.get('ask_rules', ()))
         user_blacklist = tuple(d.get('blacklist', ()))
-        # The default blacklist blocks network-egress shell commands
-        # (curl/wget/ssh/...). ``allow_network: true`` (or legacy
-        # ``no_default_blacklist``) opts out of that secure default; the
-        # user's own blacklist entries still apply.
+        # Network-egress commands (curl/wget/ssh/...) are allowed by
+        # default. ``allow_network: false`` restores the built-in egress
+        # blacklist. Legacy ``no_default_blacklist: true`` is treated as
+        # allow_network. User blacklist entries always apply.
         allow_network = bool(
-            d.get('allow_network', False)
+            d.get('allow_network', True)
             or d.get('no_default_blacklist', False))
         base_blacklist = () if allow_network else _DEFAULT_BLACKLIST
         blacklist = base_blacklist + tuple(
@@ -144,10 +182,31 @@ class PermissionConfig:
 
         safety = SafetyConfig.from_dict(safety_raw, project_root=project_root)
 
+        include_builtin = bool(
+            d.get('include_builtin_delegate_routes', True))
+        overrides = parse_delegate_routes(
+            d.get('delegate_routes'), source='project')
+        delegate_routes = merge_delegate_routes(
+            overrides, include_builtin=include_builtin)
+
+        default_provider = d.get('default_delegate_provider', 'human')
+        if default_provider not in ('skip', 'llm', 'agent', 'human'):
+            raise ValueError(
+                "default_delegate_provider must be skip | llm | agent | human")
+
+        provider_timeout = _positive_timeout(
+            d.get('provider_timeout', 30.0), 'provider_timeout')
+        agent_provider_timeout = _positive_timeout(
+            d.get('agent_provider_timeout', 60.0), 'agent_provider_timeout')
+
         return cls(
             mode=mode,
             whitelist=whitelist,
             blacklist=blacklist,
             ask_rules=ask_rules,
             safety=safety,
+            delegate_routes=delegate_routes,
+            default_delegate_provider=default_provider,
+            provider_timeout=provider_timeout,
+            agent_provider_timeout=agent_provider_timeout,
         )

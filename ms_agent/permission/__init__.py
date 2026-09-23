@@ -11,7 +11,16 @@ from .handler import (AutoPermissionHandler, CLIPermissionHandler,
                       PermissionAction, PermissionHandler, PermissionResponse,
                       WebPermissionHandler)
 from .memory import PermissionMemory
+from .approval import (ApprovalConflictError, ApprovalRequest, ApprovalStore,
+                       FileApprovalStore, MemoryApprovalStore)
+from .ledger import PermissionLedger
+from .provider import (AgentDecisionProvider, LlmDecisionProvider,
+                       PermissionDecisionProvider, ProviderDecision,
+                       VerifierAgentDecisionProvider)
+from .routes import DelegateRoute, select_delegate_route
 from .safety import SafetyGuard
+
+from .pattern_guard import UnsafePersistPattern
 
 __all__ = [
     'resolve_ask',
@@ -26,5 +35,19 @@ __all__ = [
     'PermissionResponse',
     'WebPermissionHandler',
     'PermissionMemory',
+    'PermissionLedger',
+    'ApprovalConflictError',
+    'ApprovalRequest',
+    'ApprovalStore',
+    'FileApprovalStore',
+    'MemoryApprovalStore',
+    'PermissionDecisionProvider',
+    'ProviderDecision',
+    'LlmDecisionProvider',
+    'AgentDecisionProvider',
+    'VerifierAgentDecisionProvider',
+    'DelegateRoute',
+    'select_delegate_route',
     'SafetyGuard',
+    'UnsafePersistPattern',
 ]

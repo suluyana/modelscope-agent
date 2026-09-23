@@ -128,6 +128,27 @@ def list_endpoints(
     }
 
 
+class EndpointPatch(BaseModel):
+    capabilities: Optional[list[str]] = None
+
+
+@router.patch('/{endpoint_id}')
+def patch_endpoint(endpoint_id: str, body: EndpointPatch):
+    """Human-edited capabilities. Display / self-claim filter only."""
+    state = get_team_state()
+    ep = state.endpoints.get(endpoint_id)
+    if ep is None:
+        raise HTTPException(404, detail={'error': 'ENDPOINT_NOT_FOUND'})
+    if body.capabilities is not None:
+        ep.capabilities = [
+            str(x).strip() for x in body.capabilities if str(x).strip()
+        ]
+        from datetime import datetime, timezone
+        ep.updated_at = datetime.now(timezone.utc).isoformat()
+        state.endpoints.upsert(ep)
+    return ep.to_dict()
+
+
 @router.get('/{endpoint_id}/status')
 def endpoint_status(endpoint_id: str):
     state = get_team_state()

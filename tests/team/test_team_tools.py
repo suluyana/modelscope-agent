@@ -190,3 +190,79 @@ async def test_dispatch_result_read_returns_final_text_not_tools():
             tool_args={'task_id': 'task_1'},
         ))
     assert by_task['result_text'] == '北京烤鸭'
+
+
+@pytest.mark.asyncio
+async def test_task_board_write_coerces_new_assigned_in_progress():
+    tasks = MemoryTaskBoardStore()
+    cfg = OmegaConf.create({'output_dir': '.'})
+    ttools = TeamTaskBoardTools(cfg, task_store=tasks)
+    written = json.loads(
+        await ttools.call_tool(
+            'team_taskboard',
+            tool_name='task_board_write',
+            tool_args={
+                'project_id': 'p1',
+                'status': 'in_progress',
+                'prompt': 'read the doc and list three points',
+                'target_at_name': '@bibo',
+                'blocked_by': [],
+            },
+        ))
+    assert written['status'] == 'pending'
+    assert written['target_at_name'] == 'bibo'
+    again = json.loads(
+        await ttools.call_tool(
+            'team_taskboard',
+            tool_name='task_board_write',
+            tool_args={
+                'task_id': written['task_id'],
+                'project_id': 'p1',
+                'status': 'in_progress',
+                'prompt': 'read the doc and list three points',
+                'target_at_name': 'bibo',
+                'blocked_by': ['task_other'],
+            },
+        ))
+    assert again['status'] == 'pending'
+    assert again['blocked_by'] == ['task_other']
+
+
+@pytest.mark.asyncio
+async def test_task_board_write_kicks_coordinator_for_pending():
+    tasks = MemoryTaskBoardStore()
+    kicked: list[str] = []
+
+    async def on_change(task):
+        kicked.append(task.task_id)
+
+    cfg = OmegaConf.create({'output_dir': '.'})
+    ttools = TeamTaskBoardTools(
+        cfg, task_store=tasks, on_change=on_change)
+    written = json.loads(
+        await ttools.call_tool(
+            'team_taskboard',
+            tool_name='task_board_write',
+            tool_args={
+                'project_id': 'p1',
+                'status': 'pending',
+                'prompt': 'extract who owns decompose',
+                'target_at_name': 'lily',
+            },
+        ))
+    assert kicked == [written['task_id']]
+    done = json.loads(
+        await ttools.call_tool(
+            'team_taskboard',
+            tool_name='task_board_write',
+            tool_args={
+                'task_id': written['task_id'],
+                'project_id': 'p1',
+                'status': 'completed',
+                'prompt': 'extract who owns decompose',
+                'target_at_name': 'lily',
+            },
+        ))
+    assert done['status'] == 'completed'
+    assert kicked == [written['task_id']]
+

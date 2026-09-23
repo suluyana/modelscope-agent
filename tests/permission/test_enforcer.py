@@ -67,8 +67,21 @@ class TestAutoMode:
         assert 'Auto mode' in r.reason
 
     @pytest.mark.asyncio
-    async def test_blacklist_denies(self, auto_enforcer):
+    async def test_default_allows_network(self, auto_enforcer):
         r = await auto_enforcer.check(
+            'code_executor---shell_executor',
+            {'command': 'curl http://example.com'},
+        )
+        assert r.action == 'allow'
+
+    @pytest.mark.asyncio
+    async def test_blacklist_denies(self):
+        config = PermissionConfig.from_dict({
+            'mode': 'auto',
+            'allow_network': False,
+        })
+        enforcer = PermissionEnforcer(config=config)
+        r = await enforcer.check(
             'code_executor---shell_executor',
             {'command': 'curl http://example.com'},
         )
@@ -220,3 +233,108 @@ class TestModifyAction:
         r = await enforcer.check('code_executor---shell_executor', {'command': 'rm -rf /'})
         assert r.action == 'allow'
         assert r.updated_args == {'command': 'ls -la'}
+
+
+class TestDelegateMode:
+    @pytest.mark.asyncio
+    async def test_skip_allows_without_handler(self):
+        config = PermissionConfig.from_dict({'mode': 'delegate'})
+        enforcer = PermissionEnforcer(config=config)
+        r = await enforcer.check(
+            'file_system---read_file', {'path': '/tmp/a'})
+        assert r.action == 'allow'
+        assert 'skip' in r.reason
+
+    @pytest.mark.asyncio
+    async def test_human_without_handler_denies(self):
+        config = PermissionConfig.from_dict({'mode': 'delegate'})
+        enforcer = PermissionEnforcer(config=config)
+        r = await enforcer.check('custom---mystery', {'x': 1})
+        assert r.action == 'deny'
+        assert 'human' in r.reason.lower() or 'No human' in r.reason
+
+    @pytest.mark.asyncio
+    async def test_llm_provider_allow_once(self, tmp_path):
+        class FakeProvider:
+            async def decide(self, tool_name, tool_args, context, suggestions):
+                from ms_agent.permission.provider import ProviderDecision
+                return ProviderDecision('allow_once', reason='ok')
+
+        config = PermissionConfig.from_dict({'mode': 'delegate'})
+        enforcer = PermissionEnforcer(
+            config=config,
+            provider=FakeProvider(),
+            memory=PermissionMemory(project_path=tmp_path),
+        )
+        r = await enforcer.check(
+            'code_executor---shell_executor',
+            {'command': 'git status'},
+        )
+        assert r.action == 'allow'
+        assert 'allowed once' in r.reason.lower() or 'ok' in r.reason
+
+    @pytest.mark.asyncio
+    async def test_uncertain_asks_human(self, tmp_path):
+        class UncertainProvider:
+            async def decide(self, tool_name, tool_args, context, suggestions):
+                from ms_agent.permission.provider import ProviderDecision
+                return ProviderDecision('uncertain', reason='not sure')
+
+        config = PermissionConfig.from_dict({'mode': 'delegate'})
+        enforcer = PermissionEnforcer(
+            config=config,
+            handler=MockAllowHandler(),
+            provider=UncertainProvider(),
+            memory=PermissionMemory(project_path=tmp_path),
+        )
+        r = await enforcer.check(
+            'code_executor---shell_executor',
+            {'command': 'curl https://example.com'},
+        )
+        assert r.action == 'allow'
+
+    @pytest.mark.asyncio
+    async def test_route_picks_llm_vs_agent_provider(self, tmp_path):
+        class Named:
+            def __init__(self, action):
+                self.action = action
+                self.calls = 0
+
+            async def decide(self, tool_name, tool_args, context, suggestions):
+                from ms_agent.permission.provider import ProviderDecision
+                self.calls += 1
+                return ProviderDecision(self.action, reason=self.action)
+
+        llm_p = Named('allow_once')
+        agent_p = Named('deny')
+        config = PermissionConfig.from_dict({'mode': 'delegate'})
+        enforcer = PermissionEnforcer(
+            config=config,
+            llm_provider=llm_p,
+            agent_provider=agent_p,
+            memory=PermissionMemory(project_path=tmp_path),
+        )
+        git = await enforcer.check(
+            'code_executor---shell_executor', {'command': 'git status'})
+        curl = await enforcer.check(
+            'code_executor---shell_executor',
+            {'command': 'curl https://example.com'},
+        )
+        assert git.action == 'allow'
+        assert llm_p.calls == 1
+        assert curl.action == 'deny'
+        assert agent_p.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_blacklist_still_wins(self):
+        config = PermissionConfig.from_dict({
+            'mode': 'delegate',
+            'allow_network': False,
+        })
+        enforcer = PermissionEnforcer(config=config)
+        r = await enforcer.check(
+            'code_executor---shell_executor',
+            {'command': 'curl http://example.com'},
+        )
+        assert r.action == 'deny'
+        assert 'blacklist' in r.reason

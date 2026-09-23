@@ -21,6 +21,13 @@ class UploadRequest(BaseModel):
     created_by_dispatch_id: Optional[str] = None
 
 
+@router.get('')
+def list_artifacts(project_id: Optional[str] = None):
+    state = get_team_state()
+    rows = state.artifacts.list(project_id)
+    return {'artifacts': [a.to_dict() for a in rows]}
+
+
 @router.post('')
 def upload_artifact(body: UploadRequest):
     state = get_team_state()

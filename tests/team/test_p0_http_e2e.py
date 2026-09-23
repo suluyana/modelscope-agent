@@ -119,6 +119,8 @@ def test_p0_a_mention_only_dispatches_target(api: TestClient):
     assert tasks[0]['target_at_name'] == 'codex'
     assert tasks[0]['status'] == 'completed'
     assert not tasks[0].get('result_summary')
+    assert tasks[0].get('result_source') == 'dispatch_log'
+    assert tasks[0].get('result_text')
 
 
 def test_p0_b_two_mentions_two_dispatches(api: TestClient):
@@ -162,6 +164,19 @@ def test_p0_c_followup_goes_to_lead_with_snapshots_only(api: TestClient):
     assert env.context_bundle.project_timeline == []
 
 
+def test_p0_lead_first_message_has_board_pointer(api: TestClient):
+    body = _send(api, 'proj_p0_http', '请把这件大任务拆到任务板')
+    names = [d['target_at_name'] for d in body['dispatches']]
+    assert names == ['planner']
+    merged = _merged(body['dispatches'][0]['dispatch_id'])
+    assert '[task_board] project=proj_p0_http' in merged
+    assert 'task_board_read' in merged
+    env = get_team_state().ingress.get_envelope(
+        body['dispatches'][0]['dispatch_id'])
+    assert env.context_bundle.audience == 'lead'
+    assert env.context_bundle.project_id == 'proj_p0_http'
+
+
 def test_p0_attribution_mismatch_is_emitted(api: TestClient):
     import asyncio
 
@@ -195,3 +210,77 @@ def test_p0_attribution_mismatch_is_emitted(api: TestClient):
     mismatch_ev = next(e for e in events if e.type == 'team.attribution_mismatch')
     assert mismatch_ev.payload.get('event_at_name') == 'intruder'
     assert mismatch_ev.at_name == 'codex'
+
+
+def test_http_task_claim_conflict_and_coordinator_run(api: TestClient):
+    created = api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks',
+        json={
+            'task_id': 't_food',
+            'status': 'pending',
+            'prompt': '找北京美食',
+            'target_at_name': 'codex',
+            'trigger_user_id': 'u1',
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()['parent_task_id'] is None
+    ok = api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks/t_food/claim',
+        json={'at_name': 'codex', 'expected_version': 0},
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()['status'] == 'in_progress'
+    conflict = api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks/t_food/claim',
+        json={'at_name': 'lily', 'expected_version': 0},
+    )
+    assert conflict.status_code == 409
+
+    api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks',
+        json={
+            'task_id': 't_view',
+            'status': 'pending',
+            'prompt': '找北京美景',
+            'target_at_name': 'lily',
+            'trigger_user_id': 'u1',
+        },
+    )
+    ran = api.post(
+        '/api/v1/team/projects/proj_p0_http/coordinator/run')
+    assert ran.status_code == 200, ran.text
+    ids = {d['task_id'] for d in ran.json()['dispatched']}
+    assert 't_view' in ids
+    assert 't_food' not in ids  # already in_progress / claimed
+
+
+def test_http_ask_parks_in_progress_and_defaults_to_lead(api: TestClient):
+    created = api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks',
+        json={
+            'task_id': 't_ask',
+            'status': 'in_progress',
+            'prompt': 'read the doc',
+            'target_at_name': 'codex',
+            'trigger_user_id': 'u1',
+        },
+    )
+    assert created.status_code == 200, created.text
+    asked = api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks/t_ask/ask',
+        json={'question': 'I need the path to the document.'},
+    )
+    assert asked.status_code == 200, asked.text
+    task = asked.json()['task']
+    assert task['status'] == 'wait_human'
+    ctx = task.get('deployment_context') or {}
+    assert ctx.get('ask_audience') == 'lead'
+    assert ctx.get('needs_clarification') is True
+    assert ctx.get('escalated_to_lead') is True
+    empty = api.post(
+        '/api/v1/team/projects/proj_p0_http/tasks/t_ask/ask',
+        json={'question': '   '},
+    )
+    assert empty.status_code == 400
+

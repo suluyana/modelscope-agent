@@ -77,6 +77,42 @@ class TestHookRegistry:
         assert reg.get_handlers('PreToolUse', None) == []
         assert len(reg.get_handlers('PreToolUse', 'code_executor---shell_executor')) == 1
 
+    def test_if_filters_on_content(self):
+        reg = HookRegistry.from_dict({
+            'PreToolUse': [{
+                'matcher': 'code_executor---*',
+                'hooks': [{
+                    'type': 'command',
+                    'command': './curl.sh',
+                    'if': 'curl*',
+                }],
+            }],
+        })
+        assert reg.get_handlers(
+            'PreToolUse',
+            'code_executor---shell_executor',
+            {'command': 'curl https://example.com'},
+        )
+        assert not reg.get_handlers(
+            'PreToolUse',
+            'code_executor---shell_executor',
+            {'command': 'git status'},
+        )
+
+    def test_if_skipped_without_tool_args(self):
+        reg = HookRegistry.from_dict({
+            'PreToolUse': [{
+                'matcher': 'code_executor---*',
+                'hooks': [{
+                    'type': 'command',
+                    'command': './curl.sh',
+                    'if': 'curl*',
+                }],
+            }],
+        })
+        assert reg.get_handlers(
+            'PreToolUse', 'code_executor---shell_executor') == []
+
     def test_skips_disabled_executor_types(self):
         reg = HookRegistry.from_dict({
             'PreToolUse': [{

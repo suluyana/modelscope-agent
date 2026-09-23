@@ -1,0 +1,57 @@
+# Built-in delegate routing. Same language as permission rules / hook matcher+if.
+# First match wins. Project `permission.delegate_routes` are prepended.
+# SafetyGuard / blacklist still run first and cannot be overridden here.
+#
+# Categories follow Claude auto-mode dangerousPatterns / permissionSetup:
+# arbitrary code, egress, shell swap, Agent spawn, writes that never go
+# to a classifier.
+#
+# provider:
+#   skip  — no model; treat as already safe (read-only)
+#   llm   — cheap one-shot classifier
+#   agent — independent verifier (workspace read/grep; never the requester)
+#   human — ask, or deny when no human is available. Writes and unknown tools.
+
+# Read-only: classifier skipped (Claude Read/Grep/Glob).
+- matcher: "*---read_file|*---grep|*---glob"
+  provider: skip
+
+# Arbitrary code: interpreters and package runners.
+- matcher: "*---shell_executor"
+  if: "python*|python3*|python2*|node*|deno*|tsx*|ruby*|perl*|php*|lua*|npx*|npm run*|yarn run*|pnpm run*|bunx*|bun run*|*/python *|*/python3 *|*/node *|*/ruby *"
+  provider: agent
+
+# Egress / exfil: Bash + WebFetch. gh/api and cloud CLIs are over-broad prefixes.
+- matcher: "*---shell_executor"
+  if: "curl*|wget*|ssh*|scp*|rsync*|nc *|nc*|netcat*|gh *|gh api*|kubectl*|aws *|gcloud*|gsutil*|*/curl *|*/wget *|*/ssh *"
+  provider: agent
+
+- matcher: "*---fetch_page|*---web_fetch"
+  provider: agent
+
+# Shell swap / nested eval (Unix + PowerShell).
+- matcher: "*---shell_executor"
+  if: "eval*|exec*|env *|sudo*|xargs*|bash*|sh *|zsh*|fish*|pwsh*|powershell*|cmd *|cmd.exe*|wsl*|iex *|invoke-expression*|invoke-command*|icm *|start-process*|saps *|start-job*|sajb*|add-type*|new-object*|*/bash *|*/sh *|/bin/sh*|/bin/bash*"
+  provider: agent
+
+# Spawn sub-agent: any Agent allow bypasses spawn-prompt checks.
+- matcher: "plugin_agents---*|agent_tools---*"
+  provider: agent
+
+# git config can install hooks / sshCommand; remaining git is cheap.
+- matcher: "*---shell_executor"
+  if: "git config*"
+  provider: agent
+
+- matcher: "*---shell_executor"
+  if: "git *"
+  provider: llm
+
+# Workspace-outside writes, .git / .claude / shell rc: never a classifier.
+# SafetyGuard still deny/asks the path; this row keeps Enforcer off llm/agent
+# even when the write is inside the workspace.
+- matcher: "*---write_file|*---edit_file"
+  provider: human
+
+- matcher: "*"
+  provider: human

@@ -44,9 +44,11 @@ async def _run_permission_request_hook(
 ) -> HookResult | None:
     if hook_runtime is None or hook_runtime.is_empty:
         return None
-    if permission_config is None or permission_config.mode != 'interactive':
+    if permission_config is None or permission_config.mode not in (
+            'interactive', 'delegate'):
         return None
-    if not hook_runtime.registry.get_handlers('PermissionRequest', tool_name):
+    if not hook_runtime.registry.get_handlers(
+            'PermissionRequest', tool_name, tool_args):
         return None
     return await hook_runtime.run_permission_request(tool_name, tool_args)
 
