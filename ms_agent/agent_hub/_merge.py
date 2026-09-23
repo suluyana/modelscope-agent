@@ -540,11 +540,7 @@ SEMANTIC_GROUPS = [
         'qwenpaw': 'MEMORY.md',
         'hermes': 'memories/MEMORY.md',
         'openhuman': 'MEMORY.md',
-        'qoder': 'memory/MEMORY.md',
-        # Semantic slot only. convert_workspace peels ``memory/`` out of the
-        # global-home payload and writes it under
-        # ``<work>/.ms_agent/memory/MEMORY.md`` (the runtime/WebUI/TUI path).
-        'ms-agent': 'memory/MEMORY.md',
+        'qoder': 'memory/MEMORY.md'
     },
     {
         'openclaw': 'IDENTITY.md',
@@ -679,8 +675,8 @@ def _resolve_target_path(source_product: str, source_path: str,
 # index) land per target. ``None`` = the target reads a single memory file
 # (:data:`_SINGLE_FILE_MEMORY_SLOTS`) and detail is inlined into it -- a file
 # the runtime never reads is not a migration. openclaw uses its own
-# ``memory/imports/<source>/`` convention. ms-agent inlines into
-# ``memory/MEMORY.md`` then peels that file to the project work dir.
+# ``memory/imports/<source>/`` convention; targets without an entry (ms-agent
+# has no home-level memory) keep the source path for the spec filter to drop.
 _MEMORY_LOOSE_HOME = {
     'hermes': None,
     'openclaw': 'memory/',
@@ -688,7 +684,6 @@ _MEMORY_LOOSE_HOME = {
     'qoder': 'memory/',
     'openhuman': None,
     'nanobot': None,
-    'ms-agent': None,
 }
 
 # The single memory file each ``None`` target above actually reads.
@@ -696,7 +691,6 @@ _SINGLE_FILE_MEMORY_SLOTS = {
     'nanobot': 'memory/MEMORY.md',
     'hermes': 'memories/MEMORY.md',
     'openhuman': 'MEMORY.md',
-    'ms-agent': 'memory/MEMORY.md',
 }
 
 # openhuman injects MEMORY.md into the system prompt under a char cap;

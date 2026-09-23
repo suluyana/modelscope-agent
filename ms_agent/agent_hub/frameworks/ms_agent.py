@@ -38,8 +38,6 @@ class MsAgentWorkspace(WorkspaceSpec):
     same-framework sync only. Memory is NOT here: the runtime keeps it
     project-level under ``<work_dir>/.ms_agent/memory/`` (no global memory by
     design), so the global-home workspace this spec models carries none.
-    ``convert --target-framework ms-agent --work-dir <work>`` peels inbound
-    MEMORY.md out of this home and writes it to that project path.
 
     Machine bookkeeping never travels: the ``.soul.builtin`` /
     ``.agents.builtin`` / ``.profile.builtin`` sidecars are dotfiles (skipped

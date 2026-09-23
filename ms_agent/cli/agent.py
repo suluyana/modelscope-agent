@@ -50,7 +50,7 @@ class AgentCMD(CLICommand):
             '  status    -f FRAMEWORK [--local-dir DIR]\n'
             '  backups   [-f FRAMEWORK] [-n NAME] [--local-dir DIR]\n'
             '  restore   --from-backup TARGET [-f FRAMEWORK] [-n NAME] [--local-dir DIR]\n'
-            '  convert   --from-framework FW --target-framework FW [--from-name NAME] [--target-name NAME] [--local-dir DIR] [--out-dir DIR] [--work-dir DIR] [--dry-run]\n'
+            '  convert   --from-framework FW --target-framework FW [--from-name NAME] [--target-name NAME] [--local-dir DIR] [--out-dir DIR] [--dry-run]\n'
             '  stop      (no arguments)\n'
             '\n'
             'supported frameworks:\n'
@@ -343,14 +343,6 @@ class AgentCMD(CLICommand):
             'Destination directory to write to (default: target framework path)'
         )
         p_convert.add_argument(
-            '--work-dir',
-            default=None,
-            help=
-            'Project folder TUI/WebUI will open. When converting to ms-agent, '
-            'MEMORY.md is written to <work-dir>/.ms_agent/memory/MEMORY.md '
-            '(default: current directory). Ignored for other targets.',
-        )
-        p_convert.add_argument(
             '--dry-run',
             action='store_true',
             help='Show what would be written without writing')
@@ -458,7 +450,6 @@ class AgentCMD(CLICommand):
                 local_dir=args.local_dir,
                 out_dir=args.out_dir,
                 dry_run=args.dry_run,
-                work_dir=args.work_dir,
             )
         elif action == 'watch':
             rc = cmd_watch(

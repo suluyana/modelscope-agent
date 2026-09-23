@@ -2,7 +2,6 @@
 """Sub-agent-aware workspace spec collection tests."""
 import base64
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -599,36 +598,22 @@ class TestOpenhumanWorkspaceLiveness(unittest.TestCase):
             "GOLD-WEATHER\n")
         (profile / "skills" / "weather" / "_meta.json").write_text('{"k": 1}')
         out = Path(self.tmp.name) / "out"
-        work = Path(self.tmp.name) / "work"
-        work.mkdir()
-        old_home = os.environ.get("MS_AGENT_HOME")
-        os.environ["MS_AGENT_HOME"] = str(Path(self.tmp.name) / "ms_home")
-        try:
-            rc = cmd_convert(
-                "openhuman", "ms-agent", None, None,
-                str(self.root), str(out), work_dir=str(work))
-            self.assertEqual(rc, 0)
-            rels = {
-                str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()
-            }
-            self.assertIn("skills/weather/SKILL.md", rels)
-            self.assertNotIn("skills/weather/_meta.json", rels)
-            all_text = "".join(
-                p.read_text(encoding="utf-8") for p in out.rglob("*")
-                if p.is_file())
-            self.assertIn("GOLD-PERSONA", all_text)
-            self.assertIn("GOLD-WEATHER", all_text)
-            self.assertNotIn("GOLD-MEMORY", all_text)
-            mem = work / ".ms_agent" / "memory" / "MEMORY.md"
-            self.assertTrue(mem.is_file())
-            self.assertIn("GOLD-MEMORY", mem.read_text(encoding="utf-8"))
-            # the stale shell's persona must NOT leak into the output
-            self.assertNotIn("stale soul", all_text)
-        finally:
-            if old_home is None:
-                os.environ.pop("MS_AGENT_HOME", None)
-            else:
-                os.environ["MS_AGENT_HOME"] = old_home
+        rc = cmd_convert("openhuman", "ms-agent", None, None,
+                         str(self.root), str(out))
+        self.assertEqual(rc, 0)
+        rels = {
+            str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()
+        }
+        self.assertIn("skills/weather/SKILL.md", rels)
+        self.assertNotIn("skills/weather/_meta.json", rels)
+        all_text = "".join(
+            p.read_text(encoding="utf-8") for p in out.rglob("*")
+            if p.is_file())
+        self.assertIn("GOLD-PERSONA", all_text)
+        self.assertIn("GOLD-MEMORY", all_text)
+        self.assertIn("GOLD-WEATHER", all_text)
+        # the stale shell's persona must NOT leak into the output
+        self.assertNotIn("stale soul", all_text)
 
 
 class TestOpenhumanActiveProfile(unittest.TestCase):
