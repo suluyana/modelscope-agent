@@ -19,7 +19,7 @@ mkdir -p "$MS_AGENT_HOME" /tmp/align-work
 ms-agent tui --work-dir /tmp/align-work
 ```
 
-换期前可清空 `$MS_AGENT_HOME`。磁盘是唯一验收源；当前这一轮对话若没跟上，脚本会写「需 `/new`」。
+换期前可清空 `$MS_AGENT_HOME`。磁盘是唯一验收源。账本改完后，同一会话的下一条用户消息才生效，不必 `/new`。
 
 对齐标准：**同一账本**（TUI slash 能管 WebUI 设置页写的那些文件），不是 TUI/WebUI 界面完全一致。
 
@@ -96,7 +96,7 @@ ms-agent tui --work-dir /tmp/align-work
 | E5 | 启用/停用 | `/mcp enable\|disable <name> [global\|project]` | WebUI 开关一致 |
 | E6 | 删除 | `/mcp remove <name> [global\|project]` | WebUI 不再显示（或项目级遮罩全局） |
 | E7 | 导入 json | `/mcp json <file.json>` | 能进 mcp.json |
-| E8 | 本会话连接 | add/update 后 | 能连则立刻连；否则提示 `/new` |
+| E8 | 本会话连接 | add/update/enable/disable/remove 之后，再发一条用户消息 | 只改了的服务器会连上或断开；没改的保持连接。命令只回「下一条消息生效。」 |
 
 ### F. 技能（第 0 / 4 期）
 
@@ -125,7 +125,7 @@ ms-agent tui --work-dir /tmp/align-work
 | G4 | 本项目开/关 | `/memory on\|off` 或 `/memory project on\|off` | WebUI 该项目记忆开关一致；file 时对话能走到 unified_memory |
 | G5 | 后端 | `/memory backend file\|vector`（全局默认）；`/memory project backend file\|vector`（本项目） | file：TUI 用 MEMORY.md；vector：只落盘给 WebUI，**TUI 不得悄悄写成 file** |
 | G6 | WebUI → TUI | WebUI 打开同一项目的 file 记忆 | 新开 TUI `/memory` 项目为 on |
-| G7 | 中途关掉 | 已经 load 过记忆后再 `/memory off` | 提示 `/new` 才卸工具 |
+| G7 | 中途关掉 | 已经 load 过记忆后再 `/memory off`，再发一条用户消息 | 记忆工具卸掉；不必 `/new` |
 
 ### 本会话未覆盖（不要当成回归失败）
 
@@ -371,7 +371,7 @@ TUI 命令：
 /memory project backend file|vector
 ```
 
-TUI 的 vector/mem0 不在本期接；选 vector 只落盘给 WebUI 用，**不会**悄悄改写成 file。当前会话若已加载过记忆工具，关记忆后需要 `/new`。
+TUI 的 vector/mem0 不在本期接；选 vector 只落盘给 WebUI 用，**不会**悄悄改写成 file。开关和后端在同一会话的下一条用户消息生效，不需要 `/new`。
 
 ### 5.1 全局默认 → 新项目
 
@@ -384,7 +384,7 @@ TUI 的 vector/mem0 不在本期接；选 vector 只落盘给 WebUI 用，**不�
 
 1. 同一工作目录。TUI：`/memory on`（或 `/memory project on`）
 2. 项目 meta 里 `memory_enabled` 为 true。
-3. `/new` 后再请模型「记住我喜欢快排」之类；应能走到 `unified_memory` 工具（file 后端）。
+3. 下一条用户消息再请模型「记住我喜欢快排」之类；应能走到 `unified_memory` 工具（file 后端）。不需要 `/new`。
 4. 刷新 WebUI 该项目记忆开关：应为开；`MEMORY.md` 若已写入，WebUI 记忆页能看到。
 
 ### 5.3 WebUI → TUI
@@ -393,3 +393,11 @@ TUI 的 vector/mem0 不在本期接；选 vector 只落盘给 WebUI 用，**不�
 2. 新开 TUI 同一 `--work-dir`：`/memory` 项目应为 on；配置里有 `memory.unified_memory`。
 
 **失败：** 只改了全局 settings、当前项目对话仍没有记忆工具；或 TUI 把 vector 项目悄悄写成了 MEMORY.md。
+
+---
+
+## 后续
+
+内置技能 `update-config` 先不做成两端技能页都能看到的管理项。配置说明走 `ms_agent/prompting` 里已有的提示词（文件位置、下一轮生效），用来关掉「管理界面看不到、对话里却在用」这一条。
+
+更完整的 harness 说明以后用文档技能做，不继续往系统提示词里加手册。

@@ -76,7 +76,8 @@ class TestMemoryCommand:
         node = OmegaConf.select(runtime.config, 'memory.unified_memory')
         assert node is not None
         assert node.storage.backend == 'file'
-        assert runtime.memory_tools == ['loaded']
+        assert '下一条消息生效' in result.content
+        assert runtime.memory_tools == []
 
     @pytest.mark.asyncio
     async def test_project_toggle_sees_work_dir_on_agent_runtime(

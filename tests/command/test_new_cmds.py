@@ -50,6 +50,20 @@ def make_router():
     return router
 
 
+def _keyed(provider: str) -> None:
+    from ms_agent.config.model_settings import ModelSettingsManager
+    from ms_agent.project.paths import global_home
+    ModelSettingsManager(global_home()).patch_provider(
+        provider, api_key='sk-test', base_url='https://example.invalid/v1')
+
+
+def _catalog_ok(monkeypatch, ids):
+    from ms_agent.llm.model_discovery import CatalogProbe
+    monkeypatch.setattr(
+        'ms_agent.llm.model_discovery.probe_model_catalog',
+        lambda *_a, **_k: CatalogProbe('ok', 200, list(ids)))
+
+
 def make_ctx(text, runtime=None, messages=None):
     router = make_router()
     cmd, args = CommandRouter.parse_input(text)
@@ -129,6 +143,14 @@ class TestModel:
     @pytest.fixture(autouse=True)
     def _isolate_home(self, tmp_path, monkeypatch):
         monkeypatch.setenv('MS_AGENT_HOME', str(tmp_path / 'ms_home'))
+        for name in (
+                'OPENAI_API_KEY',
+                'DASHSCOPE_API_KEY',
+                'ANTHROPIC_API_KEY',
+                'MODELSCOPE_API_KEY',
+                'MINIMAX_API_KEY',
+        ):
+            monkeypatch.delenv(name, raising=False)
 
     @pytest.mark.asyncio
     async def test_show_current_model(self):
@@ -139,37 +161,25 @@ class TestModel:
         assert 'openai' in result.content
 
     @pytest.mark.asyncio
-    async def test_switch_model(self):
-        from unittest.mock import patch
+    async def test_switch_model(self, monkeypatch):
         runtime = MockRuntime()
         router = make_router()
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = runtime.llm.config
-                self.model = 'gpt-4o'
-
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await router.dispatch(
-                make_ctx('/model gpt-4o', runtime=runtime))
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['gpt-4o'])
+        result = await router.dispatch(
+            make_ctx('/model gpt-4o', runtime=runtime))
         assert result.type == CommandResultType.MUTATE_STATE
         assert 'gpt-4o' in result.content
         assert runtime.llm.model == 'gpt-4o'
 
     @pytest.mark.asyncio
-    async def test_slash_in_model_id_stays_on_current_provider(self):
-        from unittest.mock import patch
+    async def test_slash_in_model_id_stays_on_current_provider(self, monkeypatch):
         runtime = MockRuntime()
         router = make_router()
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = runtime.llm.config
-                self.model = 'MiniMax/MiniMax-M2.1'
-
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await router.dispatch(
-                make_ctx('/model MiniMax/MiniMax-M2.1', runtime=runtime))
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['MiniMax/MiniMax-M2.1'])
+        result = await router.dispatch(
+            make_ctx('/model MiniMax/MiniMax-M2.1', runtime=runtime))
         assert result.type == CommandResultType.MUTATE_STATE
         assert runtime.llm.model == 'MiniMax/MiniMax-M2.1'
         assert runtime.llm.config.llm.service == 'openai'
@@ -177,41 +187,28 @@ class TestModel:
         assert 'Model:    MiniMax/MiniMax-M2.1' in result.content
 
     @pytest.mark.asyncio
-    async def test_known_provider_then_slashy_model(self):
-        from unittest.mock import patch
+    async def test_known_provider_then_slashy_model(self, monkeypatch):
         runtime = MockRuntime()
         router = make_router()
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = runtime.llm.config
-                self.model = 'MiniMax/MiniMax-M2.1'
-                self.spec = type('S', (), {'name': 'dashscope'})()
-                self.transport = type('T', (), {'base_url': 'https://ds'})()
-
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await router.dispatch(
-                make_ctx(
-                    '/model dashscope/MiniMax/MiniMax-M2.1', runtime=runtime))
+        _keyed('dashscope')
+        _catalog_ok(monkeypatch, ['MiniMax/MiniMax-M2.1'])
+        result = await router.dispatch(
+            make_ctx(
+                '/model dashscope/MiniMax/MiniMax-M2.1', runtime=runtime))
         assert runtime.llm.config.llm.service == 'dashscope'
         assert runtime.llm.model == 'MiniMax/MiniMax-M2.1'
         assert 'Provider: dashscope' in result.content
         assert 'Switch:   /model dashscope MiniMax/MiniMax-M2.1' in result.content
 
     @pytest.mark.asyncio
-    async def test_space_form_sets_provider_when_model_has_slash(self):
-        from unittest.mock import patch
+    async def test_space_form_sets_provider_when_model_has_slash(
+            self, monkeypatch):
         runtime = MockRuntime()
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = runtime.llm.config
-                self.model = 'MiniMax/MiniMax-M2.1'
-
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await make_router().dispatch(
-                make_ctx(
-                    '/model dashscope MiniMax/MiniMax-M2.1', runtime=runtime))
+        _keyed('dashscope')
+        _catalog_ok(monkeypatch, ['MiniMax/MiniMax-M2.1'])
+        result = await make_router().dispatch(
+            make_ctx(
+                '/model dashscope MiniMax/MiniMax-M2.1', runtime=runtime))
         assert runtime.llm.config.llm.service == 'dashscope'
         assert runtime.llm.model == 'MiniMax/MiniMax-M2.1'
 
@@ -257,6 +254,10 @@ class TestModel:
                 'ZHIPUAI_API_KEY',
         ):
             monkeypatch.delenv(env, raising=False)
+        from ms_agent.llm.model_discovery import CatalogProbe
+        monkeypatch.setattr(
+            'ms_agent.llm.model_discovery.probe_model_catalog',
+            lambda *_a, **_k: CatalogProbe('no_catalog', 404, []))
         runtime = MockRuntime()
         router = make_router()
         await router.dispatch(
@@ -347,30 +348,25 @@ class TestModel:
         assert 'Switch:   /model dashscope MiniMax/MiniMax-M2.1' in result.content
 
     @pytest.mark.asyncio
-    async def test_switch_model_replaces_setup_stub(self):
+    async def test_switch_model_replaces_setup_stub(self, monkeypatch):
         from types import SimpleNamespace
-        from unittest.mock import patch
 
         config = _make_mock_config()
         stub = SimpleNamespace(config=config, model='old', _setup_stub=True)
         runtime = MockRuntime(llm=stub)
         router = make_router()
         ctx = make_ctx('/model dashscope/qwen3.8-flash', runtime=runtime)
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = config
-                self.model = 'qwen3.8-flash'
-
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await router.dispatch(ctx)
+        _keyed('dashscope')
+        _catalog_ok(monkeypatch, ['qwen3.8-flash'])
+        result = await router.dispatch(ctx)
         assert result.type == CommandResultType.MUTATE_STATE
         assert 'qwen3.8-flash' in result.content
         assert runtime.llm.model == 'qwen3.8-flash'
         assert config.llm.service == 'dashscope'
 
     @pytest.mark.asyncio
-    async def test_switch_model_persists_to_settings_not_project_patch(self, tmp_path):
+    async def test_switch_model_persists_to_settings_not_project_patch(
+            self, tmp_path, monkeypatch):
         # The committed source YAML must never be mutated by /model.
         yaml_text = (
             'llm:\n'
@@ -390,15 +386,9 @@ class TestModel:
         runtime = MockRuntime(llm=MockLLM(model='qwen3.5-plus', config=config))
         router = make_router()
         ctx = make_ctx('/model qwen3.7-max', runtime=runtime)
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = config
-                self.model = 'qwen3.7-max'
-
-        from unittest.mock import patch
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await router.dispatch(ctx)
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['qwen3.7-max'])
+        result = await router.dispatch(ctx)
 
         assert result.type == CommandResultType.MUTATE_STATE
         assert 'Saved as the default' in result.content
@@ -417,20 +407,14 @@ class TestModel:
             'openai/qwen3.7-max')
 
     @pytest.mark.asyncio
-    async def test_switch_model_no_source_file(self, tmp_path):
+    async def test_switch_model_no_source_file(self, tmp_path, monkeypatch):
         # Still writes the WebUI-shared default_model in settings.json.
         runtime = MockRuntime()
         router = make_router()
         ctx = make_ctx('/model gpt-4o', runtime=runtime)
-
-        class Rebuilt:
-            def __init__(self):
-                self.config = runtime.llm.config
-                self.model = 'gpt-4o'
-
-        from unittest.mock import patch
-        with patch('ms_agent.llm.LLM.from_config', return_value=Rebuilt()):
-            result = await router.dispatch(ctx)
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['gpt-4o'])
+        result = await router.dispatch(ctx)
         assert result.type == CommandResultType.MUTATE_STATE
         assert 'Saved as the default' in result.content
         from ms_agent.config.model_settings import ModelSettingsManager
@@ -472,6 +456,10 @@ class TestModel:
                 'OPENAI_API_KEY',
         ):
             monkeypatch.delenv(env, raising=False)
+        from ms_agent.llm.model_discovery import CatalogProbe
+        monkeypatch.setattr(
+            'ms_agent.llm.model_discovery.probe_model_catalog',
+            lambda *_a, **_k: CatalogProbe('no_catalog', 404, []))
         runtime = MockRuntime()
         router = make_router()
         await router.dispatch(
@@ -511,7 +499,11 @@ class TestModel:
         assert 'skipped (no API key)' in skipped.content
 
     @pytest.mark.asyncio
-    async def test_provider_add_set_key_catalog(self, tmp_path):
+    async def test_provider_add_set_key_catalog(self, tmp_path, monkeypatch):
+        from ms_agent.llm.model_discovery import CatalogProbe
+        monkeypatch.setattr(
+            'ms_agent.llm.model_discovery.probe_model_catalog',
+            lambda *_a, **_k: CatalogProbe('no_catalog', 404, []))
         runtime = MockRuntime()
         router = make_router()
         added = await router.dispatch(
@@ -657,6 +649,52 @@ class TestModel:
         assert 'Cannot remove builtin' in result.content
 
     @pytest.mark.asyncio
+    async def test_unknown_provider_prefix_is_rejected(self, tmp_path):
+        runtime = MockRuntime()
+        result = await make_router().dispatch(
+            make_ctx('/model dashcope/qwen-max', runtime=runtime))
+        assert result.type == CommandResultType.MESSAGE
+        assert 'No provider named dashcope' in result.content
+        assert 'Known:' in result.content
+        assert runtime.llm.model == 'qwen3.7-plus'
+        assert runtime.llm.config.llm.model == 'qwen3.7-plus'
+        settings = tmp_path / 'ms_home' / 'settings.json'
+        if settings.exists():
+            assert 'dashcope' not in settings.read_text()
+
+    @pytest.mark.asyncio
+    async def test_catalog_add_rejects_secret_shaped_model(self, tmp_path):
+        runtime = MockRuntime()
+        secret = 'sk-THIS-IS-MY-SECRET'
+        result = await make_router().dispatch(
+            make_ctx(f'/model catalog add {secret}', runtime=runtime))
+        assert 'API key' in result.content
+        assert secret not in result.content
+        assert 'REDACTED' in result.content
+        settings = tmp_path / 'ms_home' / 'settings.json'
+        if settings.exists():
+            assert secret not in settings.read_text()
+
+    @pytest.mark.asyncio
+    async def test_switch_rejects_secret_shaped_model(self):
+        runtime = MockRuntime()
+        secret = 'sk-THIS-IS-MY-SECRET'
+        result = await make_router().dispatch(
+            make_ctx(f'/model {secret}', runtime=runtime))
+        assert 'API key' in result.content
+        assert secret not in result.content
+        assert runtime.llm.config.llm.model == 'qwen3.7-plus'
+
+    @pytest.mark.asyncio
+    async def test_provider_set_error_masks_secret(self):
+        secret = 'sk-THIS-IS-MY-SECRET'
+        result = await make_router().dispatch(
+            make_ctx(f'/model provider set {secret}', runtime=MockRuntime()))
+        assert 'No fields to patch' in result.content
+        assert secret not in result.content
+        assert 'REDACTED' in result.content
+
+    @pytest.mark.asyncio
     async def test_no_runtime(self):
         router = make_router()
         ctx = make_ctx('/model', runtime=None)
@@ -687,6 +725,38 @@ class TestConfig:
         result = await router.dispatch(ctx)
         assert 'sk-test' not in result.content
         assert '***' in result.content
+
+    @pytest.mark.asyncio
+    async def test_masks_search_keys_and_mcp_headers(self):
+        cfg = OmegaConf.create({
+            'llm': {
+                'service': 'openai',
+                'model': 'gpt-4o',
+                'openai_api_key': 'sk-real-key-value',
+            },
+            'tools': {
+                'web_search': {
+                    'tavily_api_key': 'tvly-THIS-IS-MY-SECRET',
+                },
+            },
+            'mcpServers': {
+                'docs': {
+                    'url': 'https://example.invalid/mcp',
+                    'headers': {
+                        'Authorization': 'Bearer THIS-IS-MY-TOKEN',
+                    },
+                },
+            },
+        })
+        runtime = MockRuntime()
+        runtime.llm.config = cfg
+        result = await make_router().dispatch(
+            make_ctx('/config', runtime=runtime))
+        assert 'tvly-THIS-IS-MY-SECRET' not in result.content
+        assert 'THIS-IS-MY-TOKEN' not in result.content
+        assert 'sk-real-key-value' not in result.content
+        assert 'tavily_api_key' in result.content
+        assert 'Authorization' in result.content
 
 
 class TestQuit:
@@ -861,3 +931,61 @@ class TestAllCommandsRegistered:
         cmds = router.list_commands('cli')
         total = sum(len(v) for v in cmds.values())
         assert total == 18
+
+
+class TestModelProbe:
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('MS_AGENT_HOME', str(tmp_path / 'ms_home'))
+        monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+
+    @pytest.mark.asyncio
+    async def test_auth_rolls_back_the_new_key(self, tmp_path, monkeypatch):
+        from ms_agent.llm.model_discovery import CatalogProbe
+        monkeypatch.setattr(
+            'ms_agent.llm.model_discovery.probe_model_catalog',
+            lambda *_a, **_k: CatalogProbe('auth', 401, []))
+        _keyed('acme')
+        result = await make_router().dispatch(
+            make_ctx('/model provider key acme sk-new', runtime=MockRuntime()))
+        assert '没有换成它' in result.content
+        assert '可复制' in result.content
+        data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
+        assert data['providers']['acme']['api_key'] == 'sk-test'
+
+    @pytest.mark.asyncio
+    async def test_missing_id_does_not_change_the_default(self, monkeypatch):
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['qwen-plus', 'qwen-max'])
+        runtime = MockRuntime()
+        result = await make_router().dispatch(
+            make_ctx('/model gpt-4o', runtime=runtime))
+        assert result.type == CommandResultType.MESSAGE
+        assert '没有改默认模型' in result.content
+        assert 'qwen-plus' in result.content
+        assert runtime.llm.model == 'qwen3.7-plus'
+
+    @pytest.mark.asyncio
+    async def test_no_catalog_still_saves(self, monkeypatch):
+        from ms_agent.llm.model_discovery import CatalogProbe
+        from ms_agent.config.model_settings import ModelSettingsManager
+        from ms_agent.project.paths import global_home
+        monkeypatch.setattr(
+            'ms_agent.llm.model_discovery.probe_model_catalog',
+            lambda *_a, **_k: CatalogProbe('no_catalog', 404, []))
+        _keyed('openai')
+        runtime = MockRuntime()
+        result = await make_router().dispatch(
+            make_ctx('/model gpt-4o', runtime=runtime))
+        assert result.type == CommandResultType.MUTATE_STATE
+        assert '没有返回模型列表' in result.content
+        assert runtime.llm.model == 'gpt-4o'
+        assert ModelSettingsManager(global_home()).get_default_model() == (
+            'openai/gpt-4o')
+
+    @pytest.mark.asyncio
+    async def test_model_list_names_non_chat_models(self):
+        from ms_agent.llm.model_discovery import LIST_FOOTER
+        result = await make_router().dispatch(
+            make_ctx('/model list', runtime=MockRuntime()))
+        assert LIST_FOOTER in result.content

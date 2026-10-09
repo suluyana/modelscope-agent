@@ -47,8 +47,10 @@ def _skill_usage() -> str:
         '  /skills remove <id> [global|project]\n'
         f'Directory drop-in: global → {ledger_dir()}/skills, '
         'project → <work>/.ms_agent/skills. '
-        'Omit scope: this folder (project) when TUI has --work-dir, '
+        'Omit scope on add: this folder (project) when a work dir is open, '
         'otherwise this machine (global). '
+        'Omit scope on enable, disable, or remove: the copy that already '
+        'exists; if both exist, write global or project. '
         f'{same_as_webui("skills")} '
         'remove only deletes a managed copy, not auto-discovered skills.'
     )
@@ -66,10 +68,26 @@ def _home_work(ctx: CommandContext) -> tuple[str, str | None]:
 
 
 def _parse_scope(tokens: list[str], default: str = 'project') -> tuple[str, list[str]]:
-    """Optional last-token scope so a path/name can contain spaces."""
+    """Last token is the scope, even when it is the only token.
+
+    Used by ``/mcp list``, where there is no server name.
+    """
     if tokens and tokens[-1] in ('global', 'project'):
         return tokens[-1], tokens[:-1]
     return default, list(tokens)
+
+
+def _parse_named_scope(
+    tokens: list[str],
+    default: str = 'project',
+) -> tuple[str, list[str], bool]:
+    """Scope only when a name precedes ``global`` or ``project``.
+
+    A lone ``project`` is the server name — same rule as ``/skills``.
+    Returns ``(scope, remaining tokens, explicit)``.
+    """
+    scope, rest = parse_optional_scope(tokens)
+    return (scope or default), rest, scope is not None
 
 
 def _split_kv(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -169,7 +187,7 @@ async def cmd_mcp(ctx: CommandContext) -> CommandResult:
         if not tokens:
             return arg_error(
                 f'/mcp {action} <name> [global|project]', ctx=ctx)
-        scope, rest = _parse_scope(tokens, default='project')
+        scope, rest, _ = _parse_named_scope(tokens, default='project')
         miss = _need_work(scope, work)
         if miss:
             return miss
@@ -193,8 +211,7 @@ async def cmd_mcp(ctx: CommandContext) -> CommandResult:
 
     if action == 'add':
         rest, fields = _split_kv(tokens)
-        explicit = bool(rest and rest[-1] in ('global', 'project'))
-        scope, rest = _parse_scope(rest, default='project')
+        scope, rest, explicit = _parse_named_scope(rest, default='project')
         miss = _need_work(scope, work)
         if miss:
             return miss
@@ -221,7 +238,7 @@ async def cmd_mcp(ctx: CommandContext) -> CommandResult:
 
     if action == 'update':
         rest, fields = _split_kv(tokens)
-        scope, rest = _parse_scope(rest, default='project')
+        scope, rest, _ = _parse_named_scope(rest, default='project')
         miss = _need_work(scope, work)
         if miss:
             return miss
@@ -251,21 +268,9 @@ async def cmd_mcp(ctx: CommandContext) -> CommandResult:
 
 
 async def _reload_mcp(ctx: CommandContext) -> str:
-    home, work = _home_work(ctx)
-    from ms_agent.tui.managed_config import resolve_mcp_config
-    cfg = resolve_mcp_config(home, work)
-    agent = ctx.runtime
-    tm = getattr(agent, 'tool_manager', None) if agent is not None else None
-    client = getattr(tm, 'servers', None) if tm is not None else None
-    if client is None or not cfg or not hasattr(client, 'add_mcp_config'):
-        return 'Takes effect on /new or restart.'
-    try:
-        await client.add_mcp_config(cfg)
-        if hasattr(tm, 'reindex_tool'):
-            await tm.reindex_tool()
-        return 'Connected for this session.'
-    except Exception as exc:  # noqa: BLE001 - surface, do not crash TUI
-        return f'Saved; connect failed ({exc}). /new or restart to apply.'
+    """Ledger is already written. The live runtime applies it next message."""
+    del ctx
+    return '下一条消息生效。'
 
 
 async def cmd_skills(ctx: CommandContext) -> CommandResult:
@@ -303,7 +308,9 @@ async def cmd_skills(ctx: CommandContext) -> CommandResult:
             tokens,
             work,
             syntax=f'/skills {action} <id> [global|project]',
-            ctx=ctx)
+            ctx=ctx,
+            mgr=mgr,
+            action=action)
         if isinstance(resolved, CommandResult):
             return resolved
         scope, rest = resolved
@@ -349,7 +356,9 @@ async def cmd_skills(ctx: CommandContext) -> CommandResult:
             tokens,
             work,
             syntax='/skills remove <id> [global|project]',
-            ctx=ctx)
+            ctx=ctx,
+            mgr=mgr,
+            action='remove')
         if isinstance(resolved, CommandResult):
             return resolved
         scope, rest = resolved
@@ -378,18 +387,74 @@ def _default_skill_scope(work: str | None) -> str:
     return 'project' if work else 'global'
 
 
+def _managed_skill_scopes(mgr, skill_id: str, work: str | None) -> list[str]:
+    """Scopes whose live tree contains ``<id>/SKILL.md``."""
+    found: list[str] = []
+    if (mgr.global_skills_tree() / skill_id / 'SKILL.md').is_file():
+        found.append('global')
+    if work and (mgr.project_skills_tree(work) / skill_id / 'SKILL.md').is_file():
+        found.append('project')
+    return found
+
+
+def _disabled_skill_scopes(mgr, skill_id: str, work: str | None) -> list[str]:
+    found: list[str] = []
+    if skill_id in set(mgr.load_global().get('disabled') or []):
+        found.append('global')
+    if work and skill_id in set(mgr.load_project(work).get('disabled') or []):
+        found.append('project')
+    return found
+
+
+def _pick_existing_skill_scope(mgr, skill_id: str, work: str | None,
+                               action: str) -> str | None:
+    """The one scope that already has this skill, ``both``, or None.
+
+    Enable follows the disabled list when one is set, so a global-only
+    skill that was turned off globally is turned back on there. Disable
+    and remove follow the managed copy on disk.
+    """
+    files = _managed_skill_scopes(mgr, skill_id, work)
+    if action == 'enable':
+        disabled = _disabled_skill_scopes(mgr, skill_id, work)
+        if len(disabled) == 1:
+            return disabled[0]
+        if len(disabled) > 1:
+            return 'both'
+    if len(files) == 1:
+        return files[0]
+    if len(files) > 1:
+        return 'both'
+    return None
+
+
 def _resolve_skill_scope(
     tokens: list[str],
     work: str | None,
     *,
     syntax: str,
     ctx: CommandContext,
+    mgr=None,
+    action: str | None = None,
 ) -> tuple[str, list[str]] | CommandResult:
     if not tokens:
         return arg_error(syntax, ctx=ctx)
     scope, rest = parse_optional_scope(tokens)
     if not rest:
         return arg_error(syntax, ctx=ctx)
+    if scope is None and mgr is not None and action in (
+            'enable', 'disable', 'remove'):
+        skill_id = ' '.join(rest)
+        picked = _pick_existing_skill_scope(mgr, skill_id, work, action)
+        if picked == 'both':
+            return arg_error(
+                syntax,
+                reason=f'{skill_id} exists in both global and project',
+                note='Pass global or project.',
+                ctx=ctx,
+            )
+        if picked:
+            scope = picked
     if scope is None:
         scope = _default_skill_scope(work)
     miss = _need_work(scope, work)

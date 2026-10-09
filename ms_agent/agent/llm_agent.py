@@ -337,6 +337,12 @@ class LLMAgent(Agent):
         # session sidecar or the first build). Drift against this baseline
         # fires a durable update notice on the next user turn.
         self._prompt_surface: Optional[Dict[str, str]] = None
+        # TUI assigns this. Called after the user turn is in hand and before
+        # it is persisted, and once before the opening create_messages.
+        # None on WebUI and every other host.
+        self._on_user_turn = None
+        self._llm_fp: Optional[str] = None
+        self._mcp_fp: Optional[str] = None
 
     async def prepare_skills(self):
         """Initialize the skill system from config.skills.
@@ -1106,6 +1112,13 @@ class LLMAgent(Agent):
                     await flush(timeout=15)
                 except (asyncio.CancelledError, Exception) as e:  # noqa: BLE001
                     logger.debug('memory flush on cleanup failed: %s', e)
+            note = getattr(tool, 'user_notice', None)
+            if note:
+                self._emit_user_notice(str(note))
+                try:
+                    tool.user_notice = None
+                except Exception:
+                    logger.debug('clear memory notice failed', exc_info=True)
 
     @property
     def stream(self):
@@ -2392,9 +2405,19 @@ class LLMAgent(Agent):
 
         yield messages
 
+    def _emit_user_notice(self, text: str) -> None:
+        """One line the user can act on. Not a log-level change."""
+        if self._event_sink is not None:
+            from ms_agent.ui.events import Notice
+            self._event_sink.emit(Notice(level='warning', text=text))
+            return
+        logger.error(text)
+
     def prepare_llm(self):
         """Initialize the LLM model from the configuration."""
         self.llm: LLM = LLM.from_config(self.config)
+        from ms_agent.llm.runtime_token import llm_runtime_token
+        self._llm_fp = llm_runtime_token(self.config)
 
     def _stub_llm_for_setup(self) -> None:
         """Placeholder so slash commands can run before a key exists."""
@@ -2761,6 +2784,8 @@ class LLMAgent(Agent):
                             await self.cleanup_tools()
                             return
                         messages = turn.text
+                        if self._on_user_turn is not None:
+                            await self._on_user_turn(None)
                         # create_messages() below builds the user Message from
                         # this string, so hand the turn's attachments over
                         # out-of-band rather than widening that signature.
@@ -2955,6 +2980,9 @@ class LLMAgent(Agent):
                         messages, add_type='add_after_step', **kwargs)
 
                 await self.after_tool_call(messages)
+                if (self._on_user_turn is not None
+                        and len(messages) > step_end_len):
+                    await self._on_user_turn(messages)
                 # New user turn (interactive multi-turn): attach the durable
                 # augmentations BEFORE the slice below persists them — same
                 # semantics as the round-0 attach. Order: state notice first

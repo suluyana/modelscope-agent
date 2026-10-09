@@ -38,6 +38,39 @@ class TestInteractiveSession:
         assert turn.text == 'research quantum computing'
 
     @pytest.mark.asyncio
+    async def test_mutate_state_refreshes_status_model(self):
+        class Src:
+            def __init__(self):
+                self.model = 'old'
+                self._lines = iter(['/switch', 'task'])
+
+            def note_model(self, model):
+                self.model = model
+
+            async def read_prompt(self, prompt='>>> '):
+                return next(self._lines)
+
+        class LLM:
+            model = 'old'
+            config = None
+
+        runtime = type('RT', (), {'llm': LLM()})()
+
+        async def switch(ctx):
+            ctx.runtime.llm.model = 'gpt-4o'
+            return CommandResult(
+                type=CommandResultType.MUTATE_STATE, content='Switched')
+
+        router = CommandRouter()
+        router.register(CommandDef(name='switch', description='x'), switch)
+        src = Src()
+        session = InteractiveSession(router, input_source=src)
+        turn = await session.run_turn(runtime=runtime)
+        assert src.model == 'gpt-4o'
+        assert turn.action == 'submit'
+        assert turn.text == 'task'
+
+    @pytest.mark.asyncio
     async def test_info_command_then_prompt(self):
         # /help shows output and re-prompts; the next plain line is the task.
         session = _make_session()

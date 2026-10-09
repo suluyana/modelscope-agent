@@ -144,8 +144,27 @@ class InteractiveSession:
             if result.type == CommandResultType.SUBMIT_PROMPT:
                 return InteractiveTurn(action='submit', text=result.content)
             # MESSAGE / MUTATE_STATE: show output and prompt again.
+            if result.type == CommandResultType.MUTATE_STATE:
+                self._sync_model_label(runtime)
             if result.content:
                 self._emit(result.content)
+
+    def _sync_model_label(self, runtime) -> None:
+        """Push the live model id into the TUI status bar, when one is attached."""
+        source = self._input_source
+        note = getattr(source, 'note_model', None)
+        if not callable(note) or runtime is None:
+            return
+        llm = getattr(runtime, 'llm', None)
+        model = str(getattr(llm, 'model', '') or '') if llm is not None else ''
+        if not model and llm is not None:
+            config = getattr(llm, 'config', None)
+            if config is not None:
+                from omegaconf import OmegaConf
+                model = str(
+                    OmegaConf.select(config, 'llm.model', default='') or '')
+        if model:
+            note(model)
 
     def _emit(self, text: str) -> None:
         if self._event_sink is not None:

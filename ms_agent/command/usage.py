@@ -46,6 +46,24 @@ def status_then_usage(status: str, usage: str) -> str:
     return f'{body}\n\n{sheet}'
 
 
+def mask_secrets(text: str) -> str:
+    """Replace high-confidence secret values, using the convert-upload filter."""
+    if not text:
+        return text
+    from ms_agent.agent_hub._secrets import redact_text
+    cleaned, hits = redact_text(text)
+    return cleaned if hits else text
+
+
+def contains_secret(text: str) -> bool:
+    """True when ``text`` itself looks like a credential (``sk-…``, and the same)."""
+    if not text:
+        return False
+    from ms_agent.agent_hub._secrets import redact_text
+    _cleaned, hits = redact_text(text)
+    return bool(hits)
+
+
 def arg_error(
     syntax: str,
     *,
@@ -69,7 +87,7 @@ def arg_error(
         lines.append(text)
     lines.append(f'Need: {syntax}')
     if got:
-        lines.append(f'Got:  {got}')
+        lines.append(f'Got:  {mask_secrets(got)}')
     if note:
         lines.append(note)
     return CommandResult(type=CommandResultType.MESSAGE, content='\n'.join(lines))

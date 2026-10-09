@@ -3,7 +3,8 @@ import os
 from ms_agent.command.router import CommandRouter
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
-from ms_agent.command.usage import arg_error, same_as_webui, status_then_usage
+from ms_agent.command.usage import (arg_error, contains_secret, same_as_webui,
+                                    status_then_usage)
 
 CMD_MODEL = CommandDef(
     name='model',
@@ -98,6 +99,37 @@ def _mgr():
 def _builtin_ids() -> set[str]:
     from ms_agent.llm.spec import get_registry
     return {spec.name for spec in get_registry().list_providers()}
+
+
+def _known_provider_ids() -> list[str]:
+    ids = sorted(_builtin_ids())
+    try:
+        for pid in _mgr().list_custom_providers():
+            name = str(pid)
+            if name not in ids:
+                ids.append(name)
+    except Exception:
+        pass
+    return ids
+
+
+def _unknown_provider_prefix(arg: str) -> str | None:
+    """Lowercase ``provider/model`` head that is not a known provider.
+
+    ``MiniMax/MiniMax-M2.1`` stays a model id (the head is not lowercase).
+    ``dashcope/qwen-max`` looks like a provider typo and must not be saved
+    as the model name on the current provider.
+    """
+    text = (arg or '').strip()
+    if '/' not in text:
+        return None
+    head, rest = text.split('/', 1)
+    head, rest = head.strip(), rest.strip()
+    if not head or not rest or head != head.lower():
+        return None
+    if _canonical_provider(head):
+        return None
+    return head
 
 
 def _canonical_provider(head: str) -> str | None:
@@ -335,6 +367,20 @@ def _effective_api_key(pid: str, override: dict) -> str:
     return ''
 
 
+def _runtime_api_key(config, pid: str) -> str:
+    """Key already on the live agent config, when settings and env have none."""
+    from ms_agent.llm.credentials import CredentialResolver
+    from ms_agent.llm.spec import get_registry
+    spec = get_registry().get(pid)
+    llm = getattr(config, 'llm', None)
+    if spec is None or llm is None:
+        return ''
+    try:
+        return str(CredentialResolver.resolve_api_key(spec, llm) or '').strip()
+    except Exception:
+        return ''
+
+
 def _effective_base_url(pid: str, override: dict) -> str:
     url = str(override.get('base_url') or '').strip()
     if url:
@@ -423,6 +469,8 @@ def _provider_status_lines(mgr, *, live: bool = False,
             lines.append(f'    protocol={proto}  key={key}  url={url}')
     if only_id and len(lines) <= (2 if default else 1):
         lines.append(f'  (no provider named {only})')
+    from ms_agent.llm.model_discovery import LIST_FOOTER
+    lines.append(LIST_FOOTER)
     return lines
 
 
@@ -471,8 +519,7 @@ def _push_provider_to_runtime(ctx: CommandContext, provider_id: str) -> str:
             f' Switch with /model {provider_id} <model> to use this '
             'provider live.')
     TuiApp._apply_provider_credentials(config, overwrite=True)
-    _rebuild_llm(ctx)
-    return ' Live credentials applied.'
+    return ' 下一条消息生效。'
 
 
 def _split_kv(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -551,7 +598,120 @@ async def cmd_model(ctx: CommandContext) -> CommandResult:
     return _cmd_model_switch(ctx, arg)
 
 
+def _secret_model_error(ctx: CommandContext) -> CommandResult:
+    return arg_error(
+        '/model <provider>/<model>',
+        reason='That looks like an API key, not a model id',
+        note='Set a key with /model provider key <provider> <key>',
+        ctx=ctx,
+    )
+
+
+_NO_CATALOG = '已保存。这个地址没有返回模型列表，下一次对话才会确认模型名。'
+
+
+def _probe_saved_provider(pid: str):
+    """Catalog probe for the provider as currently saved. None without key+url."""
+    from ms_agent.llm.model_discovery import probe_model_catalog
+    override = _mgr().list_custom_providers().get(pid) or {}
+    key = _effective_api_key(pid, override)
+    url = _effective_base_url(pid, override)
+    if not key or not url:
+        return None
+    proto = _effective_protocol(pid, {}, override)
+    return probe_model_catalog(url, proto, key)
+
+
+def _provider_snapshot(pid: str) -> dict:
+    entry = _mgr().list_custom_providers().get(pid) or {}
+    return {
+        'api_key': entry.get('api_key'),
+        'base_url': entry.get('base_url'),
+    }
+
+
+def _restore_provider_fields(pid: str, before: dict, fields: set[str]) -> None:
+    mgr = _mgr()
+    if 'api_key' in fields:
+        if before.get('api_key'):
+            mgr.patch_provider(pid, api_key=before['api_key'])
+        else:
+            mgr.patch_provider(pid, clear_api_key=True)
+    if 'base_url' in fields:
+        if before.get('base_url'):
+            mgr.patch_provider(pid, base_url=before['base_url'])
+        else:
+            mgr.patch_provider(pid, clear_base_url=True)
+
+
+def _probe_reject_text(pid: str, outcome: str, fields: set[str],
+                       before: dict) -> str:
+    """User-facing rollback copy. A filled command is a copy aid only."""
+    changed_key = 'api_key' in fields
+    had_key = bool(before.get('api_key'))
+    if outcome == 'auth':
+        if changed_key and had_key:
+            line = '这把密钥用不了，没有换成它。当前仍是原来的密钥。'
+        elif changed_key:
+            line = '这把密钥被供应商拒绝了，没有保存。'
+        else:
+            line = '这把密钥用不了，没有换过去。当前仍是原来的地址。'
+        aid = f'/model provider key {pid} <key>'
+    else:
+        if changed_key and not ('base_url' in fields):
+            if had_key:
+                line = '这个地址连不上，没有换成它。当前仍是原来的密钥。'
+            else:
+                line = '这个地址连不上，没有保存。'
+            aid = f'/model provider key {pid} <key>'
+        else:
+            line = '这个地址连不上，没有换过去。当前仍是原来的地址。'
+            aid = f'/model provider url {pid} <url>'
+    return f'{line}\n可复制：{aid}'
+
+
+def _gate_provider_write(pid: str, before: dict,
+                         fields: set[str]) -> tuple[str | None, str]:
+    """Probe after a key or URL write.
+
+    Returns ``(reject_text, saved_note)``. ``reject_text`` is set only when
+    the write was rolled back. ``saved_note`` is the no-catalog sentence.
+    """
+    if not fields:
+        return None, ''
+    probe = _probe_saved_provider(pid)
+    if probe is None or probe.outcome == 'ok':
+        return None, ''
+    if probe.outcome == 'no_catalog':
+        return None, _NO_CATALOG
+    _restore_provider_fields(pid, before, fields)
+    return _probe_reject_text(pid, probe.outcome, fields, before), ''
+
+
+def _finish_credential_write(ctx: CommandContext, pid: str, before: dict,
+                             fields: set[str], saved: str) -> CommandResult:
+    reject, note = _gate_provider_write(pid, before, fields)
+    if reject:
+        return CommandResult(type=CommandResultType.MESSAGE, content=reject)
+    live = _push_provider_to_runtime(ctx, pid)
+    extra = f' {note}' if note else ''
+    return CommandResult(
+        type=CommandResultType.MESSAGE,
+        content=f'{saved}{live}{extra}',
+    )
+
+
 def _cmd_model_switch(ctx: CommandContext, arg: str) -> CommandResult:
+    unknown = _unknown_provider_prefix(arg)
+    if unknown:
+        known = ', '.join(_known_provider_ids())
+        return arg_error(
+            '/model <provider>/<model>',
+            reason=f'No provider named {unknown}',
+            note=f'Known: {known}' if known else
+            'Add one with /model provider add <provider>',
+            ctx=ctx,
+        )
     service_override, new_model = _parse_model_arg(arg)
     if service_override:
         service_override = _canonical_provider(service_override) or service_override
@@ -565,30 +725,63 @@ def _cmd_model_switch(ctx: CommandContext, arg: str) -> CommandResult:
         config, target)
     new_model = _strip_provider_prefix(
         service_override or old_service, new_model)
+    if contains_secret(new_model):
+        return _secret_model_error(ctx)
+
+    def _revert_switch() -> None:
+        OmegaConf.update(config, 'llm.model', old_model, merge=True)
+        if old_service:
+            OmegaConf.update(config, 'llm.service', old_service, merge=True)
+            TuiApp._apply_provider_credentials(config, overwrite=True)
+        target.model = old_model
 
     OmegaConf.update(config, 'llm.model', new_model, merge=True)
     if service_override:
         OmegaConf.update(config, 'llm.service', service_override, merge=True)
         TuiApp._apply_provider_credentials(config, overwrite=True)
 
-    if not _rebuild_llm(ctx):
-        OmegaConf.update(config, 'llm.model', old_model, merge=True)
-        if old_service:
-            OmegaConf.update(config, 'llm.service', old_service, merge=True)
-            TuiApp._apply_provider_credentials(config, overwrite=True)
-        target.model = old_model
+    settings_provider = service_override or str(
+        getattr(getattr(config, 'llm', None), 'service', '') or '') or None
+    pid = settings_provider or ''
+    override = _mgr().list_custom_providers().get(pid) or {}
+    # Settings/env keys are probed. A key that already lives on this agent
+    # config is enough to keep the switch; the next message builds the client.
+    if not (_effective_api_key(pid, override) or _runtime_api_key(config, pid)):
+        _revert_switch()
         return CommandResult(
             type=CommandResultType.MESSAGE,
             content=_switch_fail_text(
                 service_override, new_model, old_service, old_model),
         )
 
-    settings_provider = service_override or str(
-        getattr(getattr(config, 'llm', None), 'service', '') or '') or None
+    from ms_agent.llm.model_discovery import nearby_model_ids
+    probe = _probe_saved_provider(pid)
+    if probe is not None and probe.outcome in ('auth', 'unreachable'):
+        _revert_switch()
+        return CommandResult(
+            type=CommandResultType.MESSAGE,
+            content=_probe_reject_text(
+                pid, probe.outcome,
+                {'api_key'} if probe.outcome == 'auth' else {'base_url'},
+                {'api_key': override.get('api_key'),
+                 'base_url': override.get('base_url')}),
+        )
+    if probe is not None and probe.outcome == 'ok' and new_model not in probe.ids:
+        _revert_switch()
+        near = ', '.join(nearby_model_ids(new_model, probe.ids)) or '(none)'
+        return CommandResult(
+            type=CommandResultType.MESSAGE,
+            content=(f'列表里没有 {new_model}。相近的有：{near}。'
+                     '没有改默认模型。'),
+        )
+
+    target.model = new_model
     _mgr().set_default_model(new_model, provider=settings_provider)
     content = 'Switched to:\n' + _current_model_text(
         settings_provider, new_model, ctx.runtime.llm)
-    content += 'Saved as the default (same as WebUI).'
+    content += 'Saved as the default (same as WebUI). 下一条消息使用它。'
+    if probe is not None and probe.outcome == 'no_catalog':
+        content += '\n' + _NO_CATALOG
     return CommandResult(
         type=CommandResultType.MUTATE_STATE,
         content=content,
@@ -618,6 +811,7 @@ def _cmd_model_provider(ctx: CommandContext, tokens: list[str]) -> CommandResult
             )
         pid = names[0]
         fields = _kv_alias(fields)
+        before = _provider_snapshot(pid)
         mgr.add_provider(
             pid,
             name=fields.get('name') or pid,
@@ -625,11 +819,9 @@ def _cmd_model_provider(ctx: CommandContext, tokens: list[str]) -> CommandResult
             api_key=fields.get('api_key'),
             base_url=fields.get('base_url'),
         )
-        note = _push_provider_to_runtime(ctx, pid)
-        return CommandResult(
-            type=CommandResultType.MESSAGE,
-            content=f'Provider {pid} saved.{note}',
-        )
+        touched = {k for k in ('api_key', 'base_url') if fields.get(k)}
+        return _finish_credential_write(
+            ctx, pid, before, touched, f'Provider {pid} saved.')
     if action in ('set', 'update'):
         names, fields = _split_kv(rest)
         if not names:
@@ -645,6 +837,7 @@ def _cmd_model_provider(ctx: CommandContext, tokens: list[str]) -> CommandResult
                 reason='No fields to patch',
                 ctx=ctx,
             )
+        before = _provider_snapshot(pid)
         mgr.patch_provider(
             pid,
             name=fields.get('name'),
@@ -654,11 +847,9 @@ def _cmd_model_provider(ctx: CommandContext, tokens: list[str]) -> CommandResult
             clear_api_key=fields.get('api_key', None) == '',
             clear_base_url=fields.get('base_url', None) == '',
         )
-        note = _push_provider_to_runtime(ctx, pid)
-        return CommandResult(
-            type=CommandResultType.MESSAGE,
-            content=f'Updated provider {pid}.{note}',
-        )
+        touched = {k for k in ('api_key', 'base_url') if k in fields}
+        return _finish_credential_write(
+            ctx, pid, before, touched, f'Updated provider {pid}.')
     if action == 'key':
         if len(rest) < 2:
             return arg_error(
@@ -673,12 +864,10 @@ def _cmd_model_provider(ctx: CommandContext, tokens: list[str]) -> CommandResult
                 type=CommandResultType.MESSAGE,
                 content=f'Cleared API key for {pid}.{note}',
             )
+        before = _provider_snapshot(pid)
         mgr.patch_provider(pid, api_key=value)
-        note = _push_provider_to_runtime(ctx, pid)
-        return CommandResult(
-            type=CommandResultType.MESSAGE,
-            content=f'Saved API key for {pid}.{note}',
-        )
+        return _finish_credential_write(
+            ctx, pid, before, {'api_key'}, f'Saved API key for {pid}.')
     if action in ('url', 'base_url'):
         if len(rest) < 2:
             return arg_error(
@@ -693,12 +882,10 @@ def _cmd_model_provider(ctx: CommandContext, tokens: list[str]) -> CommandResult
                 type=CommandResultType.MESSAGE,
                 content=f'Cleared base URL for {pid}.{note}',
             )
+        before = _provider_snapshot(pid)
         mgr.patch_provider(pid, base_url=value)
-        note = _push_provider_to_runtime(ctx, pid)
-        return CommandResult(
-            type=CommandResultType.MESSAGE,
-            content=f'Saved base URL for {pid}.{note}',
-        )
+        return _finish_credential_write(
+            ctx, pid, before, {'base_url'}, f'Saved base URL for {pid}.')
     if action == 'remove':
         if not rest:
             return arg_error(
@@ -804,6 +991,13 @@ def _cmd_model_catalog(ctx: CommandContext,
     if inferred:
         where += ' (current provider)'
     if action == 'add':
+        if contains_secret(model):
+            return arg_error(
+                '/model catalog add <provider> <model>',
+                reason='That looks like an API key, not a model id',
+                note='Set a key with /model provider key <provider> <key>',
+                ctx=ctx,
+            )
         mgr.add_model(pid, model)
         return CommandResult(
             type=CommandResultType.MESSAGE,
@@ -831,6 +1025,32 @@ def _cmd_model_catalog(ctx: CommandContext,
     )
 
 
+def _mask_config_secrets(node) -> None:
+    """Blank secret-shaped keys and entire ``headers`` / ``env`` bags.
+
+    Same vocabulary as convert upload (``is_secret_key``), so ``/config``
+    masks search keys and MCP header tokens the way it already masks
+    ``llm`` API keys.
+    """
+    from ms_agent.agent_hub._workspace import SECRET_BAG_KEYS, is_secret_key
+
+    if isinstance(node, dict):
+        for key, val in list(node.items()):
+            if key in SECRET_BAG_KEYS and isinstance(val, dict):
+                node[key] = {
+                    inner: '***' if inner_val not in (None, '') else inner_val
+                    for inner, inner_val in val.items()
+                }
+            elif is_secret_key(str(key)) and not isinstance(val, (dict, list)):
+                if val not in (None, ''):
+                    node[key] = '***'
+            else:
+                _mask_config_secrets(val)
+    elif isinstance(node, list):
+        for item in node:
+            _mask_config_secrets(item)
+
+
 async def cmd_config(ctx: CommandContext) -> CommandResult:
     if not ctx.runtime or not ctx.runtime.llm:
         return CommandResult(
@@ -839,11 +1059,8 @@ async def cmd_config(ctx: CommandContext) -> CommandResult:
     config = ctx.runtime.llm.config
     from omegaconf import OmegaConf
 
-    # mask sensitive info
     safe = OmegaConf.to_container(config, resolve=True)
-    for key in list(safe.get('llm', {}).keys()):
-        if 'key' in key.lower():
-            safe['llm'][key] = '***'
+    _mask_config_secrets(safe)
 
     import yaml
 

@@ -318,6 +318,76 @@ class TestSkillsCommand:
         assert 'project' in proj.get('disabled', [])
 
     @pytest.mark.asyncio
+    async def test_enable_without_scope_uses_existing_global_copy(
+            self, tmp_path, isolate_home):
+        mgr = SkillsConfigManager(str(isolate_home))
+        skill = mgr.global_skills_tree() / 'g-only'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('# G\n')
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        router = make_router()
+        disabled = await router.dispatch(
+            make_ctx('/skills disable g-only global', runtime))
+        assert 'disable g-only (global)' in disabled.content
+        enabled = await router.dispatch(
+            make_ctx('/skills enable g-only', runtime))
+        assert 'enable g-only (global)' in enabled.content
+        assert 'g-only' not in (mgr.load_global().get('disabled') or [])
+        project = mgr.load_project(str(work))
+        assert 'g-only' not in (project.get('disabled') or [])
+
+    @pytest.mark.asyncio
+    async def test_remove_without_scope_deletes_existing_global_copy(
+            self, tmp_path, isolate_home):
+        mgr = SkillsConfigManager(str(isolate_home))
+        skill = mgr.global_skills_tree() / 'g-only'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('# G\n')
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        result = await make_router().dispatch(
+            make_ctx('/skills remove g-only', runtime))
+        assert 'Removed managed skill g-only' in result.content
+        assert 'not a managed skill' not in result.content
+        assert not skill.exists()
+
+    @pytest.mark.asyncio
+    async def test_enable_without_scope_asks_when_both_copies_exist(
+            self, tmp_path, isolate_home):
+        mgr = SkillsConfigManager(str(isolate_home))
+        work = tmp_path / 'repo'
+        work.mkdir()
+        for root in (
+                mgr.global_skills_tree(),
+                mgr.project_skills_tree(str(work)),
+        ):
+            skill = root / 'g-only'
+            skill.mkdir(parents=True)
+            (skill / 'SKILL.md').write_text('# G\n')
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        result = await make_router().dispatch(
+            make_ctx('/skills enable g-only', runtime))
+        assert 'both global and project' in result.content
+
+    @pytest.mark.asyncio
+    async def test_mcp_add_server_named_project(self, tmp_path, isolate_home):
+        work = tmp_path / 'repo'
+        work.mkdir()
+        runtime = MockRuntime(
+            config=OmegaConf.create({'output_dir': str(work)}))
+        result = await make_router().dispatch(
+            make_ctx(
+                '/mcp add project url=https://example.invalid/mcp', runtime))
+        assert 'Added project (project)' in result.content
+        assert 'Need:' not in result.content
+
+    @pytest.mark.asyncio
     async def test_alias_skill_mgr(self):
         result = await make_router().dispatch(make_ctx('/skill-mgr'))
         assert '/skills add' in result.content

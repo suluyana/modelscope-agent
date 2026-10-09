@@ -57,6 +57,9 @@ TUI_RESOLVER_DEFAULTS = {
     # (update-config, …). An empty ``{}`` is falsy under OmegaConf.
     'skills': {
         'prompt_injection': 'all',
+        # Freeze the skill section for the session. Changes are announced
+        # on the next user message (see tui/live_config.py).
+        'update_notice': True,
     },
 }
 
@@ -131,11 +134,25 @@ class TuiApp:
         # Build the agent ONCE with the UI seams injected. load_cache is set
         # per session by _apply_session (True only on resume).
         from ms_agent.agent.llm_agent import LLMAgent
+        from ms_agent.config.mcp_schema import ResolvedMCPConfig
+        from ms_agent.mcp.runtime import MCPRuntime
+        from ms_agent.tui.live_config import apply_live_config
+        servers = {}
+        if isinstance(self._mcp_config, dict):
+            servers = dict(self._mcp_config.get('mcpServers') or {})
+        mcp_runtime = MCPRuntime(
+            config=ResolvedMCPConfig(mcp_servers=servers))
         self.agent = LLMAgent(
             config,
             trust_remote_code=trust_remote_code,
             event_sink=event_sink,
-            mcp_config=self._mcp_config)
+            mcp_config=self._mcp_config,
+            mcp_runtime=mcp_runtime)
+
+        async def _on_user_turn(messages):
+            await apply_live_config(self.agent, messages)
+
+        self.agent._on_user_turn = _on_user_turn
 
         # Consume the agent's single command router (no duplicate); register the
         # TUI session commands and drive input through it (slash completion).
@@ -685,7 +702,7 @@ class TuiApp:
         # Do not wipe empty sessions on startup: WebUI may have created a
         # chat the user has not typed into yet. Empty leftovers from *this*
         # TUI process are pruned when leaving the session (below).
-        self.session = self._sm.create(model=self._model or None)
+        self.session = self._sm.create(model=self.state.model or None)
         self._owned_session_ids.add(self.session.id)
         resume = False  # a fresh session reads a prompt; a resumed one restores
         self.renderer.rule(f'session {self.session.id}', 'green')
@@ -720,9 +737,9 @@ class TuiApp:
                 resume = True
                 continue
             except Exception as e:  # noqa: BLE001 — surface, don't crash the REPL
-                if isinstance(e, RuntimeError) and (
-                        'cancel scope' in str(e) or 'athrow()' in str(e)):
-                    break
+                # A leaked MCP cancel-scope error is teardown noise, not a
+                # request to leave. cleanup_tools already swallows it on
+                # /quit; if it still surfaces mid-turn, stay in the session.
                 self.renderer.finalize()
                 if self._is_missing_api_key(e):
                     logger.info('TUI waiting for API key: %s', e)
@@ -744,6 +761,13 @@ class TuiApp:
                 # (two identical errors, then "bye"). Keep the REPL so the
                 # user can /model switch or try again. resume=True restores
                 # the sealed failed turn instead of resending it.
+                from ms_agent.llm.model_discovery import (
+                    CHAT_UNSUPPORTED,
+                    chat_failed_because_unsupported,
+                )
+                model = self.state.model or ''
+                if chat_failed_because_unsupported(model, str(e)):
+                    self.console.print(CHAT_UNSUPPORTED)
                 self.console.print(
                     '[dim](turn failed — session still open, '
                     '/model to switch, /quit to exit)[/]')
@@ -761,7 +785,7 @@ class TuiApp:
                 break  # user quit
             kind = switch[0]
             if kind == 'new':
-                self.session = self._sm.create(model=self._model or None)
+                self.session = self._sm.create(model=self.state.model or None)
                 self._owned_session_ids.add(self.session.id)
                 resume = False
                 self.renderer.rule(f'new session {self.session.id}', 'green')

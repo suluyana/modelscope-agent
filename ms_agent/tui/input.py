@@ -116,6 +116,11 @@ class PromptToolkitInput:
         except Exception:
             return None
 
+    def note_model(self, model: str) -> None:
+        """Refresh the status-bar model after a command mutates it."""
+        if model:
+            self._state.model = str(model)
+
     def _toolbar(self):
         s = self._state
         parts = []

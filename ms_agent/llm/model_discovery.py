@@ -8,7 +8,8 @@ TUI listing — the endpoint itself usually returns every product on the key.
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -65,31 +66,103 @@ def wire_protocol(protocol_or_transport: str) -> str:
     return 'openai'
 
 
-def fetch_model_ids(base_url: str, protocol: str, api_key: str) -> List[str]:
-    """Return available model ids, or [] on any failure."""
+#: Shown under a model picker. Non-chat ids may remain; the line says so.
+LIST_FOOTER = (
+    '此列表供选择对话模型。其中可能包含生图、视频、语音或向量模型，'
+    '这些模型不支持当前对话。')
+
+#: Shown when a turn fails because the selected model cannot chat.
+CHAT_UNSUPPORTED = '该模型不支持对话。请重新选择对话模型。'
+
+_CHAT_UNSUPPORTED_MARKERS = (
+    'does not support chat',
+    'not a chat model',
+    'unsupported for chat',
+    'only supports embeddings',
+    'image generation model',
+)
+
+
+@dataclass
+class CatalogProbe:
+    """Result of GET {base}/models. ``status`` is None when nothing answered.
+
+    ``outcome`` is ``ok`` (ids parsed), ``auth`` (401/403), ``unreachable``
+    (connection or timeout), or ``no_catalog`` (404, empty, or unknown body).
+    """
+
+    outcome: str
+    status: Optional[int]
+    ids: List[str]
+
+
+def probe_model_catalog(base_url: str, protocol: str,
+                        api_key: str) -> CatalogProbe:
+    """GET the provider model list and keep the HTTP outcome.
+
+    A missing catalog is not "the model id is absent". Callers that only
+    need ids should use :func:`fetch_model_ids`.
+    """
     if not base_url:
-        return []
+        return CatalogProbe('no_catalog', None, [])
     base = base_url.rstrip('/')
+    if wire_protocol(protocol) == 'anthropic':
+        if not base.endswith('/v1'):
+            base = f'{base}/v1'
+        url = f'{base}/models'
+        headers = {'anthropic-version': '2023-06-01'}
+        if api_key:
+            headers['x-api-key'] = api_key
+    else:
+        url = f'{base}/models'
+        headers = {}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
     try:
-        if wire_protocol(protocol) == 'anthropic':
-            if not base.endswith('/v1'):
-                base = f'{base}/v1'
-            url = f'{base}/models'
-            headers = {'anthropic-version': '2023-06-01'}
-            if api_key:
-                headers['x-api-key'] = api_key
-        else:
-            url = f'{base}/models'
-            headers = {}
-            if api_key:
-                headers['Authorization'] = f'Bearer {api_key}'
         with httpx.Client(timeout=8) as client:
             resp = client.get(url, headers=headers)
-            if resp.status_code // 100 != 2:
-                return []
-            return parse_model_ids(resp.json())
+    except (httpx.TimeoutException, httpx.TransportError):
+        return CatalogProbe('unreachable', None, [])
     except Exception:
+        return CatalogProbe('unreachable', None, [])
+    code = resp.status_code
+    if code in (401, 403):
+        return CatalogProbe('auth', code, [])
+    if code // 100 != 2:
+        return CatalogProbe('no_catalog', code, [])
+    try:
+        ids = parse_model_ids(resp.json())
+    except Exception:
+        return CatalogProbe('no_catalog', code, [])
+    if not ids:
+        return CatalogProbe('no_catalog', code, [])
+    return CatalogProbe('ok', code, ids)
+
+
+def fetch_model_ids(base_url: str, protocol: str, api_key: str) -> List[str]:
+    """Return available model ids, or [] when the catalog cannot be read."""
+    probe = probe_model_catalog(base_url, protocol, api_key)
+    if probe.outcome != 'ok':
         return []
+    return probe.ids
+
+
+def nearby_model_ids(wanted: str, ids: Sequence[str], n: int = 5) -> List[str]:
+    """A few catalog names close to ``wanted``, else the first ``n`` ids."""
+    import difflib
+    pool = list(ids)
+    hits = difflib.get_close_matches(wanted, pool, n=n, cutoff=0.4)
+    if hits:
+        return hits
+    return pool[:n]
+
+
+def chat_failed_because_unsupported(model_id: str, error: str = '') -> bool:
+    """Whether a failed turn should use :data:`CHAT_UNSUPPORTED`."""
+    if is_non_chat_model(model_id or ''):
+        return True
+    low = (error or '').lower()
+    return any(marker in low for marker in _CHAT_UNSUPPORTED_MARKERS)
 
 
 def format_id_list(ids: Iterable[str], *, limit: int = 40) -> str:

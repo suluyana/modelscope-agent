@@ -26,7 +26,9 @@ if scope is unclear.
 
 1. Facts live in `{memory_md}`.
 2. Creating that file does **nothing** until the **project** memory flag is
-   on. TUI: `/memory on` then `/new`. WebUI: the project memory toggle.
+   on. TUI: `/memory on` — the next user message in this session picks it
+   up. WebUI: the project memory toggle. Do not tell the user to `/new`
+   first.
 3. **Do not** add `memory.unified_memory` (or any memory block) to
    `{work}/.ms_agent/config.yaml` or to agent.yaml. That is not how this
    product enables memory.
@@ -69,8 +71,8 @@ stdio:
 }
 ```
 
-New servers connect this session when possible; otherwise tell the user
-`/new` or restart.
+Edits apply on the next user message in this session. Do not tell the
+user to `/new` or restart for a server that was just saved.
 
 ## Workflow
 

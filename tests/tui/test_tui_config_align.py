@@ -352,6 +352,7 @@ async def test_serve_keeps_repl_after_turn_api_error():
     app._queued_query = None
     app._pending_switch = None
     app._model = 'm'
+    app.state = TuiState(model='m')
     app._owned_session_ids = set()
     session = SimpleNamespace(id='s1', name='Session 1')
     app._sm = MagicMock()
@@ -388,3 +389,44 @@ async def test_serve_keeps_repl_after_turn_api_error():
     assert '/quit to exit' in out
     assert 'The product is not activated' not in out  # no duplicate crash panel
     assert out.strip().endswith('bye') or 'bye' in out
+
+
+@pytest.mark.asyncio
+async def test_serve_stays_open_on_cancel_scope_error():
+    """A leaked MCP cancel-scope error must not quit the TUI."""
+    from unittest.mock import MagicMock
+
+    app = TuiApp.__new__(TuiApp)
+    buf = io.StringIO()
+    app.console = Console(file=buf, force_terminal=False, width=100)
+    app.renderer = MagicMock()
+    app._queued_query = None
+    app._pending_switch = None
+    app._model = 'm'
+    app.state = TuiState(model='m')
+    app._owned_session_ids = set()
+    session = SimpleNamespace(id='s1', name='Session 1')
+    app._sm = MagicMock()
+    app._sm.create.return_value = session
+    app.session = None
+    app._banner = lambda: None
+    app._apply_session = lambda sess, resume=False: setattr(app, 'session', sess)
+    app._name_session_from_log = lambda: None
+    app._prune_if_empty = lambda s: None
+
+    runs = {'n': 0}
+
+    async def fake_run(query=None, stream=True):
+        runs['n'] += 1
+        if runs['n'] == 1:
+            raise RuntimeError(
+                'Attempted to exit cancel scope in a different task')
+        raise EOFError()
+
+    app.agent = SimpleNamespace(run=fake_run)
+
+    await app._serve()
+    out = buf.getvalue()
+    assert runs['n'] == 2
+    assert 'session still open' in out
+    assert 'bye' in out

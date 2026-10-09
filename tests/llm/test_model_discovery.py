@@ -119,6 +119,47 @@ def test_fetch_model_ids_ok():
     assert kwargs['headers']['Authorization'] == 'Bearer sk'
 
 
+def test_probe_keeps_auth_status():
+    from ms_agent.llm.model_discovery import probe_model_catalog
+    resp = MagicMock(status_code=401)
+    client = MagicMock()
+    client.get.return_value = resp
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    with patch('ms_agent.llm.model_discovery.httpx.Client', return_value=client):
+        probe = probe_model_catalog('https://example.invalid/v1', 'openai', 'sk')
+    assert probe.outcome == 'auth'
+    assert probe.status == 401
+    assert probe.ids == []
+
+
+def test_probe_empty_body_is_not_a_missing_id():
+    from ms_agent.llm.model_discovery import probe_model_catalog
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'unexpected': True}
+    client = MagicMock()
+    client.get.return_value = resp
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    with patch('ms_agent.llm.model_discovery.httpx.Client', return_value=client):
+        probe = probe_model_catalog('https://example.invalid/v1', 'openai', 'sk')
+    assert probe.outcome == 'no_catalog'
+    assert probe.status == 200
+
+
+def test_probe_timeout_is_unreachable():
+    import httpx
+    from ms_agent.llm.model_discovery import probe_model_catalog
+    client = MagicMock()
+    client.get.side_effect = httpx.ConnectError('nope')
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    with patch('ms_agent.llm.model_discovery.httpx.Client', return_value=client):
+        probe = probe_model_catalog('https://example.invalid/v1', 'openai', 'sk')
+    assert probe.outcome == 'unreachable'
+    assert probe.status is None
+
+
 def test_fetch_model_ids_non_2xx():
     resp = MagicMock(status_code=401)
     client = MagicMock()

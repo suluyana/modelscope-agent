@@ -464,8 +464,8 @@ def write_project_instruction(work_dir: str, content: str) -> None:
     """Write the private slot only; never touch ``<work>/AGENTS.md``."""
     _migrate_legacy_project_instruction(work_dir)
     body = content.strip()
-    _atomic_write(project_instruction_path(work_dir),
-                  body + '\n' if body else '')
+    atomic_write_text(project_instruction_path(work_dir),
+                      body + '\n' if body else '')
     # Always drop the leftover JSON field so an empty private file cannot be
     # re-filled from a stale project.instruction on the next read.
     _clear_project_instruction_field(work_dir)
@@ -538,7 +538,7 @@ def _migrate_legacy_project_instruction(work_dir: str) -> str:
         legacy = (project.instruction or '').strip()
         if not legacy:
             return existing
-        _atomic_write(path, legacy + '\n')
+        atomic_write_text(path, legacy + '\n')
         _clear_project_instruction_field(work_dir)
         return legacy + '\n'
     except Exception:

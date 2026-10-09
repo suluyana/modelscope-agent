@@ -83,26 +83,14 @@ async def _apply_live(ctx: CommandContext, project) -> str:
     agent = ctx.runtime
     cfg = getattr(agent, 'config', None) if agent is not None else None
     if cfg is None:
-        return 'Takes effect on /new or restart.'
+        return '已保存。下一条消息生效。'
     kind = apply_project_memory(cfg, project)
-    if kind == 'off':
-        return 'Saved. /new to drop memory tools already loaded this session.'
     if kind == 'vector-unavailable':
         return (
             'Saved vector backend for WebUI. TUI does not start vector/mem0 '
-            'this session (no silent file fallback). Use /memory project '
-            'backend file or open the project in WebUI.')
-    tools = getattr(agent, 'memory_tools', None) or []
-    if tools:
-        return 'Saved. Memory already loaded; /new to rebuild.'
-    load = getattr(agent, 'load_memory', None)
-    if load is None:
-        return 'Saved. /new to apply.'
-    try:
-        await load()
-        return 'Memory tools registered for this session.'
-    except Exception as exc:  # noqa: BLE001
-        return f'Saved; load failed ({exc}). /new to apply.'
+            '(no silent file fallback). Use /memory project backend file '
+            'or open the project in WebUI.')
+    return '下一条消息生效。'
 
 
 async def cmd_memory(ctx: CommandContext) -> CommandResult:
@@ -212,7 +200,7 @@ def _cmd_backend(
             type=CommandResultType.MESSAGE,
             content=(
                 f'Project memory backend → {backend}. '
-                '/memory on (and /new) to apply. Vector is WebUI-owned.'),
+                '下一条消息生效。Vector is WebUI-owned.'),
         )
 
     settings = PersonalizationSettings()
