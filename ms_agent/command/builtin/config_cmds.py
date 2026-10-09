@@ -3,12 +3,12 @@ import os
 from ms_agent.command.router import CommandRouter
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
-from ms_agent.command.usage import (arg_error, contains_secret, same_as_webui,
+from ms_agent.command.usage import (arg_error, contains_secret, ledger_file,
                                     status_then_usage)
 
 CMD_MODEL = CommandDef(
     name='model',
-    description='Show, switch, or manage model providers (shared with WebUI)',
+    description='Show, switch, or manage model providers',
     category='config',
 )
 
@@ -24,7 +24,7 @@ def _model_usage() -> str:
     return (
         'usage:\n'
         '  /model                         show current provider + model\n'
-        '  /model list                    saved providers (same as WebUI)\n'
+        '  /model list                    saved providers\n'
         '  /model list live [provider]    fetch chat model ids; preview only\n'
         '  /model <model>                 switch model, keep current provider\n'
         '  /model <provider>/<model>      switch both; <provider> must be lowercase\n'
@@ -46,7 +46,7 @@ def _model_usage() -> str:
         '  /model catalog remove <model>  same, on the current provider\n'
         '<provider>  first column of /model list, e.g. dashscope\n'
         '<model>     model id on that provider, e.g. qwen3.8-flash\n'
-        f'{same_as_webui("settings.json")}\n'
+        f'Saved in {ledger_file("settings.json")}.\n'
         'Example: /model dashscope qwen3.8-flash'
     )
 
@@ -57,9 +57,10 @@ _CLEAR = frozenset({'clear', '-', 'none'})
 def _persist_model_to_config(config, new_model: str, service=None):
     """Write a work-dir ``.ms_agent/config.yaml`` pin (not used by ``/model``).
 
-    ``/model`` persists only the WebUI-shared ``default_model`` in settings.json
-    so a later WebUI default still wins on the next TUI launch. This helper
-    remains for callers that explicitly want a folder pin; that patch still
+    ``/model`` does not use this. It writes the shared ``default_model`` (what
+    the next new chat starts on) and the current session's own model. A folder
+    pin would force every conversation in the work dir onto one model. This
+    helper remains for callers that explicitly want that pin; the patch still
     outranks the global default when present.
     """
     from omegaconf import OmegaConf
@@ -435,7 +436,7 @@ def _provider_status_lines(mgr, *, live: bool = False,
             'Providers (live /models; preview only):'
         ]
     else:
-        lines = ['Providers (same as WebUI):']
+        lines = ['Providers:']
     default = mgr.get_default_model()
     if default:
         lines.append(f'Default: {default}')
@@ -777,9 +778,18 @@ def _cmd_model_switch(ctx: CommandContext, arg: str) -> CommandResult:
 
     target.model = new_model
     _mgr().set_default_model(new_model, provider=settings_provider)
+    # The default is what the next new chat starts on. This chat keeps the
+    # same choice on its own session record, so coming back later does not
+    # depend on the default still pointing here.
+    from ms_agent.project.session import persist_logged_session_model
+    try:
+        persist_logged_session_model(config, new_model, settings_provider)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug(
+            'session model persist failed', exc_info=True)
     content = 'Switched to:\n' + _current_model_text(
         settings_provider, new_model, ctx.runtime.llm)
-    content += 'Saved as the default (same as WebUI). 下一条消息使用它。'
     if probe is not None and probe.outcome == 'no_catalog':
         content += '\n' + _NO_CATALOG
     return CommandResult(

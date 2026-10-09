@@ -21,16 +21,6 @@ def ledger_file(rel: str) -> str:
     return f'{ledger_dir()}/{rel}'
 
 
-def same_as_webui(rel: str = '') -> str:
-    """Shared-ledger line: live path, then the env var that produced it.
-
-    The path is not a secret. Showing only ``MS_AGENT_HOME`` makes a person
-    expand it themselves; showing only ``~/.ms_agent`` lies when the env is set.
-    """
-    loc = ledger_file(rel) if rel else ledger_dir()
-    return f'Same as WebUI: {loc} (from MS_AGENT_HOME).'
-
-
 def status_then_usage(status: str, usage: str) -> str:
     """Bare ``/cmd``: a short identity card, then the usage sheet.
 

@@ -81,6 +81,88 @@ def test_prepare_config_merges_personalization(tmp_path, monkeypatch):
     assert out.personalization.global_instruction == 'Be brief.'
 
 
+def test_new_conversation_uses_default_not_the_live_model(tmp_path, monkeypatch):
+    """A new chat starts on the global default, even if the agent is still
+    sitting on an older conversation's model."""
+    from ms_agent.config.model_settings import ModelSettingsManager
+
+    home = tmp_path / 'home'
+    monkeypatch.setenv('MS_AGENT_HOME', str(home))
+    work = tmp_path / 'repo'
+    work.mkdir()
+    ModelSettingsManager(home).set_default_model('new-model', provider='openai')
+    app = TuiApp.__new__(TuiApp)
+    app._project = TuiApp._open_project(str(work))
+    app._sm = SessionManager(app._project)
+    app.agent = SimpleNamespace(
+        config=OmegaConf.create({
+            'llm': {'service': 'openai', 'model': 'old-model'},
+        }),
+    )
+    app.state = TuiState(model='old-model', perm='auto', work_dir=str(work))
+    session = app._open_conversation()
+    assert session.model == 'new-model'
+    assert session.model_provider == 'openai'
+    assert ModelSettingsManager(home).get_default_model() == 'openai/new-model'
+
+
+def test_apply_session_restores_model_without_changing_default(
+        tmp_path, monkeypatch):
+    from ms_agent.config.model_settings import ModelSettingsManager
+
+    home = tmp_path / 'home'
+    monkeypatch.setenv('MS_AGENT_HOME', str(home))
+    work = tmp_path / 'repo'
+    work.mkdir()
+    ModelSettingsManager(home).set_default_model('new-model', provider='openai')
+    app = TuiApp.__new__(TuiApp)
+    app._project = TuiApp._open_project(str(work))
+    app._sm = SessionManager(app._project)
+    session = app._sm.create(
+        name='older', model='old-model', model_provider='other')
+    app.agent = SimpleNamespace(
+        config=OmegaConf.create({
+            'llm': {'service': 'openai', 'model': 'new-model'},
+        }),
+        load_cache=False,
+    )
+    app.state = TuiState(model='new-model', perm='auto', work_dir=str(work))
+    app._apply_session(session, resume=True)
+    assert app.agent.config.llm.model == 'old-model'
+    assert app.agent.config.llm.service == 'other'
+    assert app.state.model == 'old-model'
+    assert ModelSettingsManager(home).get_default_model() == 'openai/new-model'
+    stored = app._sm.get(session.id)
+    assert stored.model == 'old-model'
+    assert stored.model_provider == 'other'
+
+
+def test_resume_without_stored_model_follows_default(tmp_path, monkeypatch):
+    from ms_agent.config.model_settings import ModelSettingsManager
+
+    home = tmp_path / 'home'
+    monkeypatch.setenv('MS_AGENT_HOME', str(home))
+    work = tmp_path / 'repo'
+    work.mkdir()
+    ModelSettingsManager(home).set_default_model('new-model', provider='openai')
+    app = TuiApp.__new__(TuiApp)
+    app._project = TuiApp._open_project(str(work))
+    app._sm = SessionManager(app._project)
+    session = app._sm.create(name='legacy')
+    app.agent = SimpleNamespace(
+        config=OmegaConf.create({
+            'llm': {'service': 'openai', 'model': 'previous-chat'},
+        }),
+        load_cache=False,
+    )
+    app.state = TuiState(
+        model='previous-chat', perm='auto', work_dir=str(work))
+    app._apply_session(session, resume=True)
+    assert app.agent.config.llm.model == 'new-model'
+    assert app.state.model == 'new-model'
+    assert app._sm.get(session.id).model is None
+
+
 def test_apply_session_binds_plan_to_session_dir(tmp_path, monkeypatch):
     home = tmp_path / 'home'
     monkeypatch.setenv('MS_AGENT_HOME', str(home))

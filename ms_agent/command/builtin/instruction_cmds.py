@@ -7,19 +7,18 @@ from ms_agent.command.router import CommandRouter
 from ms_agent.command.scope import work_dir_of
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
-from ms_agent.command.usage import (arg_error, ledger_file, same_as_webui,
-                                    status_then_usage)
+from ms_agent.command.usage import arg_error, ledger_file, status_then_usage
 
 CMD_INSTRUCTION = CommandDef(
     name='instruction',
-    description='Show or set AGENTS.md instructions (shared with WebUI)',
+    description='Show or set AGENTS.md instructions',
     category='config',
     aliases=('ins', ),
 )
 
 CMD_PROFILE = CommandDef(
     name='profile',
-    description='Show or set PROFILE.md (shared with WebUI)',
+    description='Show or set PROFILE.md',
     category='config',
 )
 
@@ -34,7 +33,6 @@ def _ins_usage() -> str:
         f'Global → {ledger_file("AGENTS.md")} '
         '(user region under the seeded header).\n'
         'Project → <work>/.ms_agent/AGENTS.md (never the repo-root AGENTS.md).\n'
-        f'{same_as_webui("AGENTS.md")} '
         'Takes effect on the next turn (files are read live).'
     )
 
@@ -48,7 +46,6 @@ def _profile_usage() -> str:
         '  /profile about <text>\n'
         '  /profile about clear\n'
         f'Writes {ledger_file("PROFILE.md")} (Call me line + free region). '
-        f'{same_as_webui("PROFILE.md")} '
         'Takes effect on the next turn.'
     )
 

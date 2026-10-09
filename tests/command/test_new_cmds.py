@@ -391,7 +391,9 @@ class TestModel:
         result = await router.dispatch(ctx)
 
         assert result.type == CommandResultType.MUTATE_STATE
-        assert 'Saved as the default' in result.content
+        assert 'qwen3.7-max' in result.content
+        assert 'Saved as the default' not in result.content
+        assert '下一条消息使用它' not in result.content
         assert 'project patch' not in result.content.lower()
 
         # The source YAML is untouched.
@@ -416,10 +418,57 @@ class TestModel:
         _catalog_ok(monkeypatch, ['gpt-4o'])
         result = await router.dispatch(ctx)
         assert result.type == CommandResultType.MUTATE_STATE
-        assert 'Saved as the default' in result.content
+        assert 'gpt-4o' in result.content
+        assert 'Saved as the default' not in result.content
+        assert '下一条消息使用它' not in result.content
         from ms_agent.config.model_settings import ModelSettingsManager
         from ms_agent.project.paths import global_home
         assert ModelSettingsManager(global_home()).get_default_model() == 'openai/gpt-4o'
+
+    @pytest.mark.asyncio
+    async def test_switch_updates_this_session_and_the_default(
+            self, tmp_path, monkeypatch):
+        """Switching changes the shared default and this conversation.
+
+        Another conversation's stored model stays put, so coming back to it
+        does not follow the new default.
+        """
+        from ms_agent.config.model_settings import ModelSettingsManager
+        from ms_agent.project import SessionManager
+        from ms_agent.project.manager import ProjectManager
+        from ms_agent.tui.app import TuiApp
+
+        home = tmp_path / 'home'
+        monkeypatch.setenv('MS_AGENT_HOME', str(home))
+        work = tmp_path / 'repo'
+        work.mkdir()
+        project = TuiApp._open_project(str(work))
+        sm = SessionManager(project)
+        current = sm.create(model='qwen3.7-plus', model_provider='openai')
+        other = sm.create(model='kept-model', model_provider='openai')
+        config = OmegaConf.create({
+            'llm': {
+                'service': 'openai',
+                'model': 'qwen3.7-plus',
+                'openai_api_key': 'sk-test',
+            },
+            'session_log': {
+                'dir': str(sm.sessions_dir / current.id),
+            },
+        })
+        runtime = MockRuntime(llm=MockLLM(model='qwen3.7-plus', config=config))
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['gpt-4o'])
+        result = await make_router().dispatch(
+            make_ctx('/model gpt-4o', runtime=runtime))
+        assert result.type == CommandResultType.MUTATE_STATE
+        assert ModelSettingsManager(home).get_default_model() == 'openai/gpt-4o'
+        stored = sm.get(current.id)
+        assert stored.model == 'gpt-4o'
+        assert stored.model_provider == 'openai'
+        untouched = sm.get(other.id)
+        assert untouched.model == 'kept-model'
+        assert ProjectManager(str(home)).get(project.id) is not None
 
     @pytest.mark.asyncio
     async def test_model_list_reads_settings(self, tmp_path):
@@ -431,7 +480,8 @@ class TestModel:
         ctx = make_ctx('/model list', runtime=MockRuntime())
         result = await router.dispatch(ctx)
         assert 'Default: acme/a-1' in result.content
-        assert 'same as WebUI' in result.content
+        assert 'Providers:' in result.content
+        assert 'WebUI' not in result.content
 
     @pytest.mark.asyncio
     async def test_model_list_does_not_fetch(self, monkeypatch):
@@ -619,9 +669,10 @@ class TestModel:
         assert 'Example: /model dashscope qwen3.8-flash' in result.content
         assert 'e.g. dashscope' in result.content
         assert 'e.g. qwen3.8-flash' in result.content
-        assert 'Same as WebUI:' in result.content
+        assert 'Saved in ' in result.content
         assert 'settings.json' in result.content
-        assert 'MS_AGENT_HOME' in result.content
+        assert 'WebUI' not in result.content
+        assert 'MS_AGENT_HOME' not in result.content
         assert '<provider>' in result.content
         assert 'MiniMax' not in result.content
         assert '~/.ms_agent' not in result.content

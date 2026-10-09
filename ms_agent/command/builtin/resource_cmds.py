@@ -5,18 +5,18 @@ from ms_agent.command.router import CommandRouter
 from ms_agent.command.scope import parse_optional_scope, work_dir_of
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
-from ms_agent.command.usage import (arg_error, ledger_dir, same_as_webui,
+from ms_agent.command.usage import (arg_error, ledger_dir, ledger_file,
                                     status_then_usage)
 
 CMD_MCP = CommandDef(
     name='mcp',
-    description='List/add/enable MCP servers (shared with WebUI mcp.json)',
+    description='List, add, or enable MCP servers',
     category='config',
 )
 
 CMD_SKILL_MANAGE = CommandDef(
     name='skills',
-    description='List/add/enable skills (shared with WebUI skills.json)',
+    description='List, add, or enable skills',
     category='config',
     aliases=('skill-mgr', ),
 )
@@ -32,8 +32,9 @@ def _mcp_usage() -> str:
         '  /mcp json <file.json>\n'
         '  /mcp enable|disable|remove <name> [global|project]\n'
         'Omitting scope on add writes this folder (project). '
-        'WebUI Settings → MCP is the global page.\n'
-        f'{same_as_webui("mcp.json")} Also project .ms_agent/mcp.json. '
+        '`global` is every folder on this machine.\n'
+        f'This machine: {ledger_file("mcp.json")}. '
+        'This folder: <work>/.ms_agent/mcp.json. '
         'New servers connect this session when possible; otherwise /new or restart.'
     )
 
@@ -51,14 +52,12 @@ def _skill_usage() -> str:
         'otherwise this machine (global). '
         'Omit scope on enable, disable, or remove: the copy that already '
         'exists; if both exist, write global or project. '
-        f'{same_as_webui("skills")} '
         'remove only deletes a managed copy, not auto-discovered skills.'
     )
 
 
 _PROJECT_MCP_NOT_ON_SETTINGS = (
-    'Not visible on WebUI Settings → MCP (that page is global). '
-    'Add with `global` to show it there.'
+    'Saved for this folder. Use global to save it for every folder.'
 )
 
 

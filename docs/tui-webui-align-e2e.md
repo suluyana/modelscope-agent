@@ -49,7 +49,7 @@ ms-agent tui --work-dir /tmp/align-work
 | # | 功能 | TUI | 通过标准 |
 |---|---|---|---|
 | B1 | 列出供应商 | `/model` `/model list` | 与 WebUI 模型设置同源；key 只显示 set/missing，无明文 |
-| B2 | 切换当前模型 | `/model <model>` 或 `/model <provider>/<model>` | banner/当前模型变了；settings 的 default_model 更新；下一轮走新模型 |
+| B2 | 切换当前模型 | `/model <model>` 或 `/model <provider>/<model>` | 状态栏模型变了；settings 的 default_model 更新（之后的新对话用它）；当前 session.json 的 model 也更新（回到这条对话仍是它）；下一轮走新模型。不写项目 config.yaml |
 | B3 | 新增供应商 | `/model provider add <id> key= url= protocol=` | WebUI 模型页出现该项 |
 | B4 | 改 key | `/model provider key <id> <value>\|clear` | json 变了；列表仍不打印明文；当前供应商会尽量立刻生效 |
 | B5 | 改 base_url | `/model provider url <id> <url>\|clear` | 同上 |
@@ -188,7 +188,7 @@ ms-agent tui --work-dir /tmp/align-work
 先前：`/model list` 读 `settings.json`，真正跑模型仍走 `Config.from_task(agent.yaml)`（包装里的 Qwen3-235B）。要对齐得手动 `/model openai/qwen3.7-plus`。
 
 1. 同一 `MS_AGENT_HOME`。WebUI 设置 → 模型，默认选 `openai/qwen3.7-plus`（或当前环境真实在用的那条）并保存。
-2. 新开 TUI：`ms-agent tui --work-dir /tmp/align-work`。`/model` 只写两端共用的 `default_model`，不再给这个文件夹钉一份 `.ms_agent/config.yaml`；之后在 WebUI 改默认，下次打开 TUI（无 `--config`）应跟上。
+2. 新开 TUI：`ms-agent tui --work-dir /tmp/align-work`。`/model` 写两端共用的 `default_model`，并记下当前对话自己的模型（`session.json` 的 `model` / `model_provider`），不再给这个文件夹钉一份 `.ms_agent/config.yaml`。之后在 WebUI 改默认，下一次新建的对话跟上；用 `/resume` 回到改之前的对话，模型仍是那条对话自己的。
 3. `/model`（无参数）或看 banner：当前模型应是 WebUI 刚设的那条，而不是 yaml 里的 `Qwen/Qwen3-235B-A22B-Instruct-2507`。
 4. 发一句短回复（如 `ping`）。请求应打到该默认模型，不必先 `/model openai/qwen3.7-plus`。
 5. （对照）`ms-agent tui --config /path/to/custom.yaml --work-dir ...`：应继续用 yaml 里写死的模型，不被 settings 改掉。

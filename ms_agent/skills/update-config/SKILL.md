@@ -16,8 +16,8 @@ before writing. Merge; never replace a whole config file.
 | What | This folder (project) | Every project (global) |
 |------|------------------------|------------------------|
 | Long-term memory file | `{memory_md}` | Memory is per-project; there is no global MEMORY.md |
-| Memory **flag** (what actually injects it) | TUI `/memory on`, or the WebUI project memory toggle | `/memory global on` only sets the default for **newly opened** folders |
-| MCP servers | `{project_mcp}` | `{global_mcp}` (WebUI Settings → MCP) |
+| Memory **flag** (what actually injects it) | `/memory on` | `/memory global on` only sets the default for **newly opened** folders |
+| MCP servers | `{project_mcp}` | `{global_mcp}` |
 
 A server in the global file is not the same as one in the project file. Ask
 if scope is unclear.
@@ -26,9 +26,8 @@ if scope is unclear.
 
 1. Facts live in `{memory_md}`.
 2. Creating that file does **nothing** until the **project** memory flag is
-   on. TUI: `/memory on` — the next user message in this session picks it
-   up. WebUI: the project memory toggle. Do not tell the user to `/new`
-   first.
+   on. `/memory on` — the next user message in this session picks it
+   up. Do not tell the user to `/new` first.
 3. **Do not** add `memory.unified_memory` (or any memory block) to
    `{work}/.ms_agent/config.yaml` or to agent.yaml. That is not how this
    product enables memory.
@@ -38,7 +37,7 @@ MEMORY.md directly only when the user asks to inspect or rewrite it.
 
 ## MCP servers
 
-TUI slash commands write the same files WebUI uses:
+Slash commands write these files:
 
 - This folder: `/mcp add NAME project url=...` (omitting scope writes project)
 - Every project: `/mcp add NAME global url=...`

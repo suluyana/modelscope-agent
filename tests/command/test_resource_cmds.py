@@ -110,7 +110,8 @@ class TestMcpCommand:
             make_ctx('/mcp add local command=npx', runtime))
         assert 'Added local' in result.content
         assert '(project)' in result.content
-        assert 'Settings' in result.content
+        assert 'Saved for this folder' in result.content
+        assert 'WebUI' not in result.content
         mgr = MCPConfigManager(str(isolate_home), str(work))
         entry = mgr.list('project')['local']
         assert entry['command'] == 'npx'

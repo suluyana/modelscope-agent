@@ -43,7 +43,8 @@ class TestSearchCommand:
         assert 'Engine: tavily' in result.content
         assert '/search engine' in result.content
         assert str(isolate_home) in result.content
-        assert 'MS_AGENT_HOME' in result.content
+        assert 'WebUI' not in result.content
+        assert 'MS_AGENT_HOME' not in result.content
 
     @pytest.mark.asyncio
     async def test_list_marks_current(self):

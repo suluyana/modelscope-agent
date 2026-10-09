@@ -18,23 +18,18 @@ from tests.e2e.helpers import ModelRuntime, runtime_for, run_slash
 
 
 def _assert_live_home(content: str, home) -> None:
-    """Help shows the resolved path *and* that MS_AGENT_HOME produced it."""
+    """Help shows the resolved path, not a hardcoded home or another product."""
     home = str(home)
     assert '~/.ms_agent' not in content, (
         f'help still says ~/.ms_agent while the live home is {home}')
     assert home in content, (
         f'help should show the live path {home} so a person can open the file')
-    assert 'MS_AGENT_HOME' in content, (
-        'help should say the path comes from MS_AGENT_HOME')
+    assert 'WebUI' not in content
+    assert 'MS_AGENT_HOME' not in content
 
 
 class TestHelpTextLiesAboutHome:
-    """Slash help must not hardcode ``~/.ms_agent`` when MS_AGENT_HOME is set.
-
-    Testers are told never to use ~/.ms_agent. Showing only the env var name
-    also makes them expand it themselves — print the live path, then say
-    which env produced it.
-    """
+    """Slash help shows the live config path, not ``~/.ms_agent`` or WebUI."""
 
     @pytest.mark.usability
     def test_search_help_mentions_effective_home(self, isolated_home):
@@ -105,9 +100,9 @@ class TestBareCommandShape:
 class TestDefaultScopeFootgun:
     """``/mcp add`` omits to this folder (project) and says so.
 
-    WebUI Settings → MCP is the global page, so the success line must
-    mention that. ``/skills add`` and ``/skills enable`` share one default:
-    project when a work dir is open, otherwise global.
+    ``global`` is every folder on this machine. ``/skills add`` and
+    ``/skills enable`` share one default: project when a work dir is open,
+    otherwise global.
     """
 
     @pytest.mark.usability
@@ -137,9 +132,9 @@ class TestDefaultScopeFootgun:
             '/mcp add docs url=https://example.invalid/mcp',
             runtime_for(work_dir))
         lowered = result.content.lower()
-        assert 'global' in lowered and (
-            'settings' in lowered or 'not visible' in lowered
-            or 'project scope' in lowered)
+        assert 'this folder' in lowered
+        assert 'global' in lowered
+        assert 'webui' not in lowered
 
     @pytest.mark.usability
     def test_skills_add_and_enable_share_project_default_when_work_dir(
@@ -204,7 +199,9 @@ class TestModelSwitchShadowsWebuiDefault:
             rt)
         run_slash('/model catalog add acme a-1', rt)
         result = run_slash('/model acme/a-1', rt)
-        assert 'Saved as the default' in result.content
+        assert 'a-1' in result.content
+        assert 'Saved as the default' not in result.content
+        assert '下一条消息使用它' not in result.content
         assert 'project patch' not in result.content.lower()
         assert not (work_dir / '.ms_agent' / 'config.yaml').exists()
 

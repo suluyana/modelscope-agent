@@ -464,6 +464,10 @@ class TuiApp:
         otherwise the legacy output_dir/tag history (``read_history``) would be
         loaded when the new SessionLog is still empty — replaying the previous
         session's messages. SessionLog is the single source of truth here.
+
+        When the session has its own model, that model is applied to the live
+        agent. The global default is left alone, so a new chat still starts on
+        the last model the user chose, not on whichever old chat was open.
         """
         sess_dir = str(self._sm.sessions_dir / session.id)
         cfg = self.agent.config
@@ -481,6 +485,64 @@ class TuiApp:
         self.session = session
         self.state.session_name = session.name
         self.agent.load_cache = resume
+        if session.model:
+            self._bind_live_model(session.model_provider, session.model)
+        else:
+            # No per-conversation model yet (a chat from before this was
+            # stored). Follow the default for this visit, and do not write it
+            # onto the session: we do not know which model it originally used.
+            provider, model = self._default_binding()
+            self._bind_live_model(provider, model)
+
+    def _default_binding(self) -> tuple[str | None, str | None]:
+        """Provider and model a new conversation starts on.
+
+        Reads the shared default, not the model currently on the agent. After
+        resuming an older chat the agent is on that chat's model; a new chat
+        must still start on the default.
+        """
+        from ms_agent.config.model_settings import (
+            ModelSettingsManager, strip_provider_model_prefix)
+        from ms_agent.project.paths import global_home
+
+        raw = ModelSettingsManager(global_home()).get_default_model() or ''
+        if '/' in raw:
+            provider, model = raw.split('/', 1)
+            model = strip_provider_model_prefix(provider, model) or model
+            return provider or None, model or None
+        if raw:
+            provider = str(
+                OmegaConf.select(self.agent.config, 'llm.service', default='')
+                or '') or None
+            return provider, raw
+        model = str(
+            OmegaConf.select(self.agent.config, 'llm.model', default='')
+            or '') or None
+        provider = str(
+            OmegaConf.select(self.agent.config, 'llm.service', default='')
+            or '') or None
+        return provider, model
+
+    def _open_conversation(self):
+        """Create a session stamped with the current global default."""
+        provider, model = self._default_binding()
+        return self._sm.create(model=model, model_provider=provider)
+
+    def _bind_live_model(self, provider: str | None, model: str | None) -> None:
+        """Point the live agent at a conversation's model.
+
+        Does not write ``default_model``. The next ``run()`` builds the client
+        from this config.
+        """
+        if not model:
+            return
+        cfg = self.agent.config
+        OmegaConf.update(cfg, 'llm.model', model, merge=True)
+        if provider:
+            OmegaConf.update(cfg, 'llm.service', provider, merge=True)
+            self._apply_provider_credentials(cfg, overwrite=True)
+        self.config = cfg
+        self.state.model = model
 
     def _resume_target(self, arg: str):
         sessions = self._sm.list()
@@ -702,7 +764,7 @@ class TuiApp:
         # Do not wipe empty sessions on startup: WebUI may have created a
         # chat the user has not typed into yet. Empty leftovers from *this*
         # TUI process are pruned when leaving the session (below).
-        self.session = self._sm.create(model=self.state.model or None)
+        self.session = self._open_conversation()
         self._owned_session_ids.add(self.session.id)
         resume = False  # a fresh session reads a prompt; a resumed one restores
         self.renderer.rule(f'session {self.session.id}', 'green')
@@ -785,7 +847,7 @@ class TuiApp:
                 break  # user quit
             kind = switch[0]
             if kind == 'new':
-                self.session = self._sm.create(model=self.state.model or None)
+                self.session = self._open_conversation()
                 self._owned_session_ids.add(self.session.id)
                 resume = False
                 self.renderer.rule(f'new session {self.session.id}', 'green')

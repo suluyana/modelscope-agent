@@ -11,7 +11,7 @@ from ms_agent.command.usage import arg_error, status_then_usage
 
 CMD_MEMORY = CommandDef(
     name='memory',
-    description='Turn unified memory on/off (shared with WebUI)',
+    description='Turn memory on or off',
     category='config',
 )
 
@@ -24,9 +24,10 @@ _USAGE = (
     '  /memory backend file|vector    (global default for new folders)\n'
     '  /memory global backend file|vector\n'
     '  /memory project backend file|vector\n'
-    'Project flag is what injects memory.unified_memory (same as WebUI). '
-    'Global flag is the default for new projects. Vector stays WebUI-owned; '
-    'TUI file backend writes MEMORY.md under <work>/.ms_agent/memory/.'
+    'Project on/off turns memory on for this folder. '
+    'Global on/off is the default for newly opened folders. '
+    'file writes MEMORY.md under <work>/.ms_agent/memory/. '
+    'vector is saved but not started in this session.'
 )
 
 _ON = frozenset({'on', 'true', '1', 'enable', 'enabled'})
@@ -57,7 +58,7 @@ def _status_text(ctx: CommandContext) -> str:
     g_be = loaded.memory_backend or 'file'
     lines = [
         f'Global default: {g_on}  backend={g_be}',
-        '(applies when TUI/WebUI first opens a new folder)',
+        '(applies when a new folder is opened)',
     ]
     project = _project(ctx)
     if project is None:
@@ -67,6 +68,12 @@ def _status_text(ctx: CommandContext) -> str:
         p_be = project.memory_backend or g_be
         lines.append(f'Project: {p_on}  backend={p_be}  id={project.id}')
     return status_then_usage('\n'.join(lines), _USAGE)
+
+
+def _backend_saved(text: str, backend: str) -> str:
+    if backend == 'vector':
+        return text + ' 当前会话不会启动 vector。'
+    return text
 
 
 def _parse_bool(token: str) -> bool | None:
@@ -87,9 +94,8 @@ async def _apply_live(ctx: CommandContext, project) -> str:
     kind = apply_project_memory(cfg, project)
     if kind == 'vector-unavailable':
         return (
-            'Saved vector backend for WebUI. TUI does not start vector/mem0 '
-            '(no silent file fallback). Use /memory project backend file '
-            'or open the project in WebUI.')
+            '已保存 vector。当前会话不会启动它。'
+            '要用文件记忆：/memory project backend file')
     return '下一条消息生效。'
 
 
@@ -198,9 +204,9 @@ def _cmd_backend(
         _pm().update(project.id, memory_backend=backend)
         return CommandResult(
             type=CommandResultType.MESSAGE,
-            content=(
-                f'Project memory backend → {backend}. '
-                '下一条消息生效。Vector is WebUI-owned.'),
+            content=_backend_saved(
+                f'Project memory backend → {backend}. 下一条消息生效。',
+                backend),
         )
 
     settings = PersonalizationSettings()
@@ -208,10 +214,10 @@ def _cmd_backend(
     settings.save(replace(loaded, memory_backend=backend))
     return CommandResult(
         type=CommandResultType.MESSAGE,
-        content=(
+        content=_backend_saved(
             f'Global memory backend default → {backend}. '
-            'New folders inherit this; this project is unchanged. '
-            'Vector is WebUI-owned.'),
+            'New folders inherit this; this project is unchanged.',
+            backend),
     )
 
 

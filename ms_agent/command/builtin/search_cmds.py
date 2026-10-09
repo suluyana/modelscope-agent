@@ -4,11 +4,11 @@ from __future__ import annotations
 from ms_agent.command.router import CommandRouter
 from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
-from ms_agent.command.usage import arg_error, same_as_webui, status_then_usage
+from ms_agent.command.usage import (arg_error, ledger_file, status_then_usage)
 
 CMD_SEARCH = CommandDef(
     name='search',
-    description='Show or set the web-search engine (shared with WebUI)',
+    description='Show or set the web-search engine',
     category='config',
 )
 
@@ -22,7 +22,7 @@ def _usage() -> str:
         '  /search key <value>\n'
         '  /search key clear\n'
         '  /search enable|disable\n'
-        f'{same_as_webui("settings.json")} '
+        f'Saved in {ledger_file("settings.json")}. '
         'Takes effect on the next turn, or /new if search was already connected.'
     )
 
@@ -84,7 +84,7 @@ async def cmd_search(ctx: CommandContext) -> CommandResult:
     rest = parts[1:]
 
     if action == 'list':
-        lines = ['Search engines (shared with WebUI):']
+        lines = ['Search engines:']
         current = mgr.get().engine
         for row in mgr.list_engines():
             mark = '*' if row['id'] == current else ' '
