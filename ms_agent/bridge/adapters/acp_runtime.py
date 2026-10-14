@@ -412,7 +412,7 @@ async def list_acp_sessions(
     except AuthRequired:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.info('%s session/list failed: %s', runtime, exc)
+        logger.debug('%s session/list failed: %s', runtime, exc)
         return []
 
 

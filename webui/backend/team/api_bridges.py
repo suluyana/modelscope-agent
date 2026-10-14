@@ -158,6 +158,38 @@ def _retire_same_machine_bridges(
     return retired
 
 
+# Local WebUI used to persist endpoints as owner ``u1``; the Team page now
+# pairs as ``webui``. Treat them as one identity so enable is not a 409.
+_LOCAL_OWNER_ALIASES = frozenset({'u1', 'webui'})
+
+
+def _same_owner_identity(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return left in _LOCAL_OWNER_ALIASES and right in _LOCAL_OWNER_ALIASES
+
+
+def _bridge_is_live(state, bridge_id: Optional[str]) -> bool:
+    if not bridge_id:
+        return False
+    peer = state.bridges.get(bridge_id)
+    if peer is None:
+        return False
+    return getattr(peer, 'status', None) == 'online'
+
+
+def _can_claim_existing_endpoint(state, existing: AgentEndpoint,
+                                 bridge: MachineBridge) -> bool:
+    """True when this Host Bridge may take over an existing @name."""
+    if _same_owner_identity(existing.owner_user_id, bridge.owner_user_id):
+        return True
+    if _bridge_is_live(state, existing.bridge_id):
+        return False
+    exist_label = (existing.machine_label or '').strip()
+    want_label = (bridge.machine_label or '').strip()
+    return bool(exist_label and want_label and exist_label == want_label)
+
+
 def _bind_agent_to_bridge(
     state,
     *,
@@ -173,21 +205,30 @@ def _bind_agent_to_bridge(
     status: str = 'offline',
     candidate_id: Optional[str] = None,
 ) -> AgentEndpoint:
-    """Create or rebind same-owner Agent onto this Host Bridge.
+    """Create or rebind Agent onto this Host Bridge.
 
     Reconnect / re-pair must not 409 when ``@me`` (or any name) already exists
     for the same owner — move it onto the new bridge_id instead.
+
+    The local demo owner ``u1`` is an alias of ``webui``: leftover names from
+    earlier click-throughs (``@codex``, ``@cursor``, …) are claimed rather
+    than rejected as another owner's conflict.
     """
     at_name = at_name.lstrip('@')
     existing = state.endpoints.get_by_at_name(at_name)
     if existing is not None:
         if existing.owner_user_id != bridge.owner_user_id:
-            raise TeamError(
-                'AT_NAME_CONFLICT',
-                f'@{at_name} is already registered by another owner.',
-                http_status=409,
-                details={'existing_endpoint_id': existing.endpoint_id},
-            )
+            if not _can_claim_existing_endpoint(state, existing, bridge):
+                raise TeamError(
+                    'AT_NAME_CONFLICT',
+                    f'@{at_name} is already registered by another owner.',
+                    http_status=409,
+                    details={
+                        'existing_endpoint_id': existing.endpoint_id,
+                        'existing_owner_user_id': existing.owner_user_id,
+                    },
+                )
+            existing.owner_user_id = bridge.owner_user_id
         existing.bridge_id = bridge.bridge_id
         existing.runtime = runtime
         existing.adapter_kind = adapter_kind  # type: ignore[assignment]

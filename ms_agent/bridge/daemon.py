@@ -60,6 +60,7 @@ class BridgeDaemon:
         self.queue = BridgeDispatchQueue()
         self.dry_run = dry_run
         self._bridge_token = bridge_token
+        self._heartbeat_lock = asyncio.Lock()
         self._ws: BridgeWSClient | None = None
         self._agents: dict[str, AgentSlot] = {}
         for slot in agents or []:
@@ -87,14 +88,6 @@ class BridgeDaemon:
             headers=headers,
         )
 
-        async def _after_connect_heartbeat():
-            for _ in range(50):
-                if self._ws and self._ws._ws is not None:  # noqa: SLF001
-                    await self._send_heartbeat()
-                    return
-                await asyncio.sleep(0.2)
-
-        asyncio.create_task(_after_connect_heartbeat())
         asyncio.create_task(self._heartbeat_loop())
         try:
             await self._ws.run_forever()
@@ -103,6 +96,10 @@ class BridgeDaemon:
             await get_acp_pool().close_all()
 
     async def _heartbeat_loop(self) -> None:
+        for _ in range(50):
+            if self._ws and self._ws._ws is not None:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.2)
         while True:
             try:
                 await self._send_heartbeat()
@@ -111,6 +108,10 @@ class BridgeDaemon:
             await asyncio.sleep(20)
 
     async def _send_heartbeat(self) -> None:
+        async with self._heartbeat_lock:
+            await self._send_heartbeat_locked()
+
+    async def _send_heartbeat_locked(self) -> None:
         # Pick up Agents enabled from the UI since the last beat.
         try:
             await self._refresh_slots_from_api()

@@ -246,6 +246,84 @@ def test_bind_agent_rebinds_same_owner():
     assert state.endpoints.get_by_at_name('me').bridge_id == 'br_new'
 
 
+def test_bind_agent_claims_legacy_u1_name_for_webui(monkeypatch):
+    """Enabling @codex as webui must take over leftover u1 rows, not 409."""
+    monkeypatch.setenv('MS_AGENT_TEAM_PERSIST', '0')
+    from team import state as state_mod
+    from team.api_bridges import _bind_agent_to_bridge
+
+    state_mod.reset_team_state_for_tests()
+    state = state_mod.get_team_state()
+    stale = MachineBridge(
+        bridge_id='br_u1',
+        owner_user_id='u1',
+        machine_label='U-BOX',
+        status='offline')
+    live = MachineBridge(
+        bridge_id='br_webui',
+        owner_user_id='webui',
+        machine_label='U-BOX',
+        status='online')
+    state.bridges.upsert(stale)
+    state.bridges.upsert(live)
+    state.registry.register(
+        AgentEndpoint(
+            endpoint_id='ep_codex',
+            at_name='codex',
+            owner_user_id='u1',
+            endpoint_type='persistent',
+            runtime='codex',
+            adapter_kind='acp',
+            bridge_id='br_u1',
+            machine_label='U-BOX',
+            status='offline',
+        ))
+    saved = _bind_agent_to_bridge(
+        state, bridge=live, at_name='codex', runtime='codex', status='offline')
+    assert saved.endpoint_id == 'ep_codex'
+    assert saved.owner_user_id == 'webui'
+    assert saved.bridge_id == 'br_webui'
+    assert state.endpoints.get_by_at_name('codex').owner_user_id == 'webui'
+
+
+def test_bind_agent_still_conflicts_with_live_foreign_owner(monkeypatch):
+    monkeypatch.setenv('MS_AGENT_TEAM_PERSIST', '0')
+    from ms_agent.team.errors import AT_NAME_CONFLICT, TeamError
+    from team import state as state_mod
+    from team.api_bridges import _bind_agent_to_bridge
+
+    state_mod.reset_team_state_for_tests()
+    state = state_mod.get_team_state()
+    other = MachineBridge(
+        bridge_id='br_alice',
+        owner_user_id='alice',
+        machine_label='OTHER-BOX',
+        status='online')
+    mine = MachineBridge(
+        bridge_id='br_webui',
+        owner_user_id='webui',
+        machine_label='U-BOX',
+        status='online')
+    state.bridges.upsert(other)
+    state.bridges.upsert(mine)
+    state.registry.register(
+        AgentEndpoint(
+            endpoint_id='ep_taken',
+            at_name='codex',
+            owner_user_id='alice',
+            endpoint_type='persistent',
+            runtime='codex',
+            adapter_kind='acp',
+            bridge_id='br_alice',
+            machine_label='OTHER-BOX',
+            status='online',
+        ))
+    with pytest.raises(TeamError) as ei:
+        _bind_agent_to_bridge(
+            state, bridge=mine, at_name='codex', runtime='codex')
+    assert ei.value.code == AT_NAME_CONFLICT
+
+
 def test_pair_reuses_canonical_same_machine_bridge(monkeypatch):
     """Re-pair on the same machine reuses the online bridge — no dual online."""
     monkeypatch.setenv('MS_AGENT_TEAM_PERSIST', '0')

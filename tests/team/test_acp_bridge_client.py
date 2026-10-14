@@ -152,6 +152,34 @@ async def test_pool_reuses_same_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pool_does_not_kill_initializing_session(monkeypatch):
+    created = []
+    terminated = []
+
+    class _Proc(_FakeProc):
+        def terminate(self) -> None:
+            terminated.append(True)
+            super().terminate()
+
+    async def fake_exec(*cmd, **kwargs):
+        proc = _Proc([])
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', fake_exec)
+    pool = AcpProcessPool()
+    first = await pool.get('codex', ['fake-acp'], cwd='/tmp/race')
+    assert first._ready is False
+    second = await pool.get('codex', ['fake-acp'], cwd='/tmp/race')
+    assert first is second
+    assert len(created) == 1
+    assert terminated == []
+    await asyncio.gather(first.ensure_ready(), second.ensure_ready())
+    assert first._ready is True
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
 async def test_attach_fails_without_fallback(monkeypatch):
     monkeypatch.setenv('MS_AGENT_ACP_ATTACH_FALLBACK', 'error')
     assert attach_fallback_allowed() is False

@@ -77,6 +77,7 @@ class AcpSession:
         self._init_result: dict[str, Any] | None = None
         self._ready = False
         self.on_notification: NotificationHandler | None = None
+        self._ready_lock: asyncio.Lock | None = None
         # call_id / request_id → ACP JSON-RPC id for session/request_permission
         self._permission_asks: dict[str, Any] = {}
 
@@ -129,14 +130,21 @@ class AcpSession:
             if not fut.done():
                 fut.set_exception(RuntimeError('ACP session closed'))
         self._pending.clear()
+
+    def _ensure_ready_lock(self) -> asyncio.Lock:
+        if self._ready_lock is None:
+            self._ready_lock = asyncio.Lock()
+        return self._ready_lock
+
     async def ensure_ready(self) -> dict[str, Any]:
         await self.start()
-        if self._ready and self._init_result is not None:
+        async with self._ensure_ready_lock():
+            if self._ready and self._init_result is not None:
+                return self._init_result
+            self._init_result = await self.initialize()
+            await self.authenticate()
+            self._ready = True
             return self._init_result
-        self._init_result = await self.initialize()
-        await self.authenticate()
-        self._ready = True
-        return self._init_result
 
     async def initialize(self) -> dict[str, Any]:
         return await self.request(
@@ -446,8 +454,12 @@ class AcpProcessPool:
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             sess = self._sessions.get(key)
-            if sess is not None and sess.alive and sess._ready:
+            if sess is not None and sess.alive:
+                # Reuse while initialize is still in flight. Closing a live
+                # process here races concurrent session/list / dispatch.
                 sess.auto_allow = auto_allow
+                if auth_method_id:
+                    sess.auth_method_id = auth_method_id
                 return sess
             if sess is not None:
                 await sess.close()
