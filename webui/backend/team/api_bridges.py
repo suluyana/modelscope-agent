@@ -6,9 +6,15 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from ms_agent.bridge.devmode import bridge_dev_mode
+from ms_agent.bridge.reach import (
+    cli_api_base,
+    local_debug_command,
+    remote_connect_command,
+)
 from ms_agent.team.errors import TeamError
 from ms_agent.team.models import (
     AgentEndpoint,
@@ -272,7 +278,7 @@ def _bind_agent_to_bridge(
 
 
 @router.post('/pair-token')
-def create_bridge_pair_token(body: PairTokenRequest):
+def create_bridge_pair_token(body: PairTokenRequest, request: Request):
     state = get_team_state()
     code = new_secret_token('pair_')
     expires = (_now() + timedelta(minutes=body.ttl_minutes)).isoformat()
@@ -282,7 +288,19 @@ def create_bridge_pair_token(body: PairTokenRequest):
         expires_at=expires,
     )
     state.pair_tokens.put(tok)
-    return tok.to_dict()
+    payload = tok.to_dict()
+    server = request.scope.get('server') or ('', 8000)
+    port = server[1] if len(server) > 1 and server[1] else 8000
+    # Not stored on the token. --dev on the WebUI adds a loopback command
+    # whose daemon flag is also --dev. Production only gets the remote command.
+    api_base = cli_api_base(port)
+    dev = bridge_dev_mode()
+    payload['api_base'] = api_base
+    payload['dev'] = dev
+    payload['remote_command'] = remote_connect_command(code, api_base)
+    if dev:
+        payload['local_command'] = local_debug_command(code, port)
+    return payload
 
 
 @router.post('/pair')

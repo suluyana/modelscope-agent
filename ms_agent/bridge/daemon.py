@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -455,6 +456,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument('--bridge-token', default=os.environ.get(
         'MS_AGENT_BRIDGE_TOKEN', ''))
     p.add_argument('--owner-user-id', default='')
+    p.add_argument(
+        '--dev',
+        action='store_true',
+        help='Debug mode: run this checkout (MS_AGENT_ROOT or a parent '
+        'directory) and this user\'s node. Omit when connecting a '
+        'production install.')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument(
         '--discover-only',
@@ -584,6 +591,10 @@ async def _amain(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--dev' in argv:
+        from ms_agent.bridge.devmode import prepare_dev_runtime
+        prepare_dev_runtime(argv)
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     asyncio.run(_amain(args))

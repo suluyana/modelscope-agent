@@ -204,6 +204,12 @@ def main(argv: list[str] | None = None) -> None:
         type=port_number,
         help="Internal loopback port; by default choose the next free port",
     )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Debug mode: the Team page also offers a local Bridge command "
+        "with --dev. Omit for a production connect command only.",
+    )
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument(
         "--frontend-dir",
@@ -246,6 +252,10 @@ def main(argv: list[str] | None = None) -> None:
                 HOST="127.0.0.1",
                 PORT=str(backend),
             )
+            if args.dev:
+                env["MS_AGENT_DEV"] = "1"
+            else:
+                env.pop("MS_AGENT_DEV", None)
             deadline = time.monotonic() + args.startup_timeout
             api_url = f"http://127.0.0.1:{backend}"
             processes.append(

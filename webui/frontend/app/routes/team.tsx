@@ -189,8 +189,9 @@ export default function TeamPage() {
     text: string
   } | null>(null)
   const [pairCode, setPairCode] = useState('')
-  const [connectCmd, setConnectCmd] = useState('')
-  const [copied, setCopied] = useState(false)
+  const [localCmd, setLocalCmd] = useState('')
+  const [remoteCmd, setRemoteCmd] = useState('')
+  const [copied, setCopied] = useState<'local' | 'remote' | ''>('')
   const [error, setError] = useState('')
   const [pending, setPending] = useState<PendingAction>(null)
   const [newAtName, setNewAtName] = useState(persisted.newAtName || 'me')
@@ -605,17 +606,20 @@ export default function TeamPage() {
   const onConnectMachine = () =>
     void run('pair', async () => {
       const tok = await teamApi.createBridgePairToken(userIdRef.current)
-      const cmd = buildConnectCommand(tok.pair_code)
       setPairCode(tok.pair_code)
-      setConnectCmd(cmd)
-      setCopied(false)
+      setLocalCmd(tok.local_command || '')
+      setRemoteCmd(
+        tok.remote_command ||
+          buildConnectCommand(tok.pair_code, tok.api_base)
+      )
+      setCopied('')
     })
 
-  const onCopyCommand = () =>
+  const onCopyCommand = (kind: 'local' | 'remote', command: string) =>
     void run('copy', async () => {
-      if (!connectCmd) return
-      await navigator.clipboard.writeText(connectCmd)
-      setCopied(true)
+      if (!command) return
+      await navigator.clipboard.writeText(command)
+      setCopied(kind)
     })
 
   const onEnableCandidate = (
@@ -991,21 +995,59 @@ export default function TeamPage() {
                 <Alert
                   type="info"
                   message={
-                    <div className="space-y-2">
+                    <div className="space-y-3">
                       <div>
                         pair: <Text code>{pairCode}</Text>
                       </div>
-                      <pre className="m-0 whitespace-pre-wrap break-all rounded bg-msa-fill-2 p-2 font-mono text-[11px]">
-                        {connectCmd}
-                      </pre>
-                      <Button
-                        size="small"
-                        type="primary"
-                        onClick={onCopyCommand}
-                        loading={pending === 'copy'}
-                      >
-                        {copied ? t.team.copied : t.team.copyCommand}
-                      </Button>
+                      {localCmd ? (
+                        <div className="space-y-1">
+                          <Text strong className="!text-xs">
+                            {t.team.localDebug}
+                          </Text>
+                          <div>
+                            <Text type="secondary" className="!text-xs">
+                              {t.team.localDebugHint}
+                            </Text>
+                          </div>
+                          <pre className="m-0 whitespace-pre-wrap break-all rounded bg-msa-fill-2 p-2 font-mono text-[11px]">
+                            {localCmd}
+                          </pre>
+                          <Button
+                            size="small"
+                            type="primary"
+                            onClick={() => onCopyCommand('local', localCmd)}
+                            loading={pending === 'copy'}
+                          >
+                            {copied === 'local'
+                              ? t.team.copied
+                              : t.team.copyCommand}
+                          </Button>
+                        </div>
+                      ) : null}
+                      {remoteCmd ? (
+                        <div className="space-y-1">
+                          <Text strong className="!text-xs">
+                            {t.team.remoteConnect}
+                          </Text>
+                          <div>
+                            <Text type="secondary" className="!text-xs">
+                              {t.team.remoteConnectHint}
+                            </Text>
+                          </div>
+                          <pre className="m-0 whitespace-pre-wrap break-all rounded bg-msa-fill-2 p-2 font-mono text-[11px]">
+                            {remoteCmd}
+                          </pre>
+                          <Button
+                            size="small"
+                            onClick={() => onCopyCommand('remote', remoteCmd)}
+                            loading={pending === 'copy'}
+                          >
+                            {copied === 'remote'
+                              ? t.team.copied
+                              : t.team.copyCommand}
+                          </Button>
+                        </div>
+                      ) : null}
                       <div>
                         <Text type="secondary" className="!text-xs">
                           {t.team.afterConnect}

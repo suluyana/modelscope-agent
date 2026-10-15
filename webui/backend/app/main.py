@@ -1,3 +1,4 @@
+import os
 import threading
 
 from fastapi import FastAPI
@@ -152,12 +153,13 @@ def _run(reload: bool) -> None:
 
 
 def dev() -> None:
-    """Run with hot reload."""
+    """Run with hot reload and Bridge debug connect commands."""
+    os.environ['MS_AGENT_DEV'] = '1'
     _run(reload=True)
 
 
 def serve() -> None:
-    """Run without reload (production)."""
+    """Run without reload. Bridge connect commands stay production-only."""
     _run(reload=False)
 
 

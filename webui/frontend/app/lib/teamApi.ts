@@ -180,8 +180,21 @@ export type DispatchEnvelope = {
   prompt?: string
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  return (
+    host === '' ||
+    host === 'localhost' ||
+    host === '0.0.0.0' ||
+    host === '::' ||
+    host === '::1' ||
+    host === '127.0.0.1' ||
+    host.startsWith('127.')
+  )
+}
+
 function apiBaseForCli(): string {
-  if (typeof window === 'undefined') return 'http://127.0.0.1:8000'
+  if (typeof window === 'undefined') return ''
   const { protocol, hostname, port } = window.location
   // Dev: Vite on 5173 proxies API to backend 8000 — CLI must hit backend directly.
   if (port === '5173' || port === '5174') {
@@ -221,18 +234,18 @@ export function formatSessionWhen(mtimeSec: number): string {
   return new Date(ms).toLocaleDateString()
 }
 
-export function buildConnectCommand(pairCode: string): string {
-  const base = apiBaseForCli()
-  // Editable installs may point at a checkout without Host Bridge. Force the
-  // modelscope-agent tree that contains ms_agent.bridge (override with MS_AGENT_ROOT).
-  // ACP needs no Team API key / .env. Inherit whatever is already in this shell
-  // (same as an interactive Codex TUI). If Codex config uses a custom provider
-  // (e.g. DashScope), that provider's env must already be exported here.
-  const root = '${MS_AGENT_ROOT:-/Users/luyan/workspace/modelscope-agent}'
+export function buildConnectCommand(pairCode: string, apiBase?: string): string {
+  // A page opened at localhost cannot be the daemon's target: another machine
+  // has no route to this loopback. Prefer the API base the server advertised
+  // (its LAN address). A non-loopback page host is already the address the
+  // operator chose, so keep that.
+  const fromPage = apiBaseForCli()
+  const pageHost = typeof window === 'undefined' ? '' : window.location.hostname
+  const base =
+    !isLoopbackHost(pageHost) && fromPage
+      ? fromPage
+      : (apiBase || '').trim() || fromPage
   return (
-    `cd ${root} && ` +
-    `PYTHONPATH=${root} ` +
-    `PATH="$HOME/.nvm/versions/node/v24.13.0/bin:$PATH" ` +
     `python -m ms_agent.bridge.daemon --api-base ${base} ` +
     `--pair-code ${pairCode} ` +
     `--machine-label "$(hostname -s)" ` +
@@ -405,6 +418,9 @@ export const teamApi = {
   async createBridgePairToken(ownerUserId: string): Promise<{
     pair_code: string
     expires_at: string
+    api_base?: string
+    local_command?: string
+    remote_command?: string
   }> {
     return json(
       await fetch(`${TEAM_BASE}/bridges/pair-token`, {
