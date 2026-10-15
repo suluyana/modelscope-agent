@@ -1,7 +1,7 @@
 import { App, Button, Dropdown, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useRevalidator, useRouteLoaderData } from 'react-router'
+import { Link, useNavigate, useRevalidator, useRouteLoaderData } from 'react-router'
 import type { loader as appLoader } from '~/layouts/app'
 import { taskStatusIcon } from '~/components/messages/TaskPlan'
 import IconFolder from '~/assets/icons/folder.svg?react'
@@ -1432,17 +1432,43 @@ export function Composer({
                                   onClick: () => switchPermMode('restricted')
                                 },
                                 {
+                                  key: 'accept_edits',
+                                  label: t.home.permAcceptEdits,
+                                  onClick: () => switchPermMode('accept_edits')
+                                },
+                                {
+                                  key: 'delegate',
+                                  label: t.home.permDelegate,
+                                  onClick: () => switchPermMode('delegate')
+                                },
+                                {
                                   key: 'auto',
                                   label: t.home.permFullAccess,
                                   onClick: () => switchPermMode('auto')
+                                },
+                                { type: 'divider' },
+                                {
+                                  key: 'settings',
+                                  label: (
+                                    <Link to="/settings/permissions">
+                                      {t.home.permSettings}
+                                    </Link>
+                                  )
                                 }
                               ]
                             }}
                           >
-                            <PillButton open={permMenuOpen}>
+                            <PillButton
+                              open={permMenuOpen}
+                              data-testid="composer-perm-mode"
+                            >
                               {permMode === 'auto'
                                 ? t.home.permFullAccess
-                                : t.home.permAlwaysAsk}
+                                : permMode === 'accept_edits'
+                                  ? t.home.permAcceptEdits
+                                  : permMode === 'delegate'
+                                    ? t.home.permDelegate
+                                    : t.home.permAlwaysAsk}
                             </PillButton>
                           </Dropdown>
 

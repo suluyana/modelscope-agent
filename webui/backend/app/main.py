@@ -11,6 +11,7 @@ from app.api import (
     mcps,
     memory,
     models,
+    permissions,
     presence,
     profile,
     projects,
@@ -120,6 +121,7 @@ def create_app() -> FastAPI:
     app.include_router(agent_settings.router)
     app.include_router(search.router)
     app.include_router(profile.router)
+    app.include_router(permissions.router)
     app.include_router(workspace.router)
     app.include_router(recovery.router)
     _mount_team_router(app)

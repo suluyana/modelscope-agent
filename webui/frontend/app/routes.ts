@@ -10,6 +10,7 @@ export default [
   // Main app shell — sidebar + chat surfaces.
   layout('layouts/app.tsx', [
     index('routes/home.tsx'),
+    route('team', 'routes/team.tsx'),
     route('projects/:projectId', 'routes/project-detail.tsx'),
     route('projects/:projectId/new', 'routes/project-new-session.tsx'),
     route(
@@ -26,7 +27,8 @@ export default [
     route('mcp-skills', 'routes/settings/mcp-skills.tsx'),
     route('search', 'routes/settings/search.tsx'),
     route('personalization', 'routes/settings/personalization.tsx'),
-    route('appearance', 'routes/settings/appearance.tsx')
+    route('appearance', 'routes/settings/appearance.tsx'),
+    route('permissions', 'routes/settings/permissions.tsx')
   ]),
 
   // Unmatched URLs go straight to the home page (loader redirect) — the app

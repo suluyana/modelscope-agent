@@ -231,6 +231,14 @@ export interface AgentMessage {
    * (its finished rounds are also being replayed on the live stream, so an
    * attached viewer renders one description of the turn, not two). */
   partial?: boolean;
+
+  /** Agent Team @mention replies: endpoint name without `@` (e.g. `codex`).
+   * When set, the bubble is attributed to that teammate, not the lead. */
+  atName?: string;
+  /** Agent Team dispatch id — opens the private stream rail (C-05). */
+  dispatchId?: string;
+  /** Idle Team receipt (已派 / 已结束执行). Compact bar, not a teammate bubble. */
+  receiptKind?: "dispatch_start" | "dispatch_done" | string;
 }
 
 export class AgentChatProvider extends AbstractChatProvider<
@@ -265,6 +273,9 @@ export class AgentChatProvider extends AbstractChatProvider<
     sessionId: string
     title?: string
     category?: string
+    /** True when Team @mentions were kicked async and replies will land later. */
+    pendingTeam?: boolean
+    mentions?: string[]
   }) => void
 
   transformParams(
@@ -329,10 +340,23 @@ export class AgentChatProvider extends AbstractChatProvider<
         typeof meta.project_id === "string" ? meta.project_id : undefined;
       if (sid) this.onSessionId?.(sid, projectId);
       const title = typeof meta.title === "string" ? meta.title : undefined;
-      if (title) {
-        const category =
-          typeof meta.category === "string" ? meta.category : undefined;
-        this.onSessionMeta?.({ sessionId: sid, title, category });
+      const category =
+        typeof meta.category === "string" ? meta.category : undefined;
+      const pendingTeam =
+        meta.pending_team === true || meta.via === "team_async_pending";
+      const mentions = Array.isArray(meta.mentions)
+        ? (meta.mentions as unknown[]).filter(
+            (n): n is string => typeof n === "string",
+          )
+        : undefined;
+      if (title || pendingTeam) {
+        this.onSessionMeta?.({
+          sessionId: sid,
+          title,
+          category,
+          pendingTeam: pendingTeam || undefined,
+          mentions,
+        });
       }
       // The loop boundary (SDK loop_end): its wall-clock duration is what the
       // turn header shows once processing is done; changed_files are the
@@ -861,6 +885,13 @@ export interface HistoryMessage {
   // rounds again and drops this copy (see ChatPanel); a viewer without a stream
   // keeps it, since it is all they have.
   partial?: boolean;
+
+  // Agent Team @mention replies: endpoint name without `@`.
+  at_name?: string | null;
+  // Agent Team dispatch this bubble belongs to (C-05 private stream).
+  dispatch_id?: string | null;
+  // Idle Team receipt bar (已派 / 已结束执行).
+  receipt_kind?: string | null;
 }
 
 /** Convert persisted history rows into the live AgentMessage view-model. */
@@ -885,6 +916,12 @@ export function historyToAgentMessages(
             ? { type: "skill", id: s.id ?? "", name: s.name }
             : { type: "text", text: s.text ?? "" },
       );
+    if (typeof row.at_name === "string" && row.at_name)
+      msg.atName = row.at_name.replace(/^@/, "");
+    if (typeof row.dispatch_id === "string" && row.dispatch_id)
+      msg.dispatchId = row.dispatch_id;
+    if (typeof row.receipt_kind === "string" && row.receipt_kind)
+      msg.receiptKind = row.receipt_kind;
     if (row.parts && row.parts.length > 0) {
       msg.parts = row.parts.map((part): AgentPart => {
         if (part.kind === "tasks") {

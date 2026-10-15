@@ -11,7 +11,8 @@ MemoryEmbedMode = Literal["provider", "local"]
 
 # Project-level tool authorization: "restricted" = every non-whitelisted tool
 # asks (default), "auto" = full access, no asks (SafetyGuard still applies).
-PermissionMode = Literal["restricted", "auto"]
+PermissionMode = Literal[
+    "restricted", "auto", "accept_edits", "delegate", "plan"]
 
 
 class Project(BaseModel):

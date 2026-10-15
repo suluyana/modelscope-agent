@@ -1,3 +1,4 @@
+import { TeamOutlined } from '@ant-design/icons'
 import { App, Dropdown, Input, Modal, Popover, Tooltip } from 'antd'
 import type { MenuProps } from 'antd'
 import { IconButton } from '~/components/common/IconButton'
@@ -201,6 +202,16 @@ export function Sidebar({
                   />
                 </NavLink>
               </Tooltip>
+              <Tooltip title={t.nav.agentTeam} placement="right">
+                <NavLink to="/team" onClick={onNavigate} className="block">
+                  <IconButton
+                    variant="ghost"
+                    stopPropagation={false}
+                    icon={<TeamOutlined className="text-[18px]" />}
+                    className="rounded-[12px] hover:!bg-msa-fill-3 !text-msa-text-1"
+                  />
+                </NavLink>
+              </Tooltip>
             </div>
 
             {/* Projects popover */}
@@ -289,6 +300,13 @@ export function Sidebar({
                   to="/settings/mcp-skills?tab=skills"
                   label={t.nav.skillManage}
                   icon={<SkillIcon className="h-5 w-5" />}
+                  onNavigate={onNavigate}
+                />
+                <div className="mx-3 my-1 h-px bg-msa-line-1" />
+                <SidebarNavItem
+                  to="/team"
+                  label={t.nav.agentTeam}
+                  icon={<TeamOutlined className="text-[18px]" />}
                   onNavigate={onNavigate}
                 />
               </div>

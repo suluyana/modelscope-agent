@@ -30,6 +30,7 @@ export function TurnProcess({
   live,
   startedAt,
   durationMs,
+  defaultExpanded = false,
   children
 }: {
   /** Loop finished → collapsible "processed" header + bordered content. */
@@ -40,10 +41,12 @@ export function TurnProcess({
   startedAt?: number
   /** Server-reported loop duration; preferred once done. */
   durationMs?: number
+  /** Private stream keeps process open after done so the work is still visible. */
+  defaultExpanded?: boolean
   children: React.ReactNode
 }) {
   const { t } = useT()
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(defaultExpanded)
   const { animating, onTransitionEnd } = useCollapseTransition(expanded)
 
   // Live elapsed seconds, ticked once a second while the turn is in flight.

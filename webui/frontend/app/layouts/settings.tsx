@@ -5,6 +5,7 @@ import IconMcpSkill from '~/assets/icons/mcp-skill-manage.svg?react'
 import IconSearch from '~/assets/icons/search.svg?react'
 import IconPersonalize from '~/assets/icons/personalize.svg?react'
 import IconAppearance from '~/assets/icons/appearance.svg?react'
+import IconAuthorize from '~/assets/icons/authorize.svg?react'
 
 import IconBack from '~/assets/icons/back.svg?react'
 import logoImg from '~/assets/images/logo.png'
@@ -45,6 +46,11 @@ export default function SettingsLayout() {
         to: 'appearance',
         label: t.settings.navAppearance,
         icon: IconAppearance
+      },
+      {
+        to: 'permissions',
+        label: t.settings.navPermissions,
+        icon: IconAuthorize
       }
     ]
 

@@ -64,7 +64,19 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
-        '/api': { target: apiBaseUrl, changeOrigin: true }
+        '/api': {
+          target: apiBaseUrl,
+          changeOrigin: true,
+          configure(proxy) {
+            proxy.on('proxyRes', (proxyRes, req) => {
+              const url = req.url || ''
+              if (url.includes('/stream') || url.includes('/events')) {
+                proxyRes.headers['cache-control'] = 'no-cache'
+                proxyRes.headers['x-accel-buffering'] = 'no'
+              }
+            })
+          }
+        }
       }
     },
     ssr: {

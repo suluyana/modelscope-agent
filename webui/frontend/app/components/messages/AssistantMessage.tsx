@@ -1,6 +1,6 @@
 import { Markdown } from '~/components/common/Markdown'
 import type { AgentMessage, AgentPart } from '~/lib/agentProvider'
-import type { OnOpenStep, OnOpenFile } from './types'
+import type { OnOpenStep, OnOpenFile, OnOpenDispatch } from './types'
 import { ThoughtsFlow } from './ThoughtsFlow'
 import { TaskPlan } from './TaskPlan'
 import { ToolBatch } from './ToolBatch'
@@ -10,12 +10,106 @@ import { splitTurn } from './turnSplit'
 import { ArtifactFiles } from './ArtifactFiles'
 import { ErrorCard } from './ErrorCard'
 import { TurnPlan } from './TurnPlan'
+import { useT } from '~/lib/i18n'
+import { useState } from 'react'
 
 type StepPart = Extract<AgentPart, { kind: 'step' }>
 type RenderGroup =
   | { kind: 'steps'; parts: StepPart[]; endIdx: number; group: unknown }
   | { kind: 'composing'; parts: StepPart[]; endIdx: number }
   | { kind: 'single'; part: Exclude<AgentPart, StepPart>; endIdx: number }
+
+const TEAM_PREVIEW_CHARS = 160
+
+function TeamPreviewBody({
+  content,
+  streaming,
+}: {
+  content: string
+  streaming: boolean
+}) {
+  const { t } = useT()
+  const [open, setOpen] = useState(false)
+  if (!content) return null
+  if (streaming || content.length <= TEAM_PREVIEW_CHARS) {
+    return <Markdown content={content} streaming={streaming} />
+  }
+  const preview = `${content.slice(0, TEAM_PREVIEW_CHARS).trimEnd()}…`
+  return (
+    <div>
+      <Markdown content={open ? content : preview} streaming={false} />
+      <button
+        type="button"
+        data-testid="team-preview-toggle"
+        className="mt-1 text-xs text-msa-text-3 underline underline-offset-2 hover:text-msa-text-1"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? t.team.previewLess : t.team.previewMore}
+      </button>
+    </div>
+  )
+}
+
+function AtNameHeader({
+  message,
+  onOpenDispatch,
+  onCancelDispatch,
+}: {
+  message: AgentMessage
+  onOpenDispatch?: OnOpenDispatch
+  onCancelDispatch?: (dispatchId: string) => void
+}) {
+  const { t } = useT()
+  if (message.receiptKind) return null
+  const isWorker = Boolean(message.atName)
+  // Inner rails (private stream / Lead session) omit onOpenDispatch — don't
+  // stamp a redundant Lead label on every bubble there.
+  if (!isWorker && !onOpenDispatch) return null
+  const isLead = !isWorker
+  const label = isWorker ? `@${message.atName}` : t.team.lead
+  const canOpen = Boolean(onOpenDispatch && (message.dispatchId || isLead))
+  const canStop = Boolean(isWorker && message.dispatchId && onCancelDispatch)
+  const header = canOpen ? (
+    <button
+      type="button"
+      data-testid="team-full-process"
+      className="text-left text-xs font-medium text-msa-text-3 hover:text-msa-text-1"
+      onClick={() =>
+        onOpenDispatch!(
+          isWorker
+            ? {
+                kind: 'worker',
+                dispatchId: message.dispatchId as string,
+                atName: message.atName,
+              }
+            : { kind: 'lead' },
+        )
+      }
+    >
+      {label}
+      <span className="ml-2 font-normal underline underline-offset-2">
+        {t.team.fullProcess}
+      </span>
+    </button>
+  ) : (
+    <div className="text-xs font-medium text-msa-text-3">{label}</div>
+  )
+  return (
+    <div className="flex items-center gap-3">
+      {header}
+      {canStop ? (
+        <button
+          type="button"
+          data-testid="team-preview-cancel"
+          className="text-xs text-msa-text-danger underline underline-offset-2"
+          onClick={() => onCancelDispatch!(message.dispatchId as string)}
+        >
+          {t.team.stopDispatch}
+        </button>
+      ) : null}
+    </div>
+  )
+}
 
 /** History-replayed approved authorizations render nothing (the adjacent
  * tool step shows the invocation) — exclude them from grouping so the
@@ -114,7 +208,11 @@ export function AssistantMessage({
   streaming,
   sessionId,
   onOpenStep,
-  onOpenFile
+  onOpenFile,
+  onOpenDispatch,
+  onCancelDispatch,
+  collapsiblePreview = false,
+  keepProcessOpen = false,
 }: {
   message: AgentMessage
   streaming: boolean
@@ -122,17 +220,28 @@ export function AssistantMessage({
   sessionId?: string | null
   onOpenStep?: OnOpenStep
   onOpenFile?: OnOpenFile
+  onOpenDispatch?: OnOpenDispatch
+  onCancelDispatch?: (dispatchId: string) => void
+  /** Main-chat teammate / Lead bubbles: short preview, tools stay folded. */
+  collapsiblePreview?: boolean
+  /** Worker private stream: do not collapse process after the turn ends. */
+  keepProcessOpen?: boolean
 }) {
+  const wrapTestId = message.atName
+    ? `team-reply-${message.atName}`
+    : onOpenDispatch
+      ? 'team-reply-lead'
+      : undefined
   const parts = message.parts
 
   if (!parts || parts.length === 0) {
     return (
-      <div className="space-y-3">
-        {/* A turn that has started but produced nothing yet still shows the
-            "processing Ns" header, so the counter is visible from 0 and grows
-            naturally. Without this the header first appeared with the first
-            part — after a slow model's think delay it popped in already
-            reading "8s". */}
+      <div className="space-y-3" data-testid={wrapTestId}>
+        <AtNameHeader
+          message={message}
+          onOpenDispatch={onOpenDispatch}
+          onCancelDispatch={onCancelDispatch}
+        />
         {streaming && message.turnStartedAt != null && (
           <TurnProcess
             done={false}
@@ -143,8 +252,12 @@ export function AssistantMessage({
             {null}
           </TurnProcess>
         )}
-        {message.content && (
-          <Markdown content={message.content} streaming={streaming} />
+        {collapsiblePreview ? (
+          <TeamPreviewBody content={message.content} streaming={streaming} />
+        ) : (
+          message.content && (
+            <Markdown content={message.content} streaming={streaming} />
+          )
         )}
       </div>
     )
@@ -253,7 +366,12 @@ export function AssistantMessage({
   const foldableParts = processParts.filter((p) => p.kind !== 'error')
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3" data-testid={wrapTestId}>
+      <AtNameHeader
+        message={message}
+        onOpenDispatch={onOpenDispatch}
+        onCancelDispatch={onCancelDispatch}
+      />
       {/* Header shows while the turn RUNS (even before its first block) or once
           it has folded content — never for a bare finished reply. */}
       {(foldableParts.length > 0 ||
@@ -263,6 +381,7 @@ export function AssistantMessage({
           live={streaming}
           startedAt={message.turnStartedAt}
           durationMs={message.loopDurationMs}
+          defaultExpanded={keepProcessOpen}
         >
           {renderParts(foldableParts, loopDone)}
         </TurnProcess>
@@ -271,7 +390,12 @@ export function AssistantMessage({
       {errorParts.map((p, i) => (
         <ErrorCard key={`err-${i}`} text={p.text} recoverable={p.recoverable} />
       ))}
-      {summary && <Markdown content={summary.text} streaming={false} />}
+      {summary &&
+        (collapsiblePreview ? (
+          <TeamPreviewBody content={summary.text} streaming={false} />
+        ) : (
+          <Markdown content={summary.text} streaming={false} />
+        ))}
       {/* The turn's deliverables (files written/edited this loop) close the
           message, after the summary. */}
       {loopDone && deliverables.length > 0 && (

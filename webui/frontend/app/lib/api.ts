@@ -300,7 +300,7 @@ export const api = {
       memory_backend: MemoryBackend
       mcp_auto_attach: boolean
       skill_auto_attach: boolean
-      permission_mode: 'restricted' | 'auto'
+      permission_mode: 'restricted' | 'auto' | 'accept_edits' | 'delegate' | 'plan'
     }>
   ) =>
     json<Project>(`/api/projects/${pid(id)}`, {
@@ -315,8 +315,19 @@ export const api = {
     json<Session[]>(`/api/sessions${q({ project_id: projectId })}`),
   getSession: (id: string, opts?: ApiCallOpts) =>
     json<Session>(`/api/sessions/${pid(id)}`, {}, opts),
-  listSessionMessages: (id: string, opts?: ApiCallOpts) =>
-    json<SessionMessage[]>(`/api/sessions/${pid(id)}/messages`, {}, opts),
+  listSessionMessages: (
+    id: string,
+    opts?: ApiCallOpts & { view?: 'human' | 'llm' }
+  ) => {
+    const view = opts?.view
+    const rest: ApiCallOpts | undefined =
+      opts?.silent !== undefined ? { silent: opts.silent } : undefined
+    return json<SessionMessage[]>(
+      `/api/sessions/${pid(id)}/messages${q({ view })}`,
+      {},
+      rest
+    )
+  },
   getSessionPlan: (id: string, opts?: ApiCallOpts) =>
     json<SessionPlan>(`/api/sessions/${pid(id)}/plan`, {}, opts),
   createSession: (body: {
@@ -705,6 +716,7 @@ export const api = {
     session_id: string
     request_id: string
     action: 'allow_once' | 'allow_always' | 'deny'
+    pattern?: string
   }) =>
     json<{ resolved: boolean }>('/api/chat/permission', {
       method: 'POST',
@@ -719,6 +731,71 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ session_id: sessionId })
     }),
+
+  listPermissionRules: (projectId?: string) =>
+    json<{
+      rules: Array<{
+        pattern: string
+        scope: string
+        source: string
+        kind: string
+        created_at?: string
+      }>
+      agent_provider_available: boolean
+      approver_id?: string
+    }>(`/api/permissions/rules${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
+  addPermissionRule: (body: {
+    pattern: string
+    scope: 'project' | 'global'
+    project_id?: string
+  }) => json<{ ok: boolean }>('/api/permissions/rules', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  }),
+  deletePermissionRule: (body: { pattern: string; project_id?: string }) =>
+    json<{ ok: boolean; removed: number }>('/api/permissions/rules', {
+      method: 'DELETE',
+      body: JSON.stringify(body)
+    }),
+  previewPermission: (body: {
+    tool_name: string
+    tool_args?: Record<string, unknown>
+    project_id?: string
+  }) =>
+    json<{ matches: boolean; rules: Array<{ pattern: string; kind: string }> }>(
+      '/api/permissions/preview',
+      { method: 'POST', body: JSON.stringify(body) }
+    ),
+  listPermissionAsks: (opts?: { project_id?: string; state?: string }) => {
+    const q = new URLSearchParams()
+    if (opts?.project_id) q.set('project_id', opts.project_id)
+    if (opts?.state) q.set('state', opts.state)
+    const suffix = q.toString() ? `?${q}` : ''
+    return json<{
+      asks: Array<{
+        request_id: string
+        call_id?: string
+        tool_name: string
+        tool_args?: Record<string, unknown>
+        state: string
+        session_id?: string
+        dispatch_id?: string
+        resume_status?: string
+      }>
+    }>(`/api/permissions/asks${suffix}`)
+  },
+  resolvePermissionAsk: (
+    requestId: string,
+    body: {
+      action: 'allow_once' | 'allow_always' | 'deny'
+      pattern?: string
+      session_id?: string
+    }
+  ) =>
+    json<{ resolved: boolean; via?: string }>(
+      `/api/permissions/asks/${encodeURIComponent(requestId)}/resolve`,
+      { method: 'POST', body: JSON.stringify(body) }
+    ),
 
   // Browser presence heartbeat (~10s cadence, sent by the app shell). Keeps
   // background turns alive across refresh/navigation and returns the sessions

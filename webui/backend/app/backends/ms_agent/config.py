@@ -733,7 +733,8 @@ def _apply_webui_permission(config, project_mode: str | None = None):
     an explicit user choice, so it beats the fill-blanks default."""
     from omegaconf import OmegaConf
 
-    if project_mode in ("restricted", "auto"):
+    if project_mode in (
+            "restricted", "auto", "accept_edits", "delegate", "plan"):
         OmegaConf.update(config, "permission.mode", project_mode, merge=True)
     elif OmegaConf.select(config, "permission.mode", default=None) is None:
         OmegaConf.update(config, "permission.mode", "restricted", merge=True)

@@ -63,8 +63,17 @@ export function AuthConfirmStepCard({
   } catch {
     // Keep raw if not valid JSON
   }
+  const [persistPattern, setPersistPattern] = useState(() =>
+    String(
+      (Array.isArray(step.meta.suggestions) && step.meta.suggestions[0]) ||
+        toolName,
+    ),
+  )
 
-  const resolve = async (action: 'allow_once' | 'allow_always' | 'deny') => {
+  const resolve = async (
+    action: 'allow_once' | 'allow_always' | 'deny',
+    pattern?: string,
+  ) => {
     const next: AuthState = action === 'deny' ? 'rejected' : 'approved'
     if (!requestId || !sessionId) {
       setState(next)
@@ -72,13 +81,11 @@ export function AuthConfirmStepCard({
     }
     setBusy(true)
     try {
-      // allow_always: the SDK also records the tool into the project's
-      // permission memory (.ms_agent/permission_memory.json), so future calls
-      // of the same tool skip the ask entirely.
       const { resolved } = await api.resolvePermission({
         session_id: sessionId,
         request_id: requestId,
-        action
+        action,
+        ...(action === 'allow_always' && pattern ? { pattern } : {}),
       })
       setState(resolved ? next : 'rejected')
     } catch {
@@ -173,30 +180,90 @@ export function AuthConfirmStepCard({
               </div>
             )}
 
-            {/* Authorization state: deny / always allow (persisted) / allow once */}
+            {/* Authorization: TUI-aligned once / persist pattern / deny */}
             {state === 'pending' && (
-              <div className="flex justify-end gap-2 pt-1">
-                <MsaButton
-                  variant="outlined"
-                  disabled={busy}
-                  onClick={() => resolve('deny')}
-                >
-                  {t.chat.authReject}
-                </MsaButton>
-                <MsaButton
-                  variant="outlined"
-                  disabled={busy}
-                  onClick={() => resolve('allow_always')}
-                >
-                  {t.chat.authApproveAlways}
-                </MsaButton>
+              <div className="flex flex-col gap-2 pt-1">
+                {Array.isArray(step.meta.ask_options) &&
+                step.meta.ask_options.length > 0 ? (
+                  (step.meta.ask_options as Array<{
+                    optionId?: string
+                    name?: string
+                    kind?: string
+                  }>).map((opt, idx) => {
+                    const blob = `${opt.optionId || ''} ${opt.kind || ''} ${opt.name || ''}`.toLowerCase()
+                    const action = /(deny|reject)/.test(blob)
+                      ? 'deny'
+                      : /(always|persist)/.test(blob)
+                        ? 'allow_always'
+                        : 'allow_once'
+                    if (action === 'allow_always') {
+                      return (
+                        <div key={opt.optionId || idx} className="flex items-center gap-2">
+                          <input
+                            className="min-w-0 flex-1 rounded border border-msa-line-1 bg-msa-bg-1 px-2 py-1 font-mono text-[11px] text-msa-text-2"
+                            value={persistPattern}
+                            onChange={(e) => setPersistPattern(e.target.value)}
+                          />
+                          <MsaButton
+                            variant="outlined"
+                            disabled={busy || !persistPattern.trim()}
+                            onClick={() =>
+                              void resolve('allow_always', persistPattern.trim())
+                            }
+                          >
+                            {opt.name || t.chat.authApproveAlways}
+                          </MsaButton>
+                        </div>
+                      )
+                    }
+                    return (
+                      <MsaButton
+                        key={opt.optionId || idx}
+                        variant={action === 'allow_once' ? 'primary' : 'outlined'}
+                        disabled={busy}
+                        onClick={() => void resolve(action)}
+                      >
+                        {opt.name ||
+                          (action === 'deny'
+                            ? t.chat.authReject
+                            : t.chat.authApprove)}
+                      </MsaButton>
+                    )
+                  })
+                ) : (
+                  <>
                 <MsaButton
                   variant="primary"
                   disabled={busy}
-                  onClick={() => resolve('allow_once')}
+                  onClick={() => void resolve('allow_once')}
                 >
                   {t.chat.authApprove}
                 </MsaButton>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="min-w-0 flex-1 rounded border border-msa-line-1 bg-msa-bg-1 px-2 py-1 font-mono text-[11px] text-msa-text-2"
+                    value={persistPattern}
+                    onChange={(e) => setPersistPattern(e.target.value)}
+                  />
+                  <MsaButton
+                    variant="outlined"
+                    disabled={busy || !persistPattern.trim()}
+                    onClick={() =>
+                      void resolve('allow_always', persistPattern.trim())
+                    }
+                  >
+                    {t.chat.authApproveAlways}
+                  </MsaButton>
+                </div>
+                <MsaButton
+                  variant="outlined"
+                  disabled={busy}
+                  onClick={() => void resolve('deny')}
+                >
+                  {t.chat.authReject}
+                </MsaButton>
+                  </>
+                )}
               </div>
             )}
           </div>

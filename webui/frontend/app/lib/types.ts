@@ -7,7 +7,12 @@ export type MemoryBackend = 'file' | 'vector'
 
 /** Project-level tool authorization: 'restricted' = every non-whitelisted
  * tool asks (default), 'auto' = full access, no asks. */
-export type PermissionMode = 'restricted' | 'auto'
+export type PermissionMode =
+  | 'restricted'
+  | 'auto'
+  | 'accept_edits'
+  | 'delegate'
+  | 'plan'
 
 export interface Project {
   id: string

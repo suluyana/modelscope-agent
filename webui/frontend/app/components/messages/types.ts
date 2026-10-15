@@ -17,4 +17,11 @@ export type OnOpenStep = (step: AgentStep) => void
  * workspace rail and selects the given workspace-relative path. */
 export type OnOpenFile = (path: string) => void
 
+/** Open a teammate private stream or the Lead LLM session. */
+export type OnOpenDispatch = (info: {
+  kind?: 'worker' | 'lead'
+  dispatchId?: string
+  atName?: string
+}) => void
+
 export type { AgentStep, AgentTask, StepKind }

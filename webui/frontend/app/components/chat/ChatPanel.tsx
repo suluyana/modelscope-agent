@@ -46,7 +46,8 @@ import type {
 import type {
   ArtifactRef,
   OnOpenStep,
-  OnOpenFile
+  OnOpenFile,
+  OnOpenDispatch
 } from '~/components/messages/types'
 import type {
   ThinkingFile,
@@ -90,6 +91,10 @@ interface ChatPanelProps {
   /** Fired when a user-attached file card is clicked (host opens the rail and
    * selects that workspace file). */
   onOpenFile?: OnOpenFile
+  /** Fired when a teammate bubble's "完整过程" is clicked. */
+  onOpenDispatch?: OnOpenDispatch
+  /** Stop this teammate dispatch from a preview card or receipt. */
+  onCancelDispatch?: (dispatchId: string) => void
   /**
    * Custom composer rendered in place of the default Welcome+Sender empty
    * state. Receives a `submit(text)` callback wired to the same useXChat
@@ -172,6 +177,8 @@ export function ChatPanel({
   workspaceOpen,
   onOpenStep,
   onOpenFile,
+  onOpenDispatch,
+  onCancelDispatch,
   renderEmpty,
   renderSender,
   autoSubmitMessage,
@@ -287,11 +294,7 @@ export function ChatPanel({
       // Workspace may have new/modified files from this turn.
       dispatchWorkspaceChanged()
     }
-    // Title/category generated (at `done`): refresh again so the summarized
-    // title + topic icon replace the cheap first-line title in the lists.
-    provider.onSessionMeta = () => {
-      revalidator.revalidate()
-    }
+    // onSessionMeta is wired in a later effect (needs startTeamReplyPoll).
   }, [provider, revalidator, sessionId, effectiveProjectId, onSessionStarted])
 
   const {
@@ -910,6 +913,41 @@ export function ChatPanel({
   // and the backend could build a second runtime racing the interrupt seal.
   const [stopping, setStopping] = useState(false)
 
+  // True while a live turn (stream / attach / stop-seal) must not be hidden by
+  // a history refresh bumping seedLen — that was wiping the main-agent bubble
+  // when a Team @codex poll landed mid-turn.
+  const liveTurnRef = useRef(false)
+  liveTurnRef.current = isRequesting || attaching || stopping
+  const displayHistoryRef = useRef(displayHistory)
+  displayHistoryRef.current = displayHistory
+  const pendingHistorySyncRef = useRef(false)
+
+  const mergeTeamBubbles = useCallback((next: AgentMessage[]) => {
+    const prev = displayHistoryRef.current
+    const keyOf = (m: AgentMessage) => {
+      if (m.receiptKind) {
+        return `receipt:${m.receiptKind}:${m.dispatchId || m.content}`
+      }
+      if (m.atName) {
+        return (
+          m.dispatchId ||
+          `${(m.atName || '').toLowerCase()}::${(m.content || '').slice(0, 200)}`
+        )
+      }
+      return ''
+    }
+    const prevKeys = new Set(
+      prev.filter((m) => m.atName || m.receiptKind).map(keyOf),
+    )
+    const additions = next.filter((m) => {
+      if (!m.atName && !m.receiptKind) return false
+      return !prevKeys.has(keyOf(m))
+    })
+    if (additions.length === 0) return false
+    setDisplayHistory([...prev, ...additions])
+    return true
+  }, [])
+
   const refreshMessages = useCallback(() => {
     const sid = sidRef.current
     if (!sid) return Promise.resolve()
@@ -922,6 +960,13 @@ export function ChatPanel({
         // session's view or mis-bump its seed.
         if (sidRef.current !== sid) return
         const hist = historyToAgentMessages(msgs as unknown as HistoryMessage[])
+        // Mid-turn: never bump seedLen (would hide newEntries). Soft-merge
+        // any new @teammate bubbles so they can still appear alongside lead.
+        if (liveTurnRef.current) {
+          mergeTeamBubbles(hist)
+          pendingHistorySyncRef.current = true
+          return
+        }
         // Safety net: never trade local entries for NOTHING. The backend seals
         // failed turns so server history normally contains them, but if a turn
         // died before anything could be persisted, replacing the live view
@@ -969,7 +1014,136 @@ export function ChatPanel({
         setStoppedLocally(false)
       })
       .catch(() => {})
+  }, [mergeTeamBubbles])
+
+  // After `@codex …` dispatches async, poll until the teammate bubble lands
+  // (display-only team_reply rows appear in GET …/messages).
+  const teamPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const stopTeamReplyPoll = useCallback(() => {
+    if (teamPollRef.current != null) {
+      clearInterval(teamPollRef.current)
+      teamPollRef.current = null
+    }
   }, [])
+  const startTeamReplyPoll = useCallback(
+    (expectedMentions?: string[]) => {
+      stopTeamReplyPoll()
+      const sid = sidRef.current
+      if (!sid) return
+      const want = new Set(
+        (expectedMentions || []).map((n) => n.replace(/^@/, '').toLowerCase())
+      )
+      // Track how many @bubbles we already had, and which @names we're still
+      // waiting for — stop only when EVERY expected mention has a bubble (or
+      // timeout). Stopping on the first arrival would drop later teammates.
+      const isTeammateBubble = (m: AgentMessage) =>
+        Boolean(m.atName && !m.receiptKind)
+      const baseline = displayHistoryRef.current.filter(isTeammateBubble).length
+      const startedAt = Date.now()
+      const allWantedPresent = (teamMsgs: AgentMessage[]) => {
+        if (want.size === 0) return teamMsgs.length > baseline
+        const seen = new Set(
+          teamMsgs.map((m) => (m.atName || '').toLowerCase()).filter(Boolean)
+        )
+        for (const name of want) {
+          if (!seen.has(name)) return false
+        }
+        return true
+      }
+      const tick = () => {
+        if (sidRef.current !== sid) {
+          stopTeamReplyPoll()
+          return
+        }
+        if (Date.now() - startedAt > 5 * 60 * 1000) {
+          stopTeamReplyPoll()
+          return
+        }
+        void api
+          .listSessionMessages(sid)
+          .then((msgs) => {
+            if (sidRef.current !== sid) return
+            const next = historyToAgentMessages(
+              msgs as unknown as HistoryMessage[]
+            )
+            const teamMsgs = next.filter(isTeammateBubble)
+            const complete = allWantedPresent(teamMsgs)
+
+            if (liveTurnRef.current) {
+              // Keep the in-flight lead turn visible; only graft new @bubbles.
+              mergeTeamBubbles(next)
+              if (complete) {
+                pendingHistorySyncRef.current = true
+                stopTeamReplyPoll()
+              }
+              return
+            }
+
+            // Same empty-log guard as refreshMessages: a team-only turn can
+            // finish before the @reply is on disk. Replacing with [] would
+            // bump seedLen and flash Welcome over the live 已派给 bubble.
+            if (
+              next.length === 0 &&
+              (displayHistoryRef.current.length > 0 ||
+                messagesLenRef.current > 0)
+            ) {
+              return
+            }
+
+            setDisplayHistory(next)
+            seedLenRef.current = messagesLenRef.current
+            if (complete) stopTeamReplyPoll()
+          })
+          .catch(() => {})
+      }
+      tick()
+      teamPollRef.current = setInterval(tick, 2000)
+    },
+    [mergeTeamBubbles, stopTeamReplyPoll]
+  )
+
+  useEffect(() => () => stopTeamReplyPoll(), [stopTeamReplyPoll])
+
+  // After a mid-turn soft-merge, fully resync history once the lead turn idles
+  // so seedLen / canonical rows stay consistent.
+  useEffect(() => {
+    if (isRequesting || attaching || stopping) return
+    if (!pendingHistorySyncRef.current) return
+    pendingHistorySyncRef.current = false
+    void refreshMessages()
+  }, [isRequesting, attaching, stopping, refreshMessages])
+
+  // Title/category + async Team @reply poll (declared after poll helpers).
+  useEffect(() => {
+    provider.onSessionMeta = (meta) => {
+      revalidator.revalidate()
+      if (meta.pendingTeam) startTeamReplyPoll(meta.mentions)
+    }
+  }, [provider, revalidator, startTeamReplyPoll])
+
+  // Reload / route remount: live `pendingTeam` meta is gone, but the user row
+  // may already be on disk while @replies are still in flight. Resume polling.
+  const resumePollOnceRef = useRef(false)
+  useEffect(() => {
+    if (resumePollOnceRef.current) return
+    resumePollOnceRef.current = true
+    const hist = initialMessages ?? []
+    const lastUser = [...hist].reverse().find((m) => m.role === 'user')
+    const text = String(lastUser?.content || '')
+    const mentions = [
+      ...text.matchAll(/@([A-Za-z0-9_]+)/g)
+    ].map((m) => m[1])
+    if (mentions.length === 0) return
+    const have = new Set(
+      hist
+        .filter((m) => m.atName && !m.receiptKind)
+        .map((m) => (m.atName || '').toLowerCase())
+        .filter(Boolean)
+    )
+    const pending = mentions.filter((n) => !have.has(n.toLowerCase()))
+    if (pending.length) startTeamReplyPoll(pending)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startTeamReplyPoll])
 
   // The turn an attach stream is replaying must not ALSO be rendered from
   // history. The agent persists each round as it closes, so a turn rejoined
@@ -1272,6 +1446,8 @@ export function ChatPanel({
                 sessionId={sessionId ?? startedSessionId}
                 onOpenStep={onOpenStep}
                 onOpenFile={onOpenFile}
+                onOpenDispatch={onOpenDispatch}
+                onCancelDispatch={onCancelDispatch}
               />
             </ArtifactDeletedProvider>
           ) : (

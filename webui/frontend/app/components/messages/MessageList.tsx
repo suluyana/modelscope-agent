@@ -15,11 +15,44 @@ import type { AgentMessage } from '~/lib/agentProvider'
 import { AssistantMessage } from './AssistantMessage'
 import { splitTurn } from './turnSplit'
 import { UserBubble } from './UserBubble'
-import type { OnOpenStep, OnOpenFile } from './types'
+import type { OnOpenStep, OnOpenFile, OnOpenDispatch } from './types'
 import { IconButton } from '../common/IconButton'
 import DownloadIcon from '~/assets/icons/download.svg?react'
 import CopyIcon from '~/assets/icons/copy.svg?react'
 import './MessageList.css'
+
+function TeamReceiptBar({
+  message,
+  onCancelDispatch,
+}: {
+  message: AgentMessage
+  onCancelDispatch?: (dispatchId: string) => void
+}) {
+  const { t } = useT()
+  const canStop =
+    Boolean(onCancelDispatch && message.dispatchId) &&
+    (message.receiptKind === 'dispatch_start' ||
+      message.receiptKind === 'dispatch_receipt')
+  return (
+    <div
+      data-testid="team-receipt"
+      data-receipt-kind={message.receiptKind || ''}
+      className="flex items-center justify-between gap-2 rounded-md bg-msa-fill-2 px-3 py-1.5 text-xs text-msa-text-3"
+    >
+      <span>{message.content}</span>
+      {canStop ? (
+        <button
+          type="button"
+          data-testid="team-receipt-cancel"
+          className="shrink-0 text-xs text-msa-text-danger underline underline-offset-2"
+          onClick={() => onCancelDispatch!(message.dispatchId as string)}
+        >
+          {t.team.stopDispatch}
+        </button>
+      ) : null}
+    </div>
+  )
+}
 
 export interface ChatMessageItem {
   id: string
@@ -105,8 +138,13 @@ export const MessageList = forwardRef<
     sessionId?: string | null
     onOpenStep?: OnOpenStep
     onOpenFile?: OnOpenFile
+    onOpenDispatch?: OnOpenDispatch
+    onCancelDispatch?: (dispatchId: string) => void
   }
->(function MessageList({ items, sessionId, onOpenStep, onOpenFile }, ref) {
+>(function MessageList(
+  { items, sessionId, onOpenStep, onOpenFile, onOpenDispatch, onCancelDispatch },
+  ref,
+) {
   const { t } = useT()
   const listRef = useRef<ComponentRef<typeof Bubble.List>>(null)
   const [showScrollDown, setShowScrollDown] = useState(false)
@@ -171,7 +209,7 @@ export const MessageList = forwardRef<
     // process detail, not the answer. Parts-less messages (error/fallback)
     // copy their plain content; an interrupted turn has no summary → no button.
     const copyText =
-      message.role === 'assistant' && !inFlight
+      message.role === 'assistant' && !inFlight && !message.receiptKind
         ? message.parts?.length
           ? (splitTurn(message.parts, false).summary?.text ?? '').trim()
           : (message.content || '').trim()
@@ -246,15 +284,28 @@ export const MessageList = forwardRef<
               body: 'w-full',
               root: 'px-0'
             },
-            contentRender: (content: BubbleContent) => (
-              <AssistantMessage
-                message={content.message}
-                streaming={content.streaming}
-                sessionId={sessionId}
-                onOpenStep={onOpenStep}
-                onOpenFile={onOpenFile}
-              />
-            )
+            contentRender: (content: BubbleContent) =>
+              content.message.receiptKind ? (
+                <TeamReceiptBar
+                  message={content.message}
+                  onCancelDispatch={onCancelDispatch}
+                />
+              ) : (
+                <AssistantMessage
+                  message={content.message}
+                  streaming={content.streaming}
+                  sessionId={sessionId}
+                  onOpenStep={onOpenStep}
+                  onOpenFile={onOpenFile}
+                  onOpenDispatch={onOpenDispatch}
+                  onCancelDispatch={onCancelDispatch}
+                  collapsiblePreview={
+                    !content.streaming &&
+                    (Boolean(content.message.atName) ||
+                      content.message.role === 'assistant')
+                  }
+                />
+              )
           }
         }}
         items={bubbleItems}

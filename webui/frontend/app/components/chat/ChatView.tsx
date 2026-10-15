@@ -5,11 +5,15 @@ import { ChatBackdrop } from '~/components/chat/ChatBackdrop'
 import { ChatPanel } from '~/components/chat/ChatPanel'
 import type { ChatComposerCtx } from '~/components/chat/ChatPanel'
 import { Composer } from '~/components/common/Composer'
+import { FleetPresence } from '~/components/team/FleetPresence'
 import { SessionRightRail } from '~/components/session/SessionRightRail'
 import { RailDrawer } from '~/components/common/RailDrawer'
 import { StepDetailRail } from '~/components/messages/StepDetailRail'
-import type { AgentStep } from '~/components/messages/types'
+import { DispatchTranscriptPanel } from '~/components/team/DispatchTranscriptPanel'
+import { LeadSessionPanel } from '~/components/team/LeadSessionPanel'
+import type { AgentStep, OnOpenDispatch } from '~/components/messages/types'
 import { api } from '~/lib/api'
+import { teamApi } from '~/lib/teamApi'
 import { useT } from '~/lib/i18n'
 import { WorkspaceFilesProvider } from '~/lib/workspaceFiles'
 import { useMatchMedia } from '~/lib/useMatchMedia'
@@ -144,6 +148,11 @@ export function ChatView({
   // <xl); `detailStep` decides its content (a clicked step's detail, else the
   // workspace).
   const [detailStep, setDetailStep] = useState<AgentStep | null>(null)
+  const [detailDispatch, setDetailDispatch] = useState<{
+    kind: 'worker' | 'lead'
+    dispatchId?: string
+    atName?: string
+  } | null>(null)
   // External "open this file in the workspace" request (a click on a file card
   // in a chat bubble). Nonce bumps per click so re-clicking the same file after
   // closing the rail re-selects it.
@@ -172,6 +181,7 @@ export function ChatView({
   // Workspace toggle button: show the file workspace (clearing any step detail).
   const toggleRail = () => {
     setDetailStep(null)
+    setDetailDispatch(null)
     if (isLg) {
       setAnimating(true)
       setRailOpen((p) => !p)
@@ -180,13 +190,22 @@ export function ChatView({
   // Clicking a step card opens its detail in the rail (a dedicated component,
   // not the file workspace).
   const openStepDetail = (step: AgentStep) => {
+    setDetailDispatch(null)
     setDetailStep(step)
     openRail()
   }
-  // Clicking a file card in a chat bubble opens the file workspace (clearing any
-  // step detail) and selects that path for preview.
+  const openDispatchTranscript: OnOpenDispatch = (info) => {
+    setDetailStep(null)
+    setDetailDispatch({
+      kind: info.kind ?? (info.dispatchId ? 'worker' : 'lead'),
+      dispatchId: info.dispatchId,
+      atName: info.atName,
+    })
+    openRail()
+  }
   const openWorkspaceFile = (path: string) => {
     setDetailStep(null)
+    setDetailDispatch(null)
     setOpenFileReq((prev) => ({ path, nonce: (prev?.nonce ?? 0) + 1 }))
     openRail()
   }
@@ -301,6 +320,7 @@ export function ChatView({
             {t.home.welcome}
           </p>
         </ChatBackdrop>
+        <FleetPresence />
         <Composer
           modelSelection={modelSelection}
           modelSelectionDisabled={isNewChat && ctx.loading}
@@ -322,6 +342,7 @@ export function ChatView({
   )
   const renderSender = (ctx: ChatComposerCtx) => (
     <div>
+      <FleetPresence />
       <Composer
         modelSelection={modelSelection}
         modelSelectionDisabled={isNewChat && ctx.loading}
@@ -338,10 +359,10 @@ export function ChatView({
   )
   const chatPanel = (
     <ChatPanel
-      // Remount per session so each conversation gets a fresh useXChat store
-      // seeded with its own history (project-session reuses this route module
-      // across :sessionId, so without a key the store would keep the previous
-      // session's messages).
+      // Remount per *route* session so project-session reuse doesn't keep the
+      // previous conversation's useXChat store. Do NOT key on the mid-turn
+      // startedSessionId: a homepage first send only replaceState's the URL,
+      // and changing the key here would wipe the live turn back to Welcome.
       key={sessionId ?? 'new'}
       sessionId={sessionId}
       prepareModel={modelSelection.ready}
@@ -356,6 +377,10 @@ export function ChatView({
       initialRunning={initialRunning}
       onOpenStep={openStepDetail}
       onOpenFile={openWorkspaceFile}
+      onOpenDispatch={openDispatchTranscript}
+      onCancelDispatch={(dispatchId) => {
+        void teamApi.cancelDispatch(dispatchId)
+      }}
       onSessionStarted={handleSessionStarted}
       renderEmpty={renderEmpty}
       renderSender={renderSender}
@@ -364,16 +389,28 @@ export function ChatView({
 
   // Right-rail content: a clicked step's detail takes precedence; otherwise the
   // file workspace (detail mode only — new chat has no project/workspace).
-  const railBody = detailStep ? (
-    <StepDetailRail step={detailStep} onClose={closeRail} clip={animating} />
-  ) : activeProject ? (
-    <SessionRightRail
-      project={activeProject}
-      active={railOpen || railDrawer}
-      openFile={openFileReq ?? undefined}
-      onClose={closeRail}
-    />
-  ) : null
+  const railBody =
+    detailDispatch?.kind === 'lead' && activeSessionId ? (
+      <LeadSessionPanel sessionId={activeSessionId} onClose={closeRail} />
+    ) : detailDispatch?.dispatchId ? (
+      <DispatchTranscriptPanel
+        dispatchId={detailDispatch.dispatchId}
+        atName={detailDispatch.atName}
+        onClose={closeRail}
+        onCancel={() => {
+          void teamApi.cancelDispatch(detailDispatch.dispatchId as string)
+        }}
+      />
+    ) : detailStep ? (
+      <StepDetailRail step={detailStep} onClose={closeRail} clip={animating} />
+    ) : activeProject ? (
+      <SessionRightRail
+        project={activeProject}
+        active={railOpen || railDrawer}
+        openFile={openFileReq ?? undefined}
+        onClose={closeRail}
+      />
+    ) : null
 
   // Squeezable rail (≥xl): a right-side card that pushes the chat with a width
   // transition — same behavior as the workspace. The inner content is pinned to
@@ -387,7 +424,10 @@ export function ChatView({
         setAnimating(false)
         // Clear the content only on a genuine close (both presentations shut),
         // never during a breakpoint migration that hands off to the drawer.
-        if (!railOpen && !railDrawer) setDetailStep(null)
+        if (!railOpen && !railDrawer) {
+          setDetailStep(null)
+          setDetailDispatch(null)
+        }
       }}
       className={`overflow-hidden shrink-0 ${
         railDragging
@@ -426,39 +466,30 @@ export function ChatView({
       afterOpenChange={(open) => {
         // Clear the content only on a genuine close, not when a breakpoint
         // migration hands the drawer's content off to the side-by-side panel.
-        if (!open && !railOpen) setDetailStep(null)
+        if (!open && !railOpen) {
+          setDetailStep(null)
+          setDetailDispatch(null)
+        }
       }}
     >
       {railBody}
     </RailDrawer>
   )
 
-  // New-chat mode: no file workspace, but a clicked step still opens the
-  // squeezable detail rail beside the chat.
-  if (!showWorkspace) {
-    return (
-      <WorkspaceFilesProvider projectId={null}>
-        <div className="flex h-full min-h-0">
-          <section className="relative flex min-h-0 min-w-0 flex-1">
-            <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-              {chatPanel}
-            </div>
-            {railPanel}
-          </section>
-          {railDrawerEl}
-        </div>
-      </WorkspaceFilesProvider>
-    )
-  }
-
-  // Detail mode: chat + collapsible right rail (workspace or step detail).
+  // One tree for new-chat and session detail. Branching two full returns used
+  // to remount ChatPanel the moment the first homepage send created a session
+  // (showWorkspace flipped after getProject) — the live turn vanished and the
+  // Welcome empty state flashed back.
   return (
     <WorkspaceFilesProvider projectId={activeProject?.id ?? null}>
       <div className="flex h-full min-h-0">
-        <section className="relative flex min-h-0 min-w-0 flex-1 rounded-xl bg-msa-fill-0">
-          {/* Chat area */}
+        <section
+          className={`relative flex min-h-0 min-w-0 flex-1${
+            showWorkspace ? ' rounded-xl bg-msa-fill-0' : ''
+          }`}
+        >
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-            {!railOpen && (
+            {showWorkspace && !railOpen ? (
               <Button
                 shape="round"
                 icon={<CollectionIcon className="h-5 w-5" />}
@@ -470,14 +501,11 @@ export function ChatView({
               >
                 {t.session.workspaceTitle}
               </Button>
-            )}
+            ) : null}
             {chatPanel}
           </div>
-
-          {/* Right rail: workspace or step detail, width transition. */}
           {railPanel}
         </section>
-
         {railDrawerEl}
       </div>
     </WorkspaceFilesProvider>
