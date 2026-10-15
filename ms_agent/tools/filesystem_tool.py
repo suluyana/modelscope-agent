@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import asyncio
 import base64
@@ -111,6 +112,7 @@ class FileSystemTool(ToolBase):
             ]
         self._ws = WorkspaceContext.from_config(config)
         self.output_dir = str(self._ws.root)
+        self._config = config
         self.trust_remote_code = kwargs.get('trust_remote_code', False)
         self.allow_read_all_files = getattr(
             getattr(config.tools, 'file_system', {}), 'allow_read_all_files',
@@ -193,7 +195,10 @@ class FileSystemTool(ToolBase):
                     ('Read the content of one or more files.\n\n'
                      '- `paths`: list of relative file paths to read (preferred).\n'
                      '- `path`: single relative file path (alias when the model passes one file).\n'
-                     '- For image files (png/jpg/jpeg/gif/webp), returns base64-encoded content.\n'
+                     '- Image files (png/jpg/jpeg/gif/webp) are returned AS IMAGES, attached to\n'
+                     '  the result — look at them directly. They are not readable as text, and\n'
+                     '  `offset`/`limit` do not apply. If you cannot see an attached image, the\n'
+                     '  current model has image understanding disabled.\n'
                      '- `offset`: line number to start reading from (1-based). '
                      'Only effective when paths has exactly one element. Omit to read from the beginning.\n'
                      '- `limit`: number of lines to read. '
@@ -785,6 +790,31 @@ class FileSystemTool(ToolBase):
             out = [path.strip()]
         return out
 
+    def _images_reach_the_model(self) -> bool:
+        """Whether an image this tool returns can actually be seen.
+
+        The tool and the transport must not disagree about this. The transport
+        drops a tool result's images when the switch is off (see
+        ``multimodal.openai_tool_media_message``), so a tool that always said
+        "attached as an image" was, in exactly that case, telling the model
+        something no layer would make true — and the model then answered as if
+        it had looked.
+
+        Reads the same per-model switch the transports resolve from, and fails
+        CLOSED: an unusual config that hides the flag makes the tool describe a
+        file it cannot show, which is recoverable, rather than promise a picture
+        that never arrives, which is not.
+        """
+        llm = getattr(self._config, 'llm', None) if self._config else None
+        if llm is None:
+            return False
+        from ms_agent.llm.vision import _as_bool
+        for name in ('supports_vision', 'vision_supported'):
+            value = getattr(llm, name, None)
+            if value is not None:
+                return _as_bool(value)
+        return False
+
     async def read_file(self,
                         paths: Optional[List[str]] = None,
                         path: Optional[str] = None,
@@ -819,6 +849,10 @@ class FileSystemTool(ToolBase):
             return await self._read_files_abbreviated(paths)
 
         results = {}
+        # Structured image references collected while walking the paths. Returned
+        # alongside the text so the transports can put the pixels in the image
+        # channel instead of stringifying them into the text one.
+        image_refs: list = []
         use_line_range = len(paths) == 1 and (offset is not None
                                               or limit is not None)
 
@@ -835,14 +869,55 @@ class FileSystemTool(ToolBase):
 
                 # --- Image files ---
                 if ext in self.IMAGE_EXTENSIONS:
-                    with open(target_path_real, 'rb') as f:
-                        raw = f.read()
+                    # Two channels, and the bytes belong in the other one. This
+                    # dict is JSON-serialized into the tool message's TEXT
+                    # content, so returning base64 here put the image where a
+                    # model cannot decode it: tens of thousands of tokens of
+                    # literal characters, zero comprehension, and an inflated
+                    # context estimate that re-fires compaction every round
+                    # (see session/strategies/tool_pruner).
+                    #
+                    # So: a short status in the text, and a structured reference
+                    # collected below into ``attachments``, which the transports
+                    # expand into a real image block. The model genuinely sees
+                    # the file it asked to read.
                     media_type = f'image/{ext}' if ext != 'jpg' else 'image/jpeg'
-                    results[path] = {
-                        'type': 'image',
-                        'media_type': media_type,
-                        'base64': base64.b64encode(raw).decode('ascii'),
-                    }
+                    size = os.path.getsize(target_path_real)
+                    if self._images_reach_the_model():
+                        image_refs.append({
+                            'type': 'image',
+                            'path': path,
+                            'media_type': media_type,
+                            'label': f'Image: {os.path.basename(path)}',
+                        })
+                        results[path] = {
+                            'type': 'image',
+                            'media_type': media_type,
+                            'bytes': size,
+                            'shown_as_image': True,
+                            'message':
+                            (f'This {media_type} image ({size} bytes) is '
+                             'attached below as an image. Read it from the '
+                             'image, not from this text.'),
+                        }
+                    else:
+                        # The switch decides, and the tool has to agree with it.
+                        # Claiming "attached as an image" while the transport
+                        # attaches nothing is how the model ended up describing
+                        # pictures it never received. Producing no attachment
+                        # also saves encoding bytes nobody will look at.
+                        results[path] = {
+                            'type': 'image',
+                            'media_type': media_type,
+                            'bytes': size,
+                            'shown_as_image': False,
+                            'message':
+                            ('Image understanding is off for the current '
+                             'model, so this file cannot enter the '
+                             'conversation as an image and cannot be read as '
+                             'text either. Do not guess or infer its '
+                             'contents.'),
+                        }
                     continue
 
                 # --- Text files ---
@@ -853,17 +928,23 @@ class FileSystemTool(ToolBase):
                         f'Use offset and limit to read specific portions.')
                     continue
 
-                # Dedup: return stub if file unchanged since last read
+                # Whether this path was read before, and looks the same. Used
+                # only to ANNOTATE the content — never to withhold it.
+                #
+                # Withholding assumed the earlier read was still in the model's
+                # context, which the tool cannot know: after a truncation or a
+                # compaction it is not, and the model is then unable to get the
+                # file back at all. Observed consequence — it fell back to the
+                # shell, hit an approval it could not clear, and finally edited
+                # the file to reconstruct what it could no longer see. The
+                # mtime comparison is also not proof of sameness: two writes
+                # within one filesystem timestamp tick are indistinguishable,
+                # so this could withhold content that HAD changed.
                 mtime = os.path.getmtime(target_path_real)
                 cached = self._read_cache.get(target_path_real)
-                if (cached and cached['mtime'] == mtime
-                        and cached['offset'] == offset
-                        and cached['limit'] == limit):
-                    results[path] = {
-                        'type': 'file_unchanged',
-                        'message': 'File has not changed since last read.',
-                    }
-                    continue
+                unchanged = bool(cached and cached['mtime'] == mtime
+                                 and cached['offset'] == offset
+                                 and cached['limit'] == limit)
 
                 with open(target_path_real, 'rb') as f:
                     raw_bytes = f.read()
@@ -895,7 +976,14 @@ class FileSystemTool(ToolBase):
                 else:
                     selected = lines
 
-                results[path] = ''.join(selected)
+                body = ''.join(selected)
+                if unchanged:
+                    # Says the same thing the old stub said, without taking the
+                    # content away to say it. The model can now decide for
+                    # itself whether it still had this in context.
+                    body = ('[note: unchanged since your last read of this '
+                            'file]\n' + body)
+                results[path] = body
 
                 # Update dedup cache
                 self._read_cache[target_path_real] = {
@@ -908,7 +996,13 @@ class FileSystemTool(ToolBase):
                 results[path] = f'Read file <{path}> failed: FileNotFound'
             except Exception as e:
                 results[path] = f'Read file <{path}> failed, error: ' + str(e)
-        return json.dumps(results, indent=2, ensure_ascii=False)
+        text = json.dumps(results, indent=2, ensure_ascii=False)
+        if image_refs:
+            # Dict form so the agent's ToolResult picks up ``attachments`` and
+            # carries the pixels to the image channel. A read with no images
+            # returns the same plain string as before, so nothing else moves.
+            return {'result': text, 'attachments': image_refs}
+        return text
 
     async def _read_files_abbreviated(self, paths: list[str]) -> str:
         results = {}

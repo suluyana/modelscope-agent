@@ -70,6 +70,10 @@ ms-agent run --config path/to/agent.yaml --query "Hello"
 | `--animation_mode` | Animation mode for the video-generation project: `auto` / `human` | `None` |
 | `--knowledge_search_paths` | Comma-separated list of paths for knowledge search | `None` |
 
+Automatic workspace snapshots are disabled by default. To create a Git-backed
+snapshot before each task, set `enable_snapshots: true` at the top level of the
+agent YAML configuration. Existing snapshots are retained when this is disabled.
+
 ---
 
 ## tui — Terminal UI
@@ -94,19 +98,35 @@ ms-agent tui --config path/to/agent.yaml
 
 ## ui — Web UI Server
 
-Launch the Web UI server.
+Start the WebUI and open it in a browser. Packages published on PyPI include prebuilt
+pages and styles; the first start installs frontend runtime dependencies in a
+user cache. Source installations also prepare and rebuild the frontend when needed.
 
 ```shell
-ms-agent ui --host 0.0.0.0 --port 7860
+ms-agent ui
+ms-agent ui --port 8080 --no-browser
 ```
 
-| Argument | Description | Default |
+| Argument | Behavior | Default |
 | --- | --- | --- |
-| `--host` | The server host to bind to | `0.0.0.0` |
-| `--port` | The server port to bind to | `7860` |
-| `--reload` | Enable auto-reload for development (flag) | `false` |
-| `--production` | Run in production mode (serve built frontend, flag) | `false` |
-| `--no-browser` | Do not automatically open the browser (flag) | `false` |
+| `--host` | Public bind address | `127.0.0.1` |
+| `--port` | Exact public port; an occupied explicit port fails | First free from 8000 |
+| `--backend-port` | Internal loopback port, different from public port | Next free port |
+| `--no-browser` | Leave opening the browser to the user | `false` |
+| `--skip-install` | Do not download/synchronize dependencies; still validate build and CSS | `false` |
+| `--production` | Compatibility alias for default SSR behavior | `false` |
+| `--reload` | Currently rejected; use the documented development commands | `false` |
+| `--prepare-only` | Prepare resources/dependencies and exit | `false` |
+| `--startup-timeout` | Startup deadline in seconds | `120` |
+
+The WebUI requires Python 3.12+, Node.js 22.22.0+ and pnpm 10.17.1; source setup
+also uses uv 0.5+. Explicit ports must be available, and the public and internal
+API ports must differ. If either service exits unexpectedly, the launcher stops
+the other service. Settings and sessions use `~/.ms_agent` by default; set
+`MS_AGENT_HOME` to choose another directory.
+
+See the [WebUI guide](https://github.com/modelscope/ms-agent/blob/main/webui/README.md)
+for installation, configuration, Windows and hot-reload development.
 
 ---
 

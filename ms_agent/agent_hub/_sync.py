@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from ms_agent.utils.logger import get_logger
 from ._cache import cache_dir
 from ._defaults import get_defaults
+from ._secrets import redact_outbound
 
 if TYPE_CHECKING:
     from modelscope_hub.agent import AgentApi, RemoteFileInfo
@@ -75,24 +76,35 @@ def backup_local(spec, name: str) -> Path:
     return zip_path
 
 
-def sanitize_outbound(resources: dict, spec) -> dict:
+def sanitize_outbound(resources: dict,
+                      spec,
+                      findings: list | None = None) -> dict:
     """Strip machine-local secrets from local files before they are pushed.
 
-    Symmetric to the per-file inbound sanitize hook: applies
-    ``spec.sanitize_outbound_file`` to every collected file so secrets a user
-    left in a local config (e.g. hermes ``config.yaml``, openhuman
-    ``config.toml``, qwenpaw ``agent.json``) are never uploaded to the remote
-    repo -- and therefore never written into its git history.
+    Two layers, both applied to EVERY collected file: the framework's own
+    ``spec.sanitize_outbound_file`` hook, which owns the structural cleaning of
+    the config files it knows about and fails closed (``ValueError``) on one it
+    cannot parse; then :func:`._secrets.redact_outbound`, which decides on
+    content rather than path and so also covers ``skills/*``, the persona and
+    memory documents, and the frameworks with no hook at all (BUG-0909-01).
 
-    Accepts and returns the same ``{rel_path: bytes}`` mapping
-    ``collect_bytes`` produces (``str`` values are encoded as UTF-8, matching
-    the push path which uploads bytes).
+    *findings*, when given, receives one :class:`._secrets.Finding` per redacted
+    secret (never the secret text) so the caller can report what was stripped.
+
+    Accepts and returns the ``{rel_path: bytes}`` mapping ``collect_bytes``
+    produces (``str`` values are encoded as UTF-8, matching the push path). A
+    file with nothing to redact keeps its ORIGINAL bytes object:
+    ``drop_unchanged_defaults`` and the sha256 push-skip both compare bytes.
     """
     out: dict = {}
     for rel, content in resources.items():
         raw = content if isinstance(content,
                                     bytes) else content.encode('utf-8')
-        out[rel] = spec.sanitize_outbound_file(rel, raw)
+        cleaned = spec.sanitize_outbound_file(rel, raw)
+        cleaned, hits = redact_outbound(rel, cleaned)
+        if findings is not None:
+            findings.extend(hits)
+        out[rel] = cleaned
     return out
 
 
@@ -184,6 +196,43 @@ def _retry_on_master_missing(fn, *, retries: int = 6, delay: float = 1.0):
             raise
 
 
+def _verify_visibility_or_abort(client: 'AgentApi', username: str,
+                                name: str, requested: str) -> None:
+    """Read back a freshly created repo's visibility; abort on a leak.
+
+    The visibility flag is set at creation time (not subject to the file-tree
+    eventual-consistency lag), so a private request that reads back as public
+    means the server did not honor it and any push would leak. Rather than
+    report success with a ``private`` label the server never applied, raise so
+    the caller aborts before uploading a single byte.
+
+    Conservative on purpose: only a POSITIVE ``public`` reading fails. If the
+    metadata cannot be read (transient error, anonymous-probe fallback with no
+    fields, or an unrecognized value), proceed rather than block a legitimate
+    upload on an unverifiable state.
+    """
+    if requested != 'private':
+        return
+    from modelscope_hub.agent import agent_visibility_label
+    try:
+        info = client.repo_info(username, name)
+    except Exception as exc:
+        logger.warning(
+            'Could not verify visibility for %s/%s (%s); proceeding.',
+            username, name, exc)
+        return
+    if not info:
+        logger.warning(
+            'Could not read back visibility for %s/%s; proceeding.', username,
+            name)
+        return
+    if agent_visibility_label(info) == 'public':
+        raise RuntimeError(
+            f'requested private but {username}/{name} was created PUBLIC on '
+            f'the server; aborting before upload to avoid leaking content. '
+            f'Delete the repo and retry, or check server-side permissions.')
+
+
 def push_resources(
     client: 'AgentApi',
     username: str,
@@ -214,15 +263,24 @@ def push_resources(
         return
 
     # Ensure repo exists (idempotent create).
+    created = False
     try:
         if not client.check_repo(username, name):
             client.create_repo(
                 username, name, framework=framework, visibility=visibility)
-            logger.info('Created empty agent repo %s/%s (framework=%s, %s).',
-                        username, name, framework, visibility)
+            created = True
+            logger.info(
+                'Created empty agent repo %s/%s (framework=%s, requested '
+                'visibility=%s).', username, name, framework, visibility)
     except Exception as exc:
         logger.warning('create_repo check failed (%s), proceeding anyway.',
                        exc)
+
+    # Before pushing any content, confirm the server actually honored a
+    # private request -- a mismatch here used to be reported as a successful
+    # "private" upload while the repo was in fact public (silent leak).
+    if created:
+        _verify_visibility_or_abort(client, username, name, visibility)
 
     # Idempotent upsert: skip files whose content already matches the remote.
     # A repeated full upload of unchanged content would otherwise issue
@@ -508,6 +566,8 @@ def push_mirror(
             prune_patterns=prune_patterns,
             visibility=visibility)
         return
+
+    _verify_visibility_or_abort(client, username, name, visibility)
 
     remote_sha_map = {f.path: f.sha256 for f in remote_files}
     remote_paths = set(remote_sha_map.keys())

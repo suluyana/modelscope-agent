@@ -8,17 +8,20 @@ import json
 import math
 import os
 import sys
+import time
 import uuid
 from copy import copy
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ms_agent.llm.utils import Tool, ToolCall
+from ms_agent.tools.arg_coercion import coerce_arguments
 from ms_agent.tools.agent_tool import AgentTool
 from ms_agent.tools.base import ToolBase
 from ms_agent.tools.code import CodeExecutionTool, LocalCodeExecutionTool
 from ms_agent.tools.filesystem_tool import FileSystemTool
 from ms_agent.tools.image_generator import ImageGenerator
+from ms_agent.tools.image_reader_tool import ImageReaderTool
 
 try:
     from ms_agent.tools.mcp_client import MCPClient
@@ -41,6 +44,40 @@ TOOL_CALL_TIMEOUT = int(os.getenv('TOOL_CALL_TIMEOUT', 120))
 # Hard ceiling for a single tool call, including model-provided ``timeout`` in tool arguments.
 TOOL_CALL_TIMEOUT_MAX = int(os.getenv('TOOL_CALL_TIMEOUT_MAX', 600))
 MAX_CONCURRENT_TOOLS = int(os.getenv('MAX_CONCURRENT_TOOLS', 20))
+
+
+def _truncate_tool_output(response: str, tool_ins: Any) -> str:
+    """Bound one tool result, honouring what the tool declared about itself.
+
+    The global cap exists so a runaway result cannot eat the context window.
+    But cutting a payload in half and splicing a notice into the gap assumes
+    prose: done to JSON it lands inside a string literal and the whole result
+    stops parsing, so the model gets neither the data nor an error. Tools that
+    bound themselves therefore opt out (or set their own budget) via
+    ``ToolBase.max_output_chars``; everything else keeps the previous
+    behaviour exactly.
+    """
+    budget = getattr(tool_ins, 'max_output_chars', None)
+    if budget is None:
+        budget = int(os.getenv('MAX_TOOL_OUTPUT_LEN', 20000))
+    if budget == math.inf:  # self-managed: the tool guarantees its own bound
+        return response
+    budget = int(budget)
+    if budget <= 0 or len(response) <= budget:
+        return response
+
+    keep = str(getattr(tool_ins, 'truncate_keep', 'both') or 'both')
+    notice = (
+        f'\n\n...[SYSTEM: Output truncated, {len(response)} chars total, '
+        f'showing {{shown}}]...\n\n')
+    if keep == 'head':
+        return response[:budget] + notice.format(shown=f'first {budget} chars')
+    if keep == 'tail':
+        return notice.format(shown=f'last {budget} chars') + response[-budget:]
+    half = budget // 2
+    return (response[:half]
+            + notice.format(shown=f'first and last {half} chars')
+            + response[-half:])
 
 
 def _tool_on(config, name: str) -> bool:
@@ -143,11 +180,23 @@ class ToolManager:
         if hasattr(config, 'tools') and hasattr(config.tools,
                                                 'video_generator'):
             self.extra_tools.append(VideoGenerator(config))
+        # image_reader is registered ONLY when an auxiliary vision model is
+        # configured: without one the tool can do nothing, and an always-present
+        # tool the model may call and always fail is worse than no tool at all.
+        if _tool_on(config, 'image_reader'):
+            from ms_agent.tools.image_reader_tool import auxiliary_config
+
+            if auxiliary_config(config):
+                self.extra_tools.append(ImageReaderTool(config))
+            else:
+                logger.info(
+                    'tools.image_reader is enabled but '
+                    'llm.vision.auxiliary.model is unset; not registering it')
         if _tool_on(config, 'file_system'):
             self.extra_tools.append(
                 FileSystemTool(
                     config, trust_remote_code=self.trust_remote_code))
-        if hasattr(config, 'tools') and hasattr(config.tools, 'code_executor'):
+        if _tool_on(config, 'code_executor'):
             code_exec_cfg = getattr(config.tools, 'code_executor')
             implementation = getattr(code_exec_cfg, 'implementation',
                                      'sandbox')
@@ -301,16 +350,14 @@ class ToolManager:
         elif (isinstance(self.mcp_config, dict)
               and self.mcp_config.get('mcpServers')):
             logger.warning_once(
-                'mcp package not installed; MCP tools disabled for this run'
-            )
+                'mcp package not installed; MCP tools disabled for this run')
         for tool in self.extra_tools:
             try:
                 await tool.connect()
             except Exception as e:
                 logger.warning(
                     f'Tool {getattr(tool, "name", type(tool).__name__)} '
-                    f'failed to connect: {e}; disabling.'
-                )
+                    f'failed to connect: {e}; disabling.')
 
         # reindex_tool() self-gates its MCP portion on _skip_mcp_reindex, so it
         # is always safe to call here: extra tools get indexed in every path,
@@ -376,6 +423,45 @@ class ToolManager:
         if len(server_name) > max_server_len:
             server_name = server_name[:max(0, max_server_len)]
         return f'{server_name}{self.TOOL_SPLITER}{tool_name}'
+
+    def _resolve_tool_name(self, tool_name: str) -> tuple:
+        """Map what the model asked for onto a registered tool.
+
+        Some models reach for the server segment alone — ``code_executor``
+        instead of ``code_executor---shell_executor`` — and used to get an
+        AssertionError wrapped in a traceback, which says nothing about what
+        the name should have been. When the shorthand picks out exactly one
+        tool there is no ambiguity to resolve, so the call proceeds and the
+        result carries a note; otherwise it is reported as not found, with
+        candidates.
+
+        Returns ``(resolved_name, note)``; ``resolved_name`` is ``None`` when
+        nothing matched.
+        """
+        if tool_name in self._tool_index:
+            return tool_name, ''
+        prefix = f'{tool_name}{self.TOOL_SPLITER}'
+        matches = [key for key in self._tool_index if key.startswith(prefix)]
+        if len(matches) == 1:
+            return matches[0], (
+                f'Note: "{tool_name}" was resolved to "{matches[0]}". '
+                'Use the exact tool name in subsequent calls.')
+        return None, ''
+
+    def _unknown_tool_message(self, tool_name: str) -> str:
+        """Say what to call instead, rather than how the lookup failed."""
+        import difflib
+
+        available = sorted(self._tool_index)
+        close = difflib.get_close_matches(tool_name, available, n=3, cutoff=0.4)
+        if not close:
+            prefix = f'{tool_name}{self.TOOL_SPLITER}'
+            close = [k for k in available if k.startswith(prefix)][:3]
+        detail = (f' Closest matches: {", ".join(close)}.' if close else
+                  f' Available tools: {", ".join(available[:20])}'
+                  f'{" …" if len(available) > 20 else ""}.')
+        return (f'Tool "{tool_name}" is not available.{detail} '
+                'Use the exact tool name from the tool list.')
 
     def _extend_mcp_tool_index(
         self,
@@ -457,7 +543,8 @@ class ToolManager:
                 key = self._build_index_key(server_name, tool['tool_name'])
                 existing = self._tool_index.get(key)
                 if existing is not None:
-                    if existing[0] is not tool_ins or existing[1] != server_name:
+                    if existing[
+                            0] is not tool_ins or existing[1] != server_name:
                         logger.warning(
                             'Tool name collision on %r: keeping owner from %r, '
                             'ignoring new from %r', key, existing[1],
@@ -510,9 +597,28 @@ class ToolManager:
                         tool_args = json.loads(tool_args)
                     except Exception:  # noqa
                         return f'The input {tool_args} is not a valid JSON, fix your arguments and try again'
-                assert tool_name in self._tool_index, f'Tool name {tool_name} not found'
+                resolved_name, resolution_note = self._resolve_tool_name(
+                    tool_name)
+                if resolved_name is None:
+                    return {
+                        'result': self._unknown_tool_message(tool_name),
+                        'is_error': True,
+                    }
+                tool_name = resolved_name
+                tool_info['tool_name'] = tool_name
                 index_snapshot = self._tool_index[tool_name]
-                tool_ins, server_name, _ = index_snapshot
+                tool_ins, server_name, tool_spec = index_snapshot
+
+                # Reconcile the model's JSON with the tool's declared schema
+                # before anyone validates it. The schema is right here in the
+                # index; leaving a quoted number quoted just moves the failure
+                # to the tool, which reports it in terms of its own validator.
+                if isinstance(tool_args, dict):
+                    coerced = coerce_arguments(
+                        tool_args, (tool_spec or {}).get('parameters'))
+                    if coerced is not tool_args:
+                        tool_args = coerced
+                        tool_info['arguments'] = tool_args
 
                 # --- MCP availability (before SafetyGuard / PreToolUse) ---
                 if (tool_ins is self.servers
@@ -538,26 +644,43 @@ class ToolManager:
                     safety_decision = self._safety_guard.check(
                         tool_name, args_dict)
                     if safety_decision.action == 'deny':
-                        return {'result': f'Blocked by safety policy: {safety_decision.reason}',
-                                'is_error': True}
+                        return {
+                            'result':
+                            f'Blocked by safety policy: {safety_decision.reason}',
+                            'is_error': True
+                        }
                     if safety_decision.action == 'ask':
                         resolved = resolve_ask(safety_decision,
                                                self._permission_mode,
                                                self._read_policy)
                         if resolved.action == 'deny':
-                            return {'result': f'Blocked by safety policy: {resolved.reason}',
-                                    'is_error': True}
+                            return {
+                                'result':
+                                f'Blocked by safety policy: {resolved.reason}',
+                                'is_error': True
+                            }
                         if resolved.action == 'ask':
                             if self._permission_enforcer is None:
-                                return {'result': f'Blocked by safety policy (requires confirmation): {resolved.reason}',
-                                        'is_error': True}
+                                return {
+                                    'result':
+                                    f'Blocked by safety policy (requires confirmation): {resolved.reason}',
+                                    'is_error': True
+                                }
                             # interactive mode: force the enforcer to confirm with
                             # the user; whitelist/memory must not bypass a safety
-                            # ask (REVIEW P1-2).
+                            # ask (REVIEW P1-2) — except for the categories a
+                            # user can reasonably settle once for a project,
+                            # where an ask that ignores their answer is just an
+                            # ask they learn to click through.
+                            from ms_agent.permission.ask_resolver import \
+                                REMEMBERABLE_ASK_CATEGORIES
                             from ms_agent.permission.enforcer import \
                                 PermissionDecision
                             safety_force_decision = PermissionDecision(
-                                action='ask', reason=resolved.reason)
+                                action='ask',
+                                reason=resolved.reason,
+                                rememberable=(resolved.category
+                                              in REMEMBERABLE_ASK_CATEGORIES))
 
                 # --- PreToolUse hooks ---
                 hook_result = None
@@ -594,8 +717,10 @@ class ToolManager:
                 if isinstance(perm_out, str):
                     return perm_out
                 if perm_out.action == 'deny':
-                    return {'result': f'Tool call denied: {perm_out.reason}',
-                            'is_error': True}
+                    return {
+                        'result': f'Tool call denied: {perm_out.reason}',
+                        'is_error': True
+                    }
                 if perm_out.updated_args is not None:
                     tool_args = perm_out.updated_args
                     tool_info['arguments'] = tool_args
@@ -629,19 +754,26 @@ class ToolManager:
                         tool_args=call_args),
                     timeout=wait_sec)
 
-                # Truncate excessively long tool outputs to prevent context window explosion
-                max_len = int(os.getenv('MAX_TOOL_OUTPUT_LEN', 20000))
-                if isinstance(response, str) and len(response) > max_len:
-                    half = max_len // 2
-                    trunc_notice = (
-                        f"\n\n...[SYSTEM: Output truncated, {len(response)} chars total, "
-                        f"showing first and last {half} chars]...\n\n"
-                    )
-                    response = response[:half] + trunc_notice + response[-half:]
+                # Truncate excessively long tool outputs to prevent context
+                # window explosion — unless the tool declared its own budget or
+                # said it bounds itself (see ToolBase.max_output_chars).
+                if isinstance(response, str):
+                    response = _truncate_tool_output(response, tool_ins)
 
                 if (self.mcp_success_handler is not None
                         and tool_ins is self.servers):
                     await self.mcp_success_handler(server_name)
+
+                if resolution_note:
+                    # Carried on the successful result so the correction lands
+                    # while the model is looking at what it just did, instead
+                    # of costing it a failed round to discover.
+                    if isinstance(response, dict):
+                        response = dict(response)
+                        response['result'] = (
+                            f'{resolution_note}\n{response.get("result", "")}')
+                    else:
+                        response = f'{resolution_note}\n{response}'
 
                 # --- PostToolUse hooks ---
                 hook_attachments = list(pre_attachments)
@@ -707,7 +839,9 @@ class ToolManager:
                 exc_msg = str(e) or '(no error message)'
                 tn = tool_info.get('tool_name', '(unknown)')
                 tb_lines = tb_str.strip().splitlines()
-                tb_tail = '\n'.join(tb_lines[-6:]) if len(tb_lines) > 6 else '\n'.join(tb_lines)
+                tb_tail = '\n'.join(
+                    tb_lines[-6:]) if len(tb_lines) > 6 else '\n'.join(
+                        tb_lines)
                 if tool_ins is not None and tool_ins is self.servers:
                     await self._report_mcp_failure(
                         server_name,
@@ -733,8 +867,33 @@ class ToolManager:
                     True,
                 }
 
-    async def parallel_call_tool(self, tool_list: List[ToolCall]):
-        tasks = [self.single_call_tool(tool) for tool in tool_list]
+    async def parallel_call_tool(
+        self,
+        tool_list: List[ToolCall],
+        on_result: Optional[Callable[[int, ToolCall, Any, float],
+                                     None]] = None,
+    ):
+        """Run a round's tool calls concurrently, in call order in the result.
+
+        ``on_result(index, tool_call, result, duration_s)`` — when given — fires
+        the moment THAT call returns, rather than after the whole batch. The
+        distinction matters as soon as one call can block for a long time: under
+        interactive permissions a call suspended on a human's approval used to
+        hold back every sibling's completion, so calls that were already done
+        (or needed no approval at all) still looked like they were running until
+        the human answered. It runs on the event loop between tool calls, so
+        keep it cheap and non-throwing — an exception propagates out of the
+        gather and fails the round.
+        """
+
+        async def _call(index: int, tool: ToolCall):
+            started = time.monotonic()
+            result = await self.single_call_tool(tool)
+            if on_result is not None:
+                on_result(index, tool, result, time.monotonic() - started)
+            return result
+
+        tasks = [_call(i, tool) for i, tool in enumerate(tool_list)]
         result = await asyncio.gather(*tasks)
         return result
 

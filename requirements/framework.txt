@@ -1,13 +1,13 @@
 aiohttp
 croniter>=1.3.0
 dotenv
+httpx>=0.28.1
 json5
-loguru
 markdown
 matplotlib
-mcp
+mcp<2
 modelscope>=1.35.2
-modelscope-hub
+modelscope-hub>=0.4.0
 numpy
 omegaconf
 openai
@@ -18,4 +18,5 @@ pytz
 pyyaml
 requests
 rich
+socksio
 typing_extensions

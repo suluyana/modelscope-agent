@@ -13,14 +13,10 @@ import json
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
-from .approval import (
-    ApprovalConflictError,
-    ApprovalRequest,
-    ApprovalStore,
-    MemoryApprovalStore,
-)
+from .approval import (ApprovalConflictError, ApprovalRequest, ApprovalStore,
+                       MemoryApprovalStore)
 
 
 class PermissionAction(str, Enum):
@@ -40,6 +36,17 @@ class PermissionResponse:
 
 
 class PermissionHandler(Protocol):
+    """Confirmation UI for a tool call the policy can't decide on its own.
+
+    Optional duck-typed attribute ``supports_concurrent_asks`` (default
+    ``False`` when absent) declares whether several asks may be in flight at
+    once. It is False for anything bound to the one terminal — N prompts
+    fighting over a single stdin/menu deadlock — so ``PermissionEnforcer``
+    serializes those. A handler that keys pending asks by id and renders them
+    independently (``WebPermissionHandler``) sets it True, so a round's
+    parallel tool calls all surface for decision at the same time instead of
+    one-at-a-time behind whoever the user answers first.
+    """
 
     async def ask(
         self,
@@ -48,11 +55,15 @@ class PermissionHandler(Protocol):
         context: str,
         suggestions: list[str] | None = None,
         call_id: str = '',
-    ) -> PermissionResponse: ...
+    ) -> PermissionResponse:
+        ...
 
 
 class AutoPermissionHandler:
     """Always allows — used as fallback or in auto mode."""
+
+    # Never blocks on anything, so it has no reason to be serialized.
+    supports_concurrent_asks = True
 
     async def ask(
         self,
@@ -82,20 +93,20 @@ class CLIPermissionHandler:
 
         suggestion = suggestions[0] if suggestions else tool_name
 
-        print(f'\n{"="*60}', file=sys.stderr)
+        print(f'\n{"=" * 60}', file=sys.stderr)
         print(f' Permission Required', file=sys.stderr)
-        print(f'{"="*60}', file=sys.stderr)
+        print(f'{"=" * 60}', file=sys.stderr)
         print(f' Tool: {tool_name}', file=sys.stderr)
         print(f' Args: {args_display}', file=sys.stderr)
         if context:
             print(f' Context: {context}', file=sys.stderr)
-        print(f'{"─"*60}', file=sys.stderr)
+        print(f'{"─" * 60}', file=sys.stderr)
         print(f' [y] Allow this once', file=sys.stderr)
         print(f' [s] Allow for this session', file=sys.stderr)
         print(f' [a] Always allow (pattern: {suggestion})', file=sys.stderr)
         print(f' [e] Edit args then execute', file=sys.stderr)
         print(f' [n] Deny', file=sys.stderr)
-        print(f'{"="*60}', file=sys.stderr)
+        print(f'{"=" * 60}', file=sys.stderr)
 
         loop = asyncio.get_running_loop()
         choice = await loop.run_in_executor(
@@ -145,8 +156,12 @@ class EventEmitter(Protocol):
 
 @dataclass
 class _PendingAsk:
+    """One card the user has not answered yet, and what it was about."""
     future: asyncio.Future[PermissionResponse]
     request: ApprovalRequest
+    tool_name: str
+    tool_args: dict
+    forced: bool = False
 
 
 class WebPermissionHandler:
@@ -155,6 +170,12 @@ class WebPermissionHandler:
     Pending asks are written to ``ApprovalStore`` (the ask ledger). Always-allow
     rules are *not* written here — Enforcer records those on ``PermissionMemory``.
     """
+
+    # Pending asks are keyed by request_id and each renders as its own card, so
+    # a round's parallel tool calls can all wait for a decision simultaneously.
+    # Serializing them instead would show one card at a time while the untouched
+    # siblings sat there looking like they were already running.
+    supports_concurrent_asks = True
 
     def __init__(
         self,
@@ -168,9 +189,9 @@ class WebPermissionHandler:
     ) -> None:
         """``timeout=None`` waits until the user answers.
 
-        A 120s cap used to deny the tool call, so closing the tab and
-        approving later could not resume that same Future. Bound the wait
-        only when the host explicitly asks (tests, headless jobs).
+        Expiring the question answers it on their behalf. Bound the wait
+        only when the host explicitly asks (tests, headless jobs, or a
+        full-access session where nobody may be at the keyboard).
         """
         self._pending: dict[str, _PendingAsk] = {}
         self._event_emitter = event_emitter
@@ -187,6 +208,7 @@ class WebPermissionHandler:
         context: str,
         suggestions: list[str] | None = None,
         call_id: str = '',
+        forced: bool = False,
     ) -> PermissionResponse:
         request = ApprovalRequest.create(
             tool_name,
@@ -202,7 +224,13 @@ class WebPermissionHandler:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[PermissionResponse] = loop.create_future()
         self._store.create(request)
-        self._pending[request_id] = _PendingAsk(future=future, request=request)
+        self._pending[request_id] = _PendingAsk(
+            future=future,
+            request=request,
+            tool_name=tool_name,
+            tool_args=dict(tool_args or {}),
+            forced=forced,
+        )
 
         self._event_emitter.emit({
             'type': 'permission_request',
@@ -237,14 +265,32 @@ class WebPermissionHandler:
             return PermissionResponse(
                 action=PermissionAction.DENY,
                 feedback=(
-                    'TIMEOUT: no response within '
-                    f'{self._timeout:.0f}s (not a refusal). '
-                    'Do not re-request the same call as if the user denied it.'
-                ),
+                    f'No response within {self._timeout:.0f}s, so this call '
+                    'was not run. This is a TIMEOUT, not a refusal by the '
+                    'user — nobody saw the request. Do not re-request the '
+                    'same approval; finish what you can without it and say '
+                    'plainly what is left waiting on approval.'),
             )
         finally:
             if future.done():
                 self._pending.pop(request_id, None)
+
+    def awaiting_request_ids(self) -> set:
+        """Every request still open for an answer.
+
+        A host replaying a reconnected turn needs this to tell a card that is
+        still live from one that was already decided.
+        """
+        return {
+            request_id
+            for request_id, pending in self._pending.items()
+            if not pending.future.done()
+        }
+
+    def is_awaiting(self, request_id: str) -> bool:
+        """Whether this request is still open for an answer."""
+        pending = self._pending.get(request_id)
+        return pending is not None and not pending.future.done()
 
     def resolve(self, request_id: str, response: PermissionResponse) -> bool:
         pending = self._pending.get(request_id)
@@ -267,7 +313,8 @@ class WebPermissionHandler:
                         decision='deny',
                         host_resume=not stored.token,
                     )
-                except (ApprovalConflictError, KeyError, ValueError, TypeError):
+                except (ApprovalConflictError, KeyError, ValueError,
+                        TypeError):
                     pass
             return False
         try:
@@ -285,9 +332,8 @@ class WebPermissionHandler:
         request: ApprovalRequest,
         response: PermissionResponse,
     ) -> None:
-        state = (
-            'denied'
-            if response.action == PermissionAction.DENY else 'approved')
+        state = ('denied'
+                 if response.action == PermissionAction.DENY else 'approved')
         try:
             self._store.transition(
                 request.id,
@@ -300,3 +346,41 @@ class WebPermissionHandler:
             )
         except (ApprovalConflictError, KeyError, ValueError):
             pass
+
+    def resolve_matching(
+        self,
+        covers: Callable[[str, dict[str, Any]], bool],
+        response: PermissionResponse,
+    ) -> int:
+        """Answer the still-open asks that a decision just made unnecessary.
+
+        Safety confirmations are skipped: those exist precisely so a remembered
+        answer cannot stand in for looking at this one.
+        """
+        resolved = 0
+        for request_id, pending in list(self._pending.items()):
+            if pending.forced or pending.future.done():
+                continue
+            if not covers(pending.tool_name, pending.tool_args):
+                continue
+            pending.future.set_result(response)
+            self._commit_decision(pending.request, response)
+            self._pending.pop(request_id, None)
+            resolved += 1
+        return resolved
+
+    def cancel_pending(self, feedback: str = 'Session closed') -> int:
+        """Answer every outstanding ask so nothing is left waiting on a person
+        who has gone. Returns how many were resolved.
+        """
+        resolved = 0
+        response = PermissionResponse(
+            action=PermissionAction.DENY, feedback=feedback)
+        for request_id, pending in list(self._pending.items()):
+            if pending.future.done():
+                continue
+            pending.future.set_result(response)
+            self._commit_decision(pending.request, response)
+            resolved += 1
+            self._pending.pop(request_id, None)
+        return resolved

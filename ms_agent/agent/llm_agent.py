@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import importlib
@@ -18,13 +19,24 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from ms_agent.agent.runtime import Runtime
 from ms_agent.callbacks import Callback, callbacks_mapping
 from ms_agent.knowledge_search import SirchmunkSearch
+from ms_agent.llm import multimodal
+from ms_agent.llm.io import run_in_llm_executor
 from ms_agent.llm.llm import LLM
+from ms_agent.llm.message_text import (append_text, flatten_message_text,
+                                       prepend_text)
 from ms_agent.llm.utils import Message, ToolResult
 from ms_agent.memory import Memory, get_memory_meta_safe, memory_mapping
 from ms_agent.memory.memory_manager import SharedMemoryManager
 from ms_agent.personalization.injector import PersonalizationInjector
 from ms_agent.personalization.profile import ProfileManager
 from ms_agent.personalization.types import PersonalizationConfig
+from ms_agent.project.paths import global_home
+from ms_agent.prompting import workspace_files
+from ms_agent.prompting.builtin import (BASE_AGENT_PROMPT, LIVE_FILES_HINT,
+                                        MEMORY_TOOL_GUIDANCE)
+from ms_agent.llm.vision import _as_bool
+from ms_agent.prompting.model_switch import (capability_signature,
+                                             render_capability_change_notice)
 from ms_agent.rag.base import RAG
 from ms_agent.rag.utils import rag_mapping
 from ms_agent.session import ContextAssembler, SessionLog
@@ -36,11 +48,14 @@ from ms_agent.skill.search import SkillSearchEngine
 from ms_agent.skill.skill_tools import SkillToolSet
 from ms_agent.tools import ToolManager
 from ms_agent.ui.events import (ContentDelta, ContentEnd, ContextCompacted,
-                                ErrorRaised, PlanEntry, PlanUpdated,
-                                ReasoningDelta, ReasoningEnded,
+                                ErrorRaised, ImageDelivered, PlanEntry,
+                                PlanUpdated, ReasoningDelta, ReasoningEnded,
                                 ReasoningStarted, ToolCallCompleted,
-                                ToolCallStarted, TurnCompleted, UsageInfo)
-from ms_agent.utils import async_retry, read_history, save_history
+                                ToolCallComposing, ToolCallStarted,
+                                TurnCompleted, UsageInfo)
+from ms_agent.utils import (async_retry, is_retryable_error, read_history,
+                            save_history)
+from ms_agent.utils.atomic_file import atomic_write_json
 from ms_agent.utils.constants import DEFAULT_TAG, DEFAULT_USER
 from ms_agent.utils.logger import get_logger
 from ms_agent.utils.snapshot import take_snapshot
@@ -59,8 +74,15 @@ INTERRUPTED_PLACEHOLDER = '[interrupted]'
 _INTERRUPTED_TOOL_RESULT = '[Interrupted: tool execution was cancelled]'
 
 
-def build_partial_round_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Turn an interrupted round's in-memory rows into protocol-valid log records.
+def build_partial_round_records(
+        rows: List[Dict[str, Any]],
+        marker: str = 'interrupted') -> List[Dict[str, Any]]:
+    """Turn an unfinished round's in-memory rows into protocol-valid log records.
+
+    ``marker`` is the boolean key stamped on every produced record, naming *why*
+    the round ended early: ``interrupted`` (user Stop / cancellation) or
+    ``errored`` (the turn raised). UIs badge these differently, so an API
+    failure must not be sealed as an interruption.
 
     ``rows`` are the ``_msg_to_dict`` serializations of ``messages[pre_step_len:]``
     at cancellation time. Rules (each keeps replay valid on BOTH transports):
@@ -79,17 +101,18 @@ def build_partial_round_records(rows: List[Dict[str, Any]]) -> List[Dict[str, An
       with no content and no kept calls gets the neutral placeholder content so
       the turn reads as closed (an empty assistant block would be rejected on
       Anthropic replay, and a dangling user row would be re-answered on resume).
-    - every row is flagged ``interrupted: true`` — an extra key that survives in
+    - every row is flagged ``<marker>: true`` — an extra key that survives in
       the log for UI replay but is filtered out of the LLM context rebuild.
     """
     present_results = {
         row.get('tool_call_id')
-        for row in rows if row.get('role') == 'tool' and row.get('tool_call_id')
+        for row in rows
+        if row.get('role') == 'tool' and row.get('tool_call_id')
     }
     records: List[Dict[str, Any]] = []
     for row in rows:
         rec = dict(row)
-        rec['interrupted'] = True
+        rec[marker] = True
         if rec.get('role') != 'assistant':
             records.append(rec)
             continue
@@ -130,14 +153,14 @@ def build_partial_round_records(rows: List[Dict[str, Any]]) -> List[Dict[str, An
                 'tool_call_id': tc.get('id'),
                 'name': tc.get('tool_name', ''),
                 'is_error': True,
-                'interrupted': True,
+                marker: True,
             })
     if not records:
         records.append({
             'role': 'assistant',
             'content': INTERRUPTED_PLACEHOLDER,
             'content_placeholder': True,
-            'interrupted': True,
+            marker: True,
         })
     return records
 
@@ -174,6 +197,8 @@ class LLMAgent(Agent):
 
     AGENT_NAME = 'LLMAgent'
 
+    # Deprecated: the base slot now falls back to prompting.builtin
+    # BASE_AGENT_PROMPT; kept only for external references.
     DEFAULT_SYSTEM = 'You are a helpful assistant.'
 
     DEFAULT_MAX_CHAT_ROUND = 20
@@ -188,26 +213,22 @@ class LLMAgent(Agent):
     def resolve_enable_snapshots(config: Any) -> bool:
         """Resolve whether to take automatic pre-task snapshots.
 
-        Tool-spawned sub-agents (``ms_agent_subagent`` in config) default to
-        ``False``; all other agents default to ``True``. An explicit
-        ``enable_snapshots`` in config always wins (including string forms
-        like ``\"false\"`` coerced to boolean).
+        Disabled by default for all agents. An explicit ``enable_snapshots``
+        in config always wins (including string forms like ``\"false\"``
+        coerced to boolean).
         """
         if OmegaConf.is_config(config):
             raw = OmegaConf.select(
                 config, 'enable_snapshots', default=_MISSING_ENABLE_SNAPSHOTS)
             if raw is not _MISSING_ENABLE_SNAPSHOTS and raw is not None:
                 return LLMAgent._coerce_enable_snapshots_value(raw)
-            sub = bool(
-                OmegaConf.select(config, 'ms_agent_subagent', default=False))
-            return not sub
+            return False
         if isinstance(config, dict):
             if 'enable_snapshots' in config and config[
                     'enable_snapshots'] is not None:
                 return LLMAgent._coerce_enable_snapshots_value(
                     config['enable_snapshots'])
-            return not bool(config.get('ms_agent_subagent'))
-        return True
+        return False
 
     TOTAL_PROMPT_TOKENS = 0
     TOTAL_COMPLETION_TOKENS = 0
@@ -230,6 +251,16 @@ class LLMAgent(Agent):
             default_yaml = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), 'agent.yaml')
             llm_config = Config.from_task(default_yaml)
+            # This implicit merge only borrows the default definition's
+            # plumbing (llm/tools/callbacks) for partial configs. Its
+            # environment contract (personalization.enabled) must NOT ride
+            # along: workspace files apply only when the default assistant is
+            # the *explicit* definition (bare run / tui / webui resolve), or
+            # when the caller's own config opts in.
+            if hasattr(llm_config, 'personalization'):
+                from omegaconf import open_dict
+                with open_dict(llm_config):
+                    del llm_config['personalization']
             config = OmegaConf.merge(llm_config, config)
         super().__init__(config, tag, trust_remote_code)
         self.callbacks: List[Callback] = []
@@ -255,6 +286,9 @@ class LLMAgent(Agent):
         # Skill system (initialized in prepare_skills)
         self._skill_catalog = None
         self._skill_injector = None
+        # Conditional system-prompt segment; set by _register_memory_tool once
+        # the memory tool actually registered (never mutates config.prompt).
+        self._memory_guidance = ''
         self._rollback_messages: Optional[List[Message]] = None
 
         # Skill runtime (initialized in prepare_skills)
@@ -292,8 +326,21 @@ class LLMAgent(Agent):
         # When None, the legacy sync console_io / input() path is used.
         self._input_source = kwargs.get('input_source', None)
 
+        # Attachments belonging to the FIRST user turn, parked between the
+        # interactive read in run_loop and create_messages (whose input is a
+        # bare string). Cleared as soon as create_messages consumes them, so a
+        # later turn can never inherit the first turn's images. Mid-conversation
+        # turns bypass this entirely — InputCallback builds their Message.
+        self._pending_attachments: List[Dict[str, Any]] = []
+
         # Personalization (lazy-loaded in _build_personalization_section)
         self._profile_manager = ProfileManager()
+
+        # Per-source fingerprints of the hot-reloadable head files as of the
+        # last state the model was told about (None until initialized from the
+        # session sidecar or the first build). Drift against this baseline
+        # fires a durable update notice on the next user turn.
+        self._prompt_surface: Optional[Dict[str, str]] = None
 
     async def prepare_skills(self):
         """Initialize the skill system from config.skills.
@@ -311,7 +358,8 @@ class LLMAgent(Agent):
         prompt_injection = getattr(skills_config, 'prompt_injection', 'all')
         update_notice = bool(getattr(skills_config, 'update_notice', False))
         self._skill_injector = SkillPromptInjector(
-            self._skill_catalog, prompt_injection=prompt_injection,
+            self._skill_catalog,
+            prompt_injection=prompt_injection,
             update_notice=update_notice)
 
         search_cfg = getattr(skills_config, 'search', None)
@@ -372,21 +420,111 @@ class LLMAgent(Agent):
     def _build_system_content(self) -> str:
         """Build the full system prompt content.
 
-        Assembly order: base prompt → personalization → skill injection.
+        Layering (docs: prompt-context design-final §2):
+        ① BASE — explicit ``prompt.system`` replaces the built-in base prompt
+          (and only this layer);
+        ② SOUL.md persona + ③④⑤ instructions/profile files — environment
+          layers, gated by ``personalization.enabled`` (schema default false;
+          the packaged default agent.yaml opts in);
+        ⑥ memory guidance — conditional, present only after the memory tool
+          registered (see _register_memory_tool);
+        ⑦ skill section — unchanged.
         Used by create_messages() and SkillRuntime.maybe_refresh_system_prompt().
         """
-        content = self.system or LLMAgent.DEFAULT_SYSTEM
+        content = self.system or BASE_AGENT_PROMPT
 
-        personalization = self._build_personalization_section()
-        if personalization:
-            content += '\n\n' + personalization
+        if self._personalization_enabled():
+            soul = workspace_files.soul_content()
+            if soul:
+                content += '\n\n' + soul
+            personalization = self._build_personalization_section()
+            if personalization:
+                content += '\n\n' + personalization
+            if soul or personalization:
+                # Self-knowledge of the hot-reload contract; without it the
+                # model tends to tell users its prompt is a static snapshot.
+                # {home} resolves the logical ~/.ms_agent labels to the real
+                # directory so agent-side edits target the right files.
+                content += '\n\n' + LIVE_FILES_HINT.format(
+                    home=str(global_home()))
+
+        internals = self._build_workspace_internals_section()
+        if internals:
+            content += '\n\n' + internals
+
+        if self._memory_guidance:
+            content += '\n\n' + self._memory_guidance
 
         if self._skill_injector:
-            skill_section = self._skill_injector.build_skill_prompt_section()
+            # Through the runtime when present: in update_notice mode it pins
+            # the skill section to its session-start snapshot (byte-stable;
+            # changes go through in-conversation notices) while the rest of
+            # the head stays hot-reloadable.
+            if self._skill_runtime is not None:
+                skill_section = self._skill_runtime.build_skill_section()
+            else:
+                skill_section = self._skill_injector.build_skill_prompt_section()
             if skill_section:
                 content += '\n\n' + skill_section
 
         return content
+
+    def _build_workspace_internals_section(self) -> str:
+        """Describe where the framework's own records live.
+
+        Which of the two descriptions applies is decided by where the session
+        log ACTUALLY writes, not by what the working directory happens to
+        contain: a mounted project may well have a user-owned ``sessions/``
+        directory of its own, and describing that as framework transcripts
+        would be false. The directory-existence check is only the fallback for
+        callers that run without a session log.
+        """
+        from ms_agent.prompting.builtin import (TRANSCRIPTS_INSIDE,
+                                                TRANSCRIPTS_OUTSIDE,
+                                                WORKSPACE_RECORDS_HINT)
+        from ms_agent.utils.workspace_context import resolve_workspace_root
+
+        try:
+            workspace_root = Path(resolve_workspace_root(self.config))
+        except Exception:  # noqa: BLE001 - never break prompt assembly
+            return ''
+        try:
+            home = str(global_home())
+        except Exception:  # noqa: BLE001
+            home = '~/.ms_agent'
+
+        directory = getattr(
+            getattr(self, 'session_log', None), 'directory', None)
+        records_inside = None
+        if directory is not None:
+            try:
+                Path(directory).relative_to(workspace_root)
+                records_inside = True
+            except ValueError:
+                records_inside = False
+        if records_inside is None:
+            # No session log to consult (bare SDK / tests): fall back to the
+            # managed layout's signature.
+            if not (workspace_root / 'sessions').is_dir():
+                return ''
+            records_inside = True
+
+        if records_inside:
+            # The directory the log is actually writing to, not the agent's
+            # tag: naming a path that does not exist is worse than naming
+            # none, since the model will go looking for it.
+            session_dir = Path(directory).name if directory else None
+            if not session_dir:
+                session_dir = getattr(self.runtime, 'session_id', None)
+            transcripts_where = TRANSCRIPTS_INSIDE.format(session_line=(
+                f' This conversation is `sessions/{session_dir}/`.'
+                if session_dir else ''))
+        else:
+            transcripts_where = TRANSCRIPTS_OUTSIDE.format(
+                session_dir=str(Path(directory)))
+
+        return WORKSPACE_RECORDS_HINT.format(
+            transcripts_where=transcripts_where, home=home)
 
     def _check_skill_tool_dependencies(self):
         """Warn if skills are enabled but essential tools are missing."""
@@ -606,7 +744,7 @@ class LLMAgent(Agent):
         self.log_output(f'Agent {self.tag} task beginning.')
         if self.resolve_enable_snapshots(self.config):
             _user_content = next(
-                ((getattr(m, 'content', '') or '')[:80]
+                (flatten_message_text(getattr(m, 'content', ''))[:80]
                  for m in messages if getattr(m, 'role', '') == 'user'),
                 '',
             )
@@ -673,36 +811,77 @@ class LLMAgent(Agent):
         """
         Execute multiple tool calls in parallel and append results to the message list.
 
+        Each result is turned into its tool message and ANNOUNCED
+        (``ToolCallCompleted``, plus ``PlanUpdated`` for todo tools) the moment
+        that call returns — not once the whole batch has. A round can contain
+        one call blocked on a human's approval next to calls that are already
+        finished, and those must be able to report themselves as finished.
+        The messages are still appended in call order, matching ``tool_calls``.
+
         Args:
             messages (List[Message]): Current conversation history.
 
         Returns:
             List[Message]: Updated message list including tool responses.
         """
-        tool_call_result = await self.tool_manager.parallel_call_tool(
-            messages[-1].tool_calls)
-        assert len(tool_call_result) == len(messages[-1].tool_calls)
-        for tool_call_result, tool_call_query in zip(tool_call_result,
-                                                     messages[-1].tool_calls):
-            tool_call_result_format = ToolResult.from_raw(tool_call_result)
+        tool_calls = messages[-1].tool_calls
+        results: Dict[int, Message] = {}
+
+        def _on_result(index: int, tool_call, raw, duration_s: float) -> None:
+            tool_call_result_format = ToolResult.from_raw(raw)
             _new_message = Message(
                 role='tool',
                 content=tool_call_result_format.text,
-                tool_call_id=tool_call_query['id'],
-                name=tool_call_query['tool_name'],
+                tool_call_id=tool_call['id'],
+                name=tool_call['tool_name'],
                 resources=tool_call_result_format.resources,
                 tool_detail=tool_call_result_format.tool_detail,
                 hook_attachments=tool_call_result_format.hook_attachments,
                 is_error=tool_call_result_format.is_error,
+                # Images the tool produced. Carried on the tool Message so the
+                # transports can put them in the IMAGE channel; the text channel
+                # keeps only the short status.
+                attachments=tool_call_result_format.attachments,
             )
 
             if _new_message.tool_call_id is None:
                 # If tool call id is None, add a random one
                 _new_message.tool_call_id = str(uuid.uuid4())[:8]
-                tool_call_query['id'] = _new_message.tool_call_id
-            messages.append(_new_message)
+                tool_call['id'] = _new_message.tool_call_id
+            # This call's OWN wall clock. It used to be the batch's span
+            # attributed to every call in it, which over-reported every fast
+            # tool that shared a round with a slow one.
+            _new_message._duration_ms = int(duration_s * 1000)
+            results[index] = _new_message
             self.log_output(_new_message.content)
+            self._emit_tool_completed(_new_message, duration_s)
+
+        await self.tool_manager.parallel_call_tool(
+            tool_calls, on_result=_on_result)
+        assert len(results) == len(tool_calls)
+        for index in range(len(tool_calls)):
+            messages.append(results[index])
         return messages
+
+    def _emit_tool_completed(self, message: Message, duration_s: float) -> None:
+        """Report one finished tool call to the UI (and the plan it may carry)."""
+        if self._event_sink is None:
+            return
+        content = (
+            message.content
+            if isinstance(message.content, str) else str(message.content))
+        is_error = bool(getattr(message, 'is_error', False))
+        self._event_sink.emit(
+            ToolCallCompleted(
+                call_id=str(getattr(message, 'tool_call_id', '') or ''),
+                name=str(getattr(message, 'name', '') or ''),
+                result=content or '',
+                error=(content or 'tool call failed') if is_error else None,
+                duration_s=round(duration_s, 3)))
+        # todo/split_task tool results drive the plan panel.
+        plan = self._extract_plan_from_tool_result(message)
+        if plan is not None:
+            self._event_sink.emit(PlanUpdated(entries=plan))
 
     def _select_permission_handler(self, mode: str):
         """Pick the PermissionHandler by mode + runtime environment.
@@ -745,10 +924,8 @@ class LLMAgent(Agent):
         perm_config = PermissionConfig.from_dict(
             raw, project_root=workspace_root)
 
-        allowed_dirs = [workspace_root]
-        for directory in perm_config.safety.allowed_directories:
-            if directory not in allowed_dirs:
-                allowed_dirs.append(directory)
+        allowed_dirs = list(
+            perm_config.safety.effective_allowed_directories(workspace_root))
         read_only_dirs = list(perm_config.safety.read_only_directories)
         safety_guard = SafetyGuard(
             config=perm_config.safety,
@@ -1020,6 +1197,19 @@ class LLMAgent(Agent):
             await self.mcp_runtime.stop()
         if self.tool_manager is not None:
             await self.tool_manager.cleanup()
+        # Drain scheduled memory ingestion so a teardown right after the last
+        # turn cannot lose its write. Flush only — memory instances are shared
+        # across agents of the same store (SharedMemoryManager), so CLOSING
+        # them here would yank the store out from under a sibling agent; the
+        # owner of the shared instance decides when to close (e.g. via
+        # SharedMemoryManager.close_matching).
+        for tool in self.memory_tools:
+            flush = getattr(tool, 'flush_pending', None)
+            if flush is not None:
+                try:
+                    await flush(timeout=15)
+                except Exception as e:  # noqa: BLE001 - cleanup is best-effort
+                    logger.warning(f'memory flush on cleanup failed: {e}')
 
     @property
     def stream(self):
@@ -1136,6 +1326,113 @@ class LLMAgent(Agent):
             self._event_sink.emit(ContentEnd())
         else:
             sys.stdout.write('\n')
+
+    #: Bytes of tool-call arguments between two ``ToolCallComposing`` events.
+    #: Small enough that a multi-file write reports progress several times a
+    #: second, large enough that a short call emits once and stops.
+    _COMPOSING_STEP = 256
+
+    @staticmethod
+    def _is_writing_tool_call(message) -> bool:
+        """Whether this streamed message has begun a tool call. The name arrives
+        before the arguments, so a NAMED call is the first sign the response
+        moved from thinking to calling (same test ``_emit_tool_composing`` uses).
+        """
+        for call in getattr(message, 'tool_calls', None) or []:
+            if isinstance(call, dict) and (call.get('tool_name')
+                                           or call.get('name')):
+                return True
+        return False
+
+    def _emit_tool_composing(self, message, announced: Dict[int, int]) -> None:
+        """Report tool calls the model is still writing.
+
+        Streaming hands us the assistant message repeatedly, with each tool
+        call's ``arguments`` growing chunk by chunk. Nothing has run yet — this
+        is purely so the UI can say "preparing write_file…" instead of showing
+        nothing at all while a large call is transmitted.
+
+        Silent for a UI-less run (no event sink), and throttled so short calls
+        emit once rather than once per chunk.
+        """
+        if self._event_sink is None:
+            return
+        for index, call in enumerate(getattr(message, 'tool_calls', None) or []):
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get('tool_name') or '')
+            if not name:
+                continue  # the name always precedes the arguments; wait for it
+            size = len(str(call.get('arguments') or ''))
+            last = announced.get(index)
+            if last is not None and size - last < self._COMPOSING_STEP:
+                continue
+            announced[index] = size
+            self._event_sink.emit(
+                ToolCallComposing(index=index, name=name, arguments_len=size))
+
+    def _record_image_deliveries(self, messages: List[Message]) -> None:
+        """Publish and persist this request's per-image outcome.
+
+        The transport computes it while formatting (``_last_deliveries``); this
+        forwards it to the UI and writes it once onto the attachment that
+        produced it.
+
+        **The record only ever moves forward.** It answers "has the model ever
+        received this picture in this conversation", not "what happened on the
+        turn it was attached to". The difference is not academic: an image sent
+        while the switch was off and shown later when it was on kept a permanent
+        "degraded", so a text-only model arriving afterwards was told the picture
+        had never been seen — and RETRACTED a correct description of it as a
+        hallucination (measured). Once seen is seen.
+
+        Reached defensively: the LLM object may be a legacy engine, a router
+        provider or a test double, and none of them should be able to break a
+        turn by not having images.
+        """
+        source = self.llm
+        for attr in ('transport', '_transport'):
+            inner = getattr(source, attr, None)
+            if inner is not None and hasattr(inner, '_last_deliveries'):
+                source = inner
+                break
+        deliveries = getattr(source, '_last_deliveries', None) or []
+        if not deliveries:
+            return
+
+        by_path = {}
+        for delivery in deliveries:
+            by_path.setdefault(getattr(delivery, 'path', ''), delivery)
+        for message in messages:
+            for attachment in getattr(message, 'attachments', None) or []:
+                if not isinstance(attachment, dict):
+                    continue
+                if attachment.get('delivery') == multimodal.DELIVERED:
+                    continue  # already seen; nothing can un-see it
+                delivery = by_path.get(str(attachment.get('path') or ''))
+                if delivery is not None:
+                    attachment['delivery'] = getattr(delivery, 'state', '')
+
+        if self.session_log is not None:
+            try:
+                self.session_log.record_image_delivery([{
+                    'path': getattr(d, 'path', ''),
+                    'state': getattr(d, 'state', ''),
+                    'reason': getattr(d, 'reason', ''),
+                } for d in deliveries])
+            except Exception:  # noqa: BLE001 — bookkeeping must not fail a turn
+                logger.warning('persist image delivery failed', exc_info=True)
+
+        if self._event_sink is None:
+            return
+        for delivery in deliveries:
+            self._event_sink.emit(
+                ImageDelivered(
+                    index=getattr(delivery, 'index', 0),
+                    path=getattr(delivery, 'path', ''),
+                    filename=getattr(delivery, 'filename', ''),
+                    state=getattr(delivery, 'state', ''),
+                    reason=getattr(delivery, 'reason', '')))
 
     @staticmethod
     def _extract_plan_from_tool_result(msg):
@@ -1260,21 +1557,54 @@ class LLMAgent(Agent):
             ), f'inputs can be either a list or a string, but current is {type(messages)}'
             messages = [
                 Message(role='system', content=''),
-                Message(role='user', content=messages or self.query),
+                Message(
+                    role='user',
+                    content=messages or self.query,
+                    # Attachments for the FIRST turn. The interactive read that
+                    # produced this prompt happens in run_loop, which stashes
+                    # them here — the string-in signature cannot carry them, and
+                    # a session's first message is exactly when a user attaches
+                    # something.
+                    attachments=self._pending_attachments or []),
             ]
+        self._pending_attachments = []
 
         messages[0].content = self._build_system_content()
 
         return messages
 
-    def _build_personalization_section(self) -> str:
+    def _personalization_enabled(self) -> bool:
+        """Environment contract: does this definition accept workspace files?
+
+        Schema default is **false** so self-contained yamls (task pipelines
+        like deep_research) stay byte-identical regardless of what lives in
+        the user's home. The packaged default agent.yaml — the general
+        assistant that bare CLI / TUI / WebUI all run — opts in explicitly.
+        """
         p_config = getattr(self.config, 'personalization', None)
+        if p_config is None:
+            return False
+        return bool(getattr(p_config, 'enabled', False))
+
+    def _build_personalization_section(self) -> str:
+        """Sections ③④⑤: file-first with legacy-field fallback.
+
+        The fallback criterion is "file strips to empty", NOT "file exists" —
+        ensure-materialized templates are comment-only and must not shadow a
+        legacy settings/project field before the user writes anything.
+        """
+        p_config = getattr(self.config, 'personalization', None)
+        legacy_global = (getattr(p_config, 'global_instruction', '')
+                         or '') if p_config else ''
+        legacy_project = (getattr(p_config, 'project_instruction', '')
+                          or '') if p_config else ''
         config = PersonalizationConfig(
-            global_instruction=(getattr(p_config, 'global_instruction', '')
-                                or '') if p_config else '',
-            project_instruction=(getattr(p_config, 'project_instruction', '')
-                                 or '') if p_config else '',
-            user_profile=self._profile_manager.read(),
+            global_instruction=workspace_files.global_instructions_block(
+                legacy_fallback=legacy_global),
+            project_instruction=workspace_files.project_instructions_block(
+                getattr(self, 'output_dir', None),
+                legacy_fallback=legacy_project),
+            user_profile=workspace_files.profile_block(),
         )
         return PersonalizationInjector.build(config)
 
@@ -1341,8 +1671,7 @@ class LLMAgent(Agent):
 
     async def _register_memory_tool(self, orchestrator):
         """Register the memory tool into ToolManager and inject prompt guidance."""
-        from ms_agent.memory.unified.memory_tool import (MEMORY_USAGE_PROMPT,
-                                                         MemoryTool)
+        from ms_agent.memory.unified.memory_tool import MemoryTool
 
         if not hasattr(orchestrator, 'get_tool_schemas'):
             return
@@ -1373,16 +1702,11 @@ class LLMAgent(Agent):
             await self.tool_manager.index_extra_tool(mem_tool)
             logger.info('[unified_memory] Memory tool registered')
 
-        # Inject usage guidance into system prompt
-        if hasattr(self.config, 'prompt') and hasattr(self.config.prompt,
-                                                      'system'):
-            current_prompt = self.config.prompt.system or ''
-            if 'Long-term Memory' not in current_prompt:
-                OmegaConf.update(
-                    self.config,
-                    'prompt.system',
-                    current_prompt + '\n\n' + MEMORY_USAGE_PROMPT,
-                    merge=True)
+        # Register the usage guidance as an assembly segment (design-final §2
+        # rule 3). The previous approach mutated config.prompt.system in
+        # place, which made the config object a hidden prompt writer and broke
+        # the "definition is read-only" contract.
+        self._memory_guidance = MEMORY_TOOL_GUIDANCE
 
     def _schedule_add_memory_after_task(self, messages, timestamp=None):
 
@@ -1413,6 +1737,194 @@ class LLMAgent(Agent):
             if ks_config is not None:
                 self.knowledge_search: SirchmunkSearch = SirchmunkSearch(
                     self.config)
+
+    async def _attach_memory_recall(self, messages: List[Message]) -> None:
+        """Durably attach vector-memory recall to a NEW user turn.
+
+        Runs exactly once per user turn, right before the turn is persisted:
+        the recall block becomes part of the message in the SessionLog (the
+        same mechanism skill update notices use), so it
+        - survives per-round context reassembly (the model's own history
+          keeps showing what it actually saw), and
+        - keeps the request a strict prefix-extension of the previous one
+          (maximal prefix-cache reuse — an ephemeral per-round attach
+          diverged at the previous user message and re-prefilled the whole
+          last turn).
+        Backends without ``recall_block`` (e.g. the file backend, whose
+        snapshot rides in the system prompt) are unaffected.
+        """
+        if not self.memory_tools or not messages:
+            return
+        last = messages[-1]
+        if getattr(last, 'role', None) != 'user':
+            return
+        # Read the text out of whatever shape the content is in, rather than
+        # bailing on a block list: a multimodal turn that silently got no memory
+        # recall is a far worse outcome than one whose query came from its text.
+        content = flatten_message_text(last.content)
+        if not content:
+            return
+        # The turn may already carry other <system-reminder> blocks (skill
+        # update notice prefixed by the host, prompt-files update notice) —
+        # they must not suppress recall, and must not leak into the retrieval
+        # query. Idempotency is per-block: the backend's own marker.
+        query = workspace_files.REMINDER_BLOCK_RE.sub('', content).strip()
+        if not query:
+            return
+        for tool in self.memory_tools:
+            recall = getattr(tool, 'recall_block', None)
+            if recall is None:
+                continue
+            marker = getattr(tool, 'recall_marker', None)
+            if marker and marker in content:
+                return  # this turn already carries a recall block
+            try:
+                block = await recall(query)
+            except Exception as e:
+                logger.warning(f'[memory] recall attach skipped: {e}')
+                continue
+            if block:
+                if block in content:
+                    return  # marker-less backend, identical block attached
+                # append_text keeps the shape: a str grows, a block list gains a
+                # trailing text block (concatenating onto a list would raise).
+                last.content = append_text(last.content, block)
+                return
+
+    # ── prompt-files update notices (hot-reload perception) ──────────────
+    #
+    # The head hot-reloads silently (content compare each round). These
+    # helpers give the model the missing *event*: per-source fingerprints are
+    # tracked against what the model was last told, and drift is announced as
+    # a durable <system-reminder> prefixed to the next user message — same
+    # delivery contract as skill update notices (part of the persisted turn,
+    # survives reassembly, prefix-cache friendly). Mid-turn edits are
+    # announced at the next turn boundary; the *content* still applies
+    # immediately through the per-round refresh.
+
+    def _prompt_surface_sidecar(self) -> Optional[Path]:
+        if self.session_log is None:
+            return None
+        return self.session_log.directory / 'prompt_surface.json'
+
+    def _current_prompt_surface(self) -> Dict[str, str]:
+        return workspace_files.head_source_fingerprints(
+            getattr(self, 'output_dir', None))
+
+    def _commit_prompt_surface(self, surface: Dict[str, str]) -> None:
+        """The model has now been told this state — persist it."""
+        self._prompt_surface = surface
+        path = self._prompt_surface_sidecar()
+        if path is None:
+            return
+        try:
+            atomic_write_json(
+                path, {
+                    'version': 1,
+                    'sources': surface
+                }, indent=1)
+        except OSError as e:
+            logger.warning(f'[prompt-surface] sidecar save failed: {e}')
+
+    def _load_prompt_surface(self) -> Optional[Dict[str, str]]:
+        path = self._prompt_surface_sidecar()
+        if path is None:
+            return None
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+        sources = data.get('sources')
+        return sources if isinstance(sources, dict) else None
+
+    def _init_prompt_surface(self) -> None:
+        """Session start (fresh first turn): begin tracking, announce nothing
+        — the head was just built from these very files."""
+        if not self._personalization_enabled():
+            return
+        self._commit_prompt_surface(self._current_prompt_surface())
+
+    def _attach_prompt_update_notice(self, messages: List[Message]):
+        """Prefix a durable update notice to a NEW user turn on drift.
+
+        Returns a commit callable to invoke AFTER the turn is persisted (safe
+        over-notify: an interrupted turn re-fires the notice next time, never
+        silently drops it), or None when nothing was attached.
+        """
+        if not self._personalization_enabled():
+            return None
+        if not messages:
+            return None
+        last = messages[-1]
+        if getattr(last, 'role', None) != 'user':
+            return None
+
+        baseline = self._prompt_surface
+        if baseline is None:
+            baseline = self._load_prompt_surface()
+        current = self._current_prompt_surface()
+        if baseline is None:
+            # Resumed session predating surface tracking: unknowable drift.
+            # Start tracking silently rather than spamming every legacy
+            # resume with a vague "may have changed".
+            self._commit_prompt_surface(current)
+            return None
+
+        # A label missing from the baseline (schema growth) never fires.
+        changed = sorted(label for label, digest in current.items()
+                         if label in baseline and baseline[label] != digest)
+        if not changed:
+            if current.keys() - baseline.keys():
+                self._commit_prompt_surface(current)
+            return None
+
+        notice = workspace_files.render_update_notice(changed)
+        # Shape-preserving prepend; on a block list the notice becomes the first
+        # text block, which also matches the providers' label-before-payload
+        # preference.
+        last.content = prepend_text(last.content, notice)
+        return lambda: self._commit_prompt_surface(current)
+
+    def _capability_signature(self) -> str:
+        """Who is answering, and whether they may be shown pictures."""
+        llm = getattr(self.config, 'llm', None)
+        return capability_signature(
+            str(getattr(llm, 'model', '') or ''),
+            _as_bool(getattr(llm, 'supports_vision', None)))
+
+    def _attach_model_switch_notice(self, messages: List[Message]):
+        """Prefix a durable notice to a NEW user turn when capabilities changed.
+
+        Returns a commit callable to invoke AFTER the turn is persisted (so an
+        interrupted turn re-fires rather than silently dropping the notice), or
+        None when nothing was attached. Same contract as
+        :meth:`_attach_prompt_update_notice`.
+
+        Fires only on a real user turn — a tool round is not a moment the user
+        changed anything, and announcing it there would spend context on
+        nothing.
+        """
+        if self.session_log is None or not messages:
+            return None
+        last = messages[-1]
+        if getattr(last, 'role', None) != 'user':
+            return None
+        current = self._capability_signature()
+        previous = self.session_log.active_model
+        if previous == current:
+            return None
+
+        def _commit() -> None:
+            self.session_log.active_model = current
+
+        notice = render_capability_change_notice(previous, current)
+        if notice is None:
+            # First turn of a session, or a change in something this notice does
+            # not speak for: record the baseline, say nothing.
+            _commit()
+            return None
+        last.content = prepend_text(last.content, notice)
+        return _commit
 
     async def condense_memory(self, messages: List[Message]) -> List[Message]:
         """Inject long-term memory context into the message list.
@@ -1642,7 +2154,8 @@ class LLMAgent(Agent):
         # _msg_to_dict; the attribute is not a dataclass field so to_dict_clean
         # skips it). Cleared after use so it doesn't leak to the next message.
         dur = getattr(self, '_last_reasoning_duration', None)
-        if dur is not None and getattr(response_message, 'reasoning_content', ''):
+        if dur is not None and getattr(response_message, 'reasoning_content',
+                                       ''):
             response_message._reasoning_duration = dur
         self._last_reasoning_duration = None
 
@@ -1658,7 +2171,54 @@ class LLMAgent(Agent):
         messages.append(Message(role='user', content=body))
         return messages
 
-    @async_retry(max_attempts=Agent.retry_count, delay=1.0)
+    @staticmethod
+    def _close_llm_stream(llm, response=None) -> None:
+        """Best-effort cleanup, including a response returned after cancellation."""
+        for close in (getattr(llm, 'interrupt',
+                              None), getattr(response, 'close', None)):
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # teardown must not mask the original error
+                    pass
+
+    async def _generate_response(self, messages, tools):
+        """Open a synchronous model request without blocking the event loop.
+
+        Cancellation cannot stop a Python worker thread. If the request returns
+        after its caller has gone, the worker closes that response instead of
+        abandoning it. The lock covers only ownership transfer, never I/O.
+        """
+        lock = threading.Lock()
+        llm = self.llm
+        abandoned = False
+        response = None
+
+        def generate():
+            nonlocal response
+            result = llm.generate(messages, tools=tools)
+            with lock:
+                discard = abandoned
+                if not discard:
+                    response = result
+            if discard:
+                self._close_llm_stream(llm, result)
+            return result
+
+        try:
+            return await run_in_llm_executor(generate)
+        except asyncio.CancelledError:
+            with lock:
+                abandoned = True
+                result = response
+            self._close_llm_stream(llm, result)
+            raise
+
+    # retry_if: a hard 4xx (bad payload, content filter, auth) is a verdict on
+    # the request, not a transient fault — retrying it 5× only adds ~40s of
+    # backoff before the same failure surfaces.
+    @async_retry(
+        max_attempts=Agent.retry_count, delay=1.0, retry_if=is_retryable_error)
     async def step(
         self, messages: List[Message]
     ) -> AsyncGenerator[List[Message], Any]:  # type: ignore
@@ -1727,9 +2287,15 @@ class LLMAgent(Agent):
                 _response_message = None
                 _printed_reasoning_header = False
                 _printed_reasoning_footer = False
-                _gen = self.llm.generate(messages, tools=tools)
-                _loop = asyncio.get_running_loop()
+                # index -> arguments length already announced, so a long tool
+                # call reports progress instead of going silent (see
+                # ui.events.ToolCallComposing).
+                _composing: Dict[int, int] = {}
+                _reported_images = False
+                _llm = self.llm
+                _gen = await self._generate_response(messages, tools)
                 _NO_MORE = object()
+                _stopped = threading.Event()
 
                 def _next_chunk(_g=_gen):
                     # Step the BLOCKING sync LLM stream off the event loop, so
@@ -1742,10 +2308,15 @@ class LLMAgent(Agent):
                         return next(_g)
                     except StopIteration:
                         return _NO_MORE
+                    finally:
+                        # A cancelled await leaves next() running in its worker.
+                        # Close the iterator there once that read has unwound.
+                        if _stopped.is_set():
+                            self._close_llm_stream(_llm, _g)
 
                 try:
                     while True:
-                        _chunk = await _loop.run_in_executor(None, _next_chunk)
+                        _chunk = await run_in_llm_executor(_next_chunk)
                         if _chunk is _NO_MORE:
                             break
                         _response_message = _chunk
@@ -1755,8 +2326,8 @@ class LLMAgent(Agent):
 
                         if self.stream_output and self.show_reasoning:
                             reasoning_text = (
-                                getattr(_response_message, 'reasoning_content', '')
-                                or '')
+                                getattr(_response_message, 'reasoning_content',
+                                        '') or '')
                             # Some providers may reset / shorten content across chunks.
                             if len(reasoning_text) < len(_reasoning):
                                 _reasoning = ''
@@ -1775,22 +2346,36 @@ class LLMAgent(Agent):
                                 _printed_reasoning_footer = True
                             self._emit_content(new_content)
                         _content = _response_message.content
+                        # Thinking ends when the model starts writing a tool call,
+                        # not when the response drains — for a call carrying a
+                        # whole file those are a minute apart, and both the UI
+                        # timer and the persisted `reasoning_duration` read this
+                        # boundary. Mirrors the content branch above.
+                        if (_printed_reasoning_header
+                                and not _printed_reasoning_footer
+                                and self._is_writing_tool_call(_response_message)):
+                            self._emit_reasoning_end()
+                            _printed_reasoning_footer = True
+                        self._emit_tool_composing(_response_message, _composing)
+                        if not _reported_images:
+                            # After the first chunk, not before it: the payload's
+                            # delivery record is written while formatting, and a
+                            # gateway that answers 200 and then refuses the
+                            # images is only discovered once the stream starts.
+                            # Reporting earlier would confidently say "delivered"
+                            # for exactly the requests that were not.
+                            self._record_image_deliveries(messages)
+                            _reported_images = True
                         messages[-1] = _response_message
                         yield messages
                 finally:
-                    # Turn abandoned mid-stream (client disconnect / stop): ask
-                    # the provider to close the live upstream response so the
-                    # server stops generating, instead of leaving it to run to
-                    # completion into a dropped connection. Only the data-driven
-                    # provider layer implements interrupt(); the legacy LLM does
-                    # not, so this is a no-op there (unchanged). Harmless on a
-                    # normal finish (the stream is already exhausted).
-                    _interrupt = getattr(self.llm, 'interrupt', None)
-                    if callable(_interrupt):
-                        try:
-                            _interrupt()
-                        except Exception:  # noqa: BLE001 - teardown never raises
-                            pass
+                    _stopped.set()
+                    if not _reported_images:
+                        # A turn that produced nothing still attached images, and
+                        # what became of them is still worth saying.
+                        self._record_image_deliveries(messages)
+                        _reported_images = True
+                    self._close_llm_stream(_llm, _gen)
                 if self.stream_output:
                     if _printed_reasoning_header and not _printed_reasoning_footer:
                         self._emit_reasoning_end()
@@ -1806,7 +2391,8 @@ class LLMAgent(Agent):
 
                     self._emit_content_end()
             else:
-                _response_message = self.llm.generate(messages, tools=tools)
+                _response_message = await self._generate_response(
+                    messages, tools)
                 if self.show_reasoning:
                     reasoning_text = (
                         getattr(_response_message, 'reasoning_content', '')
@@ -1841,36 +2427,11 @@ class LLMAgent(Agent):
                             name=str(
                                 tc.get('tool_name') or tc.get('name') or ''),
                             arguments=tc.get('arguments')))
-            _tool_start = len(messages)
-            _tool_t0 = time.monotonic()
+            # Each call stamps its own ``_duration_ms`` (persistence/replay) and
+            # emits its own ToolCallCompleted / PlanUpdated as it finishes —
+            # inside parallel_tool_call, not after the batch, so one call held
+            # up by an approval doesn't hold back its finished siblings.
             messages = await self.parallel_tool_call(messages)
-            # Batch wall-clock: exact for the common single-tool round; for
-            # parallel multi-tool rounds it attributes the batch span to each
-            # (they ran concurrently within it). Stamp for persistence/replay
-            # regardless of sink, and report it live via ToolCallCompleted.
-            _tool_ms = int((time.monotonic() - _tool_t0) * 1000)
-            for m in messages[_tool_start:]:
-                if getattr(m, 'role', None) == 'tool':
-                    m._duration_ms = _tool_ms
-            if self._event_sink is not None:
-                for m in messages[_tool_start:]:
-                    if getattr(m, 'role', None) == 'tool':
-                        _content = (m.content if isinstance(m.content, str)
-                                    else str(m.content))
-                        _is_err = bool(getattr(m, 'is_error', False))
-                        self._event_sink.emit(
-                            ToolCallCompleted(
-                                call_id=str(
-                                    getattr(m, 'tool_call_id', '') or ''),
-                                name=str(getattr(m, 'name', '') or ''),
-                                result=_content or '',
-                                error=(_content or 'tool call failed')
-                                if _is_err else None,
-                                duration_s=round(_tool_ms / 1000, 3)))
-                        # todo/split_task tool results drive the plan panel.
-                        _plan = self._extract_plan_from_tool_result(m)
-                        if _plan is not None:
-                            self._event_sink.emit(PlanUpdated(entries=_plan))
 
         # usage
         # NOTE: token accounting must run BEFORE after_tool_call. The interactive
@@ -2039,6 +2600,20 @@ class LLMAgent(Agent):
                 if not any(v is not None
                            for v in [user_id, agent_id, run_id, memory_type]):
                     continue
+                # Ingestion runs an extraction LLM + embeddings (seconds).
+                # Backends that support it take the write off the turn's
+                # critical path — schedule_add returns immediately and the
+                # write serializes against retrieval on the store's own lock.
+                # Others (legacy memory types) keep the awaited behaviour.
+                if add_type == 'add_after_step' and hasattr(
+                        tool, 'schedule_add'):
+                    tool.schedule_add(
+                        messages,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        memory_type=memory_type)
+                    continue
                 await tool.add(
                     messages,
                     user_id=user_id,
@@ -2080,6 +2655,12 @@ class LLMAgent(Agent):
         d: Dict[str, Any] = {'role': msg.role, 'content': msg.content or ''}
         if msg.tool_calls:
             d['tool_calls'] = msg.tool_calls
+        # Image refs must survive to disk: the SessionLog is the source of truth
+        # a resumed session rebuilds context from, so dropping them here means
+        # attached images vanish on reload (and on every context reassembly).
+        # They are references, not bytes — cheap to persist.
+        if getattr(msg, 'attachments', None):
+            d['attachments'] = msg.attachments
         if hasattr(msg, 'tool_call_id') and msg.tool_call_id:
             d['tool_call_id'] = msg.tool_call_id
         if hasattr(msg, 'name') and msg.name:
@@ -2110,16 +2691,24 @@ class LLMAgent(Agent):
             d['tokens'] = prompt_tokens + completion_tokens
         return d
 
-    def _persist_partial_round(self, messages: List[Message],
-                               pre_step_len: int) -> None:
-        """Seal an interrupted round into the SessionLog (best-effort).
+    def _persist_partial_round(self,
+                               messages: List[Message],
+                               pre_step_len: int,
+                               marker: str = 'interrupted') -> None:
+        """Seal an unfinished round into the SessionLog (best-effort).
 
-        Called from run_loop's cancellation handler, where the normal
-        round-boundary persistence can no longer run. Serializes the round's
-        in-memory rows and appends the protocol-repaired records built by
-        :func:`build_partial_round_records`. Synchronous file I/O only (safe
-        inside a cancelled task); never raises — sealing must not break the
-        cancellation unwind.
+        Called from run_loop's cancellation handler AND its exception handler,
+        where the normal round-boundary persistence can no longer run.
+        Serializes the round's in-memory rows and appends the protocol-repaired
+        records built by :func:`build_partial_round_records`. Synchronous file
+        I/O only (safe inside a cancelled task); never raises — sealing must not
+        break the unwind.
+
+        Sealing is not cosmetic: without it the log tail stays on a ``user`` or
+        ``tool`` row, and the next resume rebuilds that same round and re-calls
+        the model instead of reading the user's new prompt (see run_loop's
+        ``load_cache`` guard). ``marker`` records why the round ended —
+        ``interrupted`` for Stop, ``errored`` for a raised turn.
         """
         if self.session_log is None:
             return
@@ -2148,7 +2737,7 @@ class LLMAgent(Agent):
             rows = [
                 self._msg_to_dict(msg) for msg in messages[pre_step_len:]
             ]
-            for record in build_partial_round_records(rows):
+            for record in build_partial_round_records(rows, marker=marker):
                 self.session_log.append(record)
         except Exception:
             logger.warning('persist partial round failed', exc_info=True)
@@ -2164,6 +2753,11 @@ class LLMAgent(Agent):
         Args:
             messages: Input prompt string or list of Message objects.
         """
+        # Bound BEFORE the try so the exception handler can always read it:
+        # setup (agent/LLM construction, credential resolution) raises well
+        # before the round loop, and an unbound local there would turn a clean
+        # provider error into an UnboundLocalError. None = no round to seal.
+        pre_step_len: Optional[int] = None
         try:
             self.max_chat_round = getattr(self.config, 'max_chat_round',
                                           LLMAgent.DEFAULT_MAX_CHAT_ROUND)
@@ -2214,6 +2808,10 @@ class LLMAgent(Agent):
                             await self.cleanup_tools()
                             return
                         messages = turn.text
+                        # create_messages() below builds the user Message from
+                        # this string, so hand the turn's attachments over
+                        # out-of-band rather than widening that signature.
+                        self._pending_attachments = turn.attachments
                 else:
                     # Non-interactive with no task: accept piped stdin as the
                     # query; otherwise fail clearly instead of blocking input().
@@ -2283,11 +2881,23 @@ class LLMAgent(Agent):
                         messages, submit, hook_event='UserPromptSubmit')
 
                 await self.do_rag(messages)
+                # Durable recall attach BEFORE seeding: the block becomes part
+                # of this turn in the log (skill-notice style), so it survives
+                # context reassembly and keeps the prefix cache maximal.
+                await self._attach_memory_recall(messages)
+                # Head files were just read to build this head — baseline the
+                # surface so later turns can detect (and announce) drift.
+                self._init_prompt_surface()
 
                 # Seed SessionLog with initial messages
                 if self.session_log is not None:
                     for msg in messages:
                         self.session_log.append(self._msg_to_dict(msg))
+                    # Baseline the model here, not on the second turn: a switch
+                    # made between turn 1 and turn 2 is exactly the case the
+                    # notice exists for, and recording late would miss it.
+                    self.session_log.active_model = (
+                        self._capability_signature())
 
             for message in messages:
                 if message.role != 'system':
@@ -2340,6 +2950,23 @@ class LLMAgent(Agent):
                     # plus synthesized interrupted tool results — before the
                     # cancellation unwinds. Sync file I/O only; must re-raise.
                     self._persist_partial_round(messages, pre_step_len)
+                    # An interrupted round is never ingested into long-term
+                    # memory: a half-finished answer is not durable
+                    # conversational truth. Advance the ingest ledger past it
+                    # (sync, in-memory + small file write) so the next turn's
+                    # delta does not sweep the partial content in either.
+                    # THIS ROUND ONLY -- the same slice `_persist_partial_round`
+                    # takes. Handing over the whole history would mark earlier
+                    # rounds as ingested too, including one a background ingest
+                    # is still writing (extraction takes seconds), which loses
+                    # it: the write finds an empty delta, or fails and is denied
+                    # its retry.
+                    for _mem_tool in self.memory_tools:
+                        if hasattr(_mem_tool, 'mark_ingested'):
+                            try:
+                                _mem_tool.mark_ingested(messages[pre_step_len:])
+                            except Exception:  # noqa: E722 - never mask cancel
+                                pass
                     raise
 
                 # Persist THIS round's step output (assistant + any tool
@@ -2354,7 +2981,35 @@ class LLMAgent(Agent):
                     for msg in messages[pre_step_len:step_end_len]:
                         self.session_log.append(self._msg_to_dict(msg))
 
+                # Ingest memory here — before after_tool_call, which blocks on
+                # the next prompt in interactive mode (running afterwards made
+                # 'add_after_step' mean "after the *next* step": round N was
+                # only ingested once round N+1 arrived, a single-round session
+                # never at all, and the ingested list already carried the next
+                # user turn). Only on a CLOSING round — an assistant reply with
+                # no tool calls, i.e. the turn is complete. Tool rounds are
+                # intermediate state, not durable conversational truth, and
+                # ingesting every round made memory cost O(rounds x history):
+                # a 4-round tool-calling answer paid ~4 extraction-LLM calls
+                # where one covers it (the closing ingest sees the whole turn).
+                if (messages and messages[-1].role == 'assistant'
+                        and not messages[-1].tool_calls):
+                    await self.add_memory(
+                        messages, add_type='add_after_step', **kwargs)
+
                 await self.after_tool_call(messages)
+                # New user turn (interactive multi-turn): attach the durable
+                # augmentations BEFORE the slice below persists them — same
+                # semantics as the round-0 attach. Order: state notice first
+                # (prompt-files drift, prefixed), then recall (appended; its
+                # query strips reminder blocks so notices never pollute it).
+                commit_surface = None
+                commit_model = None
+                if len(messages) > step_end_len:
+                    commit_surface = self._attach_prompt_update_notice(
+                        messages)
+                    commit_model = self._attach_model_switch_notice(messages)
+                    await self._attach_memory_recall(messages)
                 self.runtime.round += 1
 
                 # Persist whatever after_tool_call appended (the next user
@@ -2363,10 +3018,14 @@ class LLMAgent(Agent):
                     for msg in messages[step_end_len:]:
                         self.session_log.append(self._msg_to_dict(msg))
                     self.session_log.round = self.runtime.round
+                if commit_surface is not None:
+                    # Only now is the notice durably part of the turn — an
+                    # interrupted persist re-fires it next time (over-notify,
+                    # never silent-drop).
+                    commit_surface()
+                if commit_model is not None:
+                    commit_model()
 
-                # save memory and history
-                await self.add_memory(
-                    messages, add_type='add_after_step', **kwargs)
                 self.save_history(messages)
 
                 # +1 means the next round the assistant may give a conclusion
@@ -2397,11 +3056,23 @@ class LLMAgent(Agent):
             import traceback
 
             logger.warning(traceback.format_exc())
+            # Seal the round FIRST. A raised turn leaves the log tail on a
+            # `user`/`tool` row, and run_loop's resume guard only skips the
+            # model call when the tail is `assistant` — so the next request
+            # rebuilds this same round, re-sends the identical failing context,
+            # and never reaches after_tool_call (which is what drains the queued
+            # prompt). The user sees the turn "loop" while every resend is
+            # silently discarded. Sealing closes the round, so the rebuilt agent
+            # blocks on read_prompt and consumes the new message instead.
+            if pre_step_len is not None:
+                self._persist_partial_round(
+                    messages, pre_step_len, marker='errored')
             if self._event_sink is not None:
                 # A run_loop turn-abort is non-recoverable (the turn produced no
                 # usable assistant output); mark it so live == persisted/replay.
-                self._event_sink.emit(ErrorRaised(
-                    message=f'{type(e).__name__}: {e}', recoverable=False))
+                self._event_sink.emit(
+                    ErrorRaised(
+                        message=f'{type(e).__name__}: {e}', recoverable=False))
             # Persist the turn/API error as a display-only record. It is filtered
             # out of get_all_messages(), so it never re-enters the LLM context on
             # resume (unrecoverable), but history can replay that it happened.

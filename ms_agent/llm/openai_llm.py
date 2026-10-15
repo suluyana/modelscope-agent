@@ -5,13 +5,18 @@ import httpx
 import inspect
 import json
 from copy import deepcopy
+from dataclasses import replace
 from omegaconf import DictConfig, OmegaConf
 from openai.types.chat.chat_completion_message_tool_call import (
     ChatCompletionMessageToolCall, Function)
 from typing import Any, Dict, Generator, Iterable, List, Optional
 
-from ms_agent.llm import LLM
+from ms_agent.llm import LLM, multimodal
+from ms_agent.llm.io import interrupt_stream
+from ms_agent.llm.thinking import apply_effort, create_with_thinking_fallback
 from ms_agent.llm.utils import Message, Tool, ToolCall
+from ms_agent.llm.vision import create_with_vision_fallback
+from ms_agent.llm.vision import delivery_reason as vision_delivery_reason
 from ms_agent.utils import (MAX_CONTINUE_RUNS, assert_package_exist,
                             get_logger, retry)
 from ms_agent.utils.constants import get_service_config
@@ -97,6 +102,22 @@ class OpenAI(LLM):
                 float(_read_timeout), connect=float(_connect_timeout)),
         )
         self.base_url = base_url or ''
+        self._active_stream = None
+
+        # Image attachments (legacy non-router path). Resolution mirrors the
+        # router's: an explicit per-model switch wins, else the service's
+        # declared capability, else runtime learning from a refusal.
+        from ms_agent.llm.spec import get_registry
+        from ms_agent.llm.vision import resolve_supports_vision
+        self._vision = multimodal.VisionOptions.from_config(config)
+        _service = getattr(config.llm, 'service', None)
+        self._last_deliveries: List[multimodal.ImageDelivery] = []
+        self._vision_supported = resolve_supports_vision(
+            config,
+            spec=get_registry().get(_service)
+            or get_registry().resolve_by_model(self.model),
+            model=self.model,
+            base_url=self.base_url)
         self.args: Dict = OmegaConf.to_container(
             getattr(config, 'generation_config', DictConfig({})))
 
@@ -252,6 +273,12 @@ class OpenAI(LLM):
         if not stream:
             args.pop('stream_options', None)
 
+        # Lower the canonical knob first: the Responses path below reads
+        # `reasoning_effort` straight into `reasoning.effort`, so it must see a
+        # real OpenAI tier rather than a canonical `auto`/`off`.
+        args = apply_effort(
+            args, base_url=str(getattr(self.client, 'base_url', '')))
+
         if self._use_responses_api:
             if stream:
                 return self._responses_stream_generate(messages, tools, **args)
@@ -271,6 +298,39 @@ class OpenAI(LLM):
         else:
             return self._continue_generate(messages, completion, tools,
                                            max_continue_runs - 1, **args)
+
+    def _images_allowed(self) -> bool:
+        """Whether to encode pixels at all for this request.
+
+        The per-model switch, and nothing else. There is deliberately no memory
+        of past refusals to consult — see ``llm/vision.py`` for why.
+        """
+        return bool(self._vision_supported)
+
+    def _mark_images_degraded(self, reason: str) -> None:
+        """Correct this request's delivery record after recovery dropped images.
+
+        The record is built while formatting, i.e. before the endpoint has had a
+        chance to object, so left alone it would say "delivered" for exactly the
+        requests the user most needs told about.
+        """
+        self._last_deliveries = [
+            d if d.state != multimodal.DELIVERED else replace(
+                d, state=multimodal.DEGRADED, reason=reason)
+            for d in self._last_deliveries
+        ]
+
+    def _track_stream(self, stream):
+        # Retain the HTTP stream, not the lazy thinking/vision wrapper: closing
+        # an unstarted or currently executing generator cannot close its socket.
+        self._active_stream = stream
+        return stream
+
+    def interrupt(self) -> None:
+        stream = getattr(self, '_active_stream', None)
+        interrupt_stream(stream)
+        if getattr(self, '_active_stream', None) is stream:
+            self._active_stream = None
 
     def _call_llm(self,
                   messages: List[Message],
@@ -295,8 +355,31 @@ class OpenAI(LLM):
         if is_streaming and stream_options_config.get('include_usage', True):
             kwargs.setdefault('stream_options', {})['include_usage'] = True
 
-        return self.client.chat.completions.create(
-            model=self.model, messages=messages, tools=tools, **kwargs)
+        # Thinking is per-model and a refusal is a hard 400 (see llm/thinking.py).
+        # Image content is a per-model hard 400 on text-only models; retry once
+        # with the images folded into text and remember the model. Composes with
+        # the thinking fallback (each retries for its own reason).
+        sent_images = any(
+            multimodal.has_image_blocks(m.get('content'))
+            for m in messages if isinstance(m, dict))
+
+        def create(messages, **params):
+            result = self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=tools, **params)
+            return self._track_stream(result) if is_streaming else result
+
+        return create_with_vision_fallback(
+            lambda messages, **kw: create_with_thinking_fallback(
+                lambda **kw2: create(messages=messages, **kw2), self.client,
+                self.model, logger, **kw),
+            base_url=getattr(self.client, 'base_url', ''),
+            model=self.model,
+            messages=messages,
+            sent_images=sent_images,
+            max_edge=getattr(getattr(self, '_vision', None), 'max_edge', 0),
+            on_degrade=self._mark_images_degraded,
+            logger_=logger,
+            **kwargs)
 
     @staticmethod
     def _extract_cache_info(usage_obj: Any) -> tuple:
@@ -870,9 +953,16 @@ class OpenAI(LLM):
         if resp_tools:
             kwargs['tools'] = resp_tools
 
-        response = self._responses_client.responses.create(
-            model=self.model,
-            input=input_items,
+        # Same per-model hard-400 as the Chat Completions branch: a model that
+        # cannot think rejects the reasoning parameters outright. This branch
+        # used to lower the knob (`apply_effort`) without owning the repair, so
+        # the refusal reached the caller raw.
+        response = create_with_thinking_fallback(
+            lambda **kw: self._responses_client.responses.create(
+                model=self.model, input=input_items, **kw),
+            self._responses_client,
+            self.model,
+            logger,
             **kwargs,
         )
         text = getattr(response, 'output_text', '') or ''
@@ -922,9 +1012,13 @@ class OpenAI(LLM):
         if resp_tools:
             kwargs['tools'] = resp_tools
 
-        stream = self._responses_client.responses.create(
-            model=self.model,
-            input=input_items,
+        stream = create_with_thinking_fallback(
+            lambda **kw: self._track_stream(
+                self._responses_client.responses.create(
+                    model=self.model, input=input_items, **kw)),
+            self._responses_client,
+            self.model,
+            logger,
             stream=True,
             **kwargs,
         )
@@ -1012,6 +1106,10 @@ class OpenAI(LLM):
         # Determine if we need to add cache_control (for dashscope/anthropic)
         add_cache_control = self._prefix_cache_provider is not None
 
+        # One ordinal per PICTURE; see multimodal.image_index.
+        numbering: Dict[str, int] = {}
+        deliveries: List[multimodal.ImageDelivery] = []
+
         # Determine which message index should have cache_control (the last matching one)
         cache_indice = None
         if self._prefix_cache_enabled and add_cache_control:
@@ -1030,6 +1128,9 @@ class OpenAI(LLM):
 
         openai_messages = []
         for idx, message in enumerate(messages):
+            # Read image refs BEFORE to_dict_clean(), which strips them.
+            attachments = (message.attachments if isinstance(message, Message)
+                           else message.get('attachments')) or []
             if isinstance(message, Message):
                 # Only strip string content, keep list content as-is for multimodal
                 if isinstance(message.content, str):
@@ -1037,11 +1138,34 @@ class OpenAI(LLM):
                 message = message.to_dict_clean()
             else:
                 message = dict(message)
+                message.pop('attachments', None)
 
             content = message.get('content', '')
             # Only strip string content, multimodal content (list) should be kept as-is
             if isinstance(content, str):
                 content = content.strip()
+
+            # Image refs -> native image_url blocks. A turn with no attachments
+            # returns the same plain string, so text-only requests are unchanged.
+            # Not for a tool message: the Chat Completions SCHEMA allows
+            # only text parts in `role: "tool"`, so its images go to the
+            # synthetic user turn appended after it (below). Five compatible
+            # providers were measured to accept inline image parts here anyway,
+            # but hoisting is valid under the schema AND under all of them — see
+            # multimodal.TOOL_MEDIA_PROMPT for the full measurement.
+            if attachments and message.get('role') != 'tool':
+                content, built = multimodal.openai_content(
+                    content,
+                    attachments,
+                    self._vision,
+                    vision_supported=self._images_allowed(),
+                    reason=vision_delivery_reason(self.base_url, self.model),
+                    numbering=numbering,
+                    priors=[
+                        str((a or {}).get('delivery') or '')
+                        for a in attachments if isinstance(a, dict)
+                    ])
+                deliveries.extend(built)
 
             # Apply prefix cache structured content transformation
             # Only for string content, multimodal content is already structured
@@ -1070,10 +1194,30 @@ class OpenAI(LLM):
             # assistant messages accept it. This is the correct representation
             # now that the framework no longer injects a placeholder utterance.
             if (formatted_message.get('role') == 'assistant'
-                    and formatted_message.get('tool_calls')
-                    and not content):
+                    and formatted_message.get('tool_calls') and not content):
                 formatted_message['content'] = None
 
             openai_messages.append(formatted_message)
 
+            # Tool-result images: same hoist as OpenAICompatTransport (the
+            # Chat Completions schema restricts a tool message to text parts).
+            if attachments and message.get('role') == 'tool':
+                if multimodal.tool_media_withheld(attachments, self._vision,
+                                                  self._images_allowed()):
+                    # See the router transport: without this the tool's own
+                    # text is the last word on images this request drops.
+                    formatted_message['content'] = '\n'.join(
+                        filter(None, [
+                            str(formatted_message.get('content') or ''),
+                            multimodal.TOOL_MEDIA_WITHHELD,
+                        ]))
+                media = multimodal.openai_tool_media_message(
+                    attachments,
+                    self._vision,
+                    vision_supported=self._images_allowed(),
+                    numbering=numbering)
+                if media is not None:
+                    openai_messages.append(media)
+
+        self._last_deliveries = deliveries
         return openai_messages

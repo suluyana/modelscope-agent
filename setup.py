@@ -2,10 +2,18 @@
 # !/usr/bin/env python
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.sdist import sdist as _sdist
 
+import importlib.util
 import os
 import shutil
-from typing import List
+from pathlib import Path
+
+_webui_spec = importlib.util.spec_from_file_location(
+    '_ms_agent_webui_build',
+    Path(__file__).resolve().parent / '.dev_scripts/webui/webui_packaging.py')
+webui_packaging = importlib.util.module_from_spec(_webui_spec)
+_webui_spec.loader.exec_module(webui_packaging)
 
 
 def readme():
@@ -83,7 +91,7 @@ def parse_requirements(fname='requirements.txt', with_version=True):
         with open(fpath, 'r', encoding='utf-8') as f:
             for line in f.readlines():
                 line = line.strip()
-                if line.startswith('http'):
+                if line.startswith(('http://', 'https://')):
                     print('skip http requirements %s' % line)
                     continue
                 if line and not line.startswith('#') and not line.startswith(
@@ -124,6 +132,11 @@ def parse_requirements(fname='requirements.txt', with_version=True):
 class build_py(_build_py):
 
     def run(self):
+        if getattr(self, 'editable_mode', False):
+            super().run()
+            return
+        if (webui_packaging.WEBUI / webui_packaging.MANIFEST).is_file():
+            webui_packaging.validate_release()
         super().run()
 
         # Copy the repository root's `projects/` into the build directory's `ms_agent/projects/`
@@ -137,97 +150,58 @@ class build_py(_build_py):
 
             shutil.copytree(src, dst)
 
-        # Build and copy webui
-        self._build_and_copy_webui()
+        webui_packaging.copy_resources(Path(self.build_lib) / 'ms_agent/webui')
 
-    def _build_and_copy_webui(self):
-        """Build frontend and copy webui files to build directory"""
-        import subprocess
-
-        repo_root = os.path.dirname(__file__)
-        webui_src = os.path.join(repo_root, 'webui')
-
-        if not os.path.isdir(webui_src):
-            print(
-                'Warning: webui directory not found, skipping webui packaging')
-            return
-
-        frontend_src = os.path.join(webui_src, 'frontend')
-        backend_src = os.path.join(webui_src, 'backend')
-
-        # Check if npm is available
-        try:
-            subprocess.run(['npm', '--version'],
-                           capture_output=True,
-                           check=True,
-                           timeout=5)
-            npm_available = True
-        except (subprocess.CalledProcessError, FileNotFoundError,
-                subprocess.TimeoutExpired):
-            npm_available = False
-            print(
-                'Warning: npm not found, cannot build frontend. WebUI may not work properly.'
+        # Copy the Capability Gateway skill package into the built-in skills
+        # tree so ``pip install ms-agent`` ships a discoverable skill
+        # (skill_id = ``ms-agent``) under ``ms_agent/skills/ms-agent/``.
+        skill_src = os.path.join(os.path.dirname(__file__), 'ms-agent-skills')
+        if os.path.isdir(skill_src):
+            skill_dst = os.path.join(self.build_lib, 'ms_agent', 'skills',
+                                     'ms-agent')
+            os.makedirs(os.path.dirname(skill_dst), exist_ok=True)
+            if os.path.exists(skill_dst):
+                shutil.rmtree(skill_dst)
+            shutil.copytree(
+                skill_src,
+                skill_dst,
+                ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.DS_Store'),
             )
 
-        # Build frontend if npm is available
-        if npm_available and os.path.isdir(frontend_src):
-            print('Building frontend with npm...')
+    def get_source_files(self):
+        files = super().get_source_files()
+        files.extend('webui/' + rel
+                     for rel in webui_packaging.resource_paths(
+                         include_build=(webui_packaging.WEBUI /
+                                        webui_packaging.MANIFEST).is_file())
+                     if (webui_packaging.WEBUI / rel).is_file())
+        if (webui_packaging.WEBUI / webui_packaging.MANIFEST).is_file():
+            files.append('webui/' + webui_packaging.MANIFEST)
+        return files
 
-            # Install dependencies if needed
-            node_modules = os.path.join(frontend_src, 'node_modules')
-            if not os.path.exists(node_modules):
-                print('Installing frontend dependencies...')
-                try:
-                    subprocess.run(['npm', 'install'],
-                                   cwd=frontend_src,
-                                   check=True,
-                                   timeout=300)
-                except (subprocess.CalledProcessError,
-                        subprocess.TimeoutExpired) as e:
-                    print(f'Warning: npm install failed: {e}')
-                    return
+    def get_outputs(self, include_bytecode=1):
+        files = super().get_outputs(include_bytecode=include_bytecode)
+        if not getattr(self, 'editable_mode', False):
+            files.extend(
+                str(Path(self.build_lib) / 'ms_agent/webui' / rel)
+                for rel in webui_packaging.resource_paths(
+                    include_build=(webui_packaging.WEBUI /
+                                   webui_packaging.MANIFEST).is_file())
+                + [webui_packaging.MANIFEST])
+        return files
 
-            # Build frontend
-            try:
-                subprocess.run(['npm', 'run', 'build'],
-                               cwd=frontend_src,
-                               check=True,
-                               timeout=300)
-                print('Frontend built successfully')
-            except (subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired) as e:
-                print(f'Warning: npm build failed: {e}')
-                return
 
-        # Copy webui to build directory
-        webui_dst = os.path.join(self.build_lib, 'ms_agent', 'webui')
+class sdist(_sdist):
 
-        # Copy backend
-        if os.path.isdir(backend_src):
-            backend_dst = os.path.join(webui_dst, 'backend')
-            if os.path.exists(backend_dst):
-                shutil.rmtree(backend_dst)
-            shutil.copytree(backend_src, backend_dst)
-            print(f'Copied backend to {backend_dst}')
-
-        # Copy frontend dist (built files)
-        frontend_dist_src = os.path.join(frontend_src, 'dist')
-        if os.path.isdir(frontend_dist_src):
-            frontend_dst = os.path.join(webui_dst, 'frontend', 'dist')
-            os.makedirs(os.path.dirname(frontend_dst), exist_ok=True)
-            if os.path.exists(frontend_dst):
-                shutil.rmtree(frontend_dst)
-            shutil.copytree(frontend_dist_src, frontend_dst)
-            print(f'Copied frontend dist to {frontend_dst}')
-        else:
-            print(
-                'Warning: frontend dist not found, WebUI may not work in production mode'
-            )
+    def run(self):
+        if (webui_packaging.WEBUI / webui_packaging.MANIFEST).is_file():
+            webui_packaging.validate_release()
+        super().run()
 
 
 if __name__ == '__main__':
     print(
-        'Usage: `python setup.py sdist bdist_wheel` or `pip install .[framework]` from source code'
+        'Usage: `python setup.py sdist bdist_wheel` or `pip install .` from source code'
     )
 
     install_requires, deps_link = parse_requirements(
@@ -237,21 +211,20 @@ if __name__ == '__main__':
     extra_requires['research'], _ = parse_requirements(
         'requirements/research.txt')
     extra_requires['code'], _ = parse_requirements('requirements/code.txt')
-    extra_requires['webui'], _ = parse_requirements('requirements/webui.txt')
     extra_requires['acp'], _ = parse_requirements('requirements/acp.txt')
     extra_requires['a2a'], _ = parse_requirements('requirements/a2a.txt')
     extra_requires['retrieval'], _ = parse_requirements(
         'requirements/retrieval.txt')
-    extra_requires['cinema'], _ = parse_requirements(
-        'requirements/cinema.txt')
+    extra_requires['cinema'], _ = parse_requirements('requirements/cinema.txt')
     extra_requires['docs'], _ = parse_requirements('requirements/docs.txt')
+    extra_requires['webui'], _ = parse_requirements('requirements/webui.txt')
 
     # ``all`` aggregates every *runtime* extra so that `pip install ms-agent[all]`
     # yields a fully-featured install. ``docs`` is build-only and intentionally
     # excluded. De-duplicated for a clean, deterministic dependency set.
     all_requires = list(install_requires)
-    for _group in ('research', 'code', 'webui', 'acp', 'a2a', 'retrieval',
-                   'cinema'):
+    for _group in ('research', 'code', 'acp', 'a2a', 'retrieval', 'cinema',
+                   'webui'):
         all_requires.extend(extra_requires[_group])
     extra_requires['all'] = sorted(set(all_requires))
 
@@ -267,13 +240,22 @@ if __name__ == '__main__':
         keywords='python, agent, LLM',
         url='https://github.com/modelscope/ms-agent',
         packages=find_packages(exclude=('configs', 'demo')),
+        python_requires='>=3.10',
         include_package_data=True,
-        cmdclass={'build_py': build_py},
+        cmdclass={
+            'build_py': build_py,
+            'sdist': sdist
+        },
         package_data={
             'ms_agent': [
                 'projects/**/*',
-                'webui/backend/**/*',
-                'webui/frontend/dist/**/*',
+                # agent_hub conversion templates — without these in the wheel,
+                # get_defaults() returns {} and cross-framework convert
+                # silently degrades to a raw file copy.
+                'agent_hub/default_configs/**/*',
+                'webui/**/*',
+                # Capability Gateway skill package (copied into ms_agent/skills at build).
+                'skills/**/*',
             ],
             '': ['*.h', '*.cpp', '*.cu'],
         },
@@ -282,8 +264,6 @@ if __name__ == '__main__':
             'License :: OSI Approved :: Apache Software License',
             'Operating System :: OS Independent',
             'Programming Language :: Python :: 3',
-            'Programming Language :: Python :: 3.8',
-            'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
             'Programming Language :: Python :: 3.11',
             'Programming Language :: Python :: 3.12',

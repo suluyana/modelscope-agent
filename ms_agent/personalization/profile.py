@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ms_agent.utils.atomic_file import atomic_write_text
+from ms_agent.utils.file_lock import locked
+
 PROFILE_FILENAME = 'profile.md'
 
 
@@ -13,8 +16,15 @@ class ProfileManager:
     into the system prompt's User Profile section.
     """
 
-    def __init__(self, global_dir: str = '~/.ms_agent') -> None:
-        self._dir = Path(os.path.expanduser(global_dir))
+    def __init__(self, global_dir: str | None = None) -> None:
+        # Default follows the runtime home (honors MS_AGENT_HOME) instead of a
+        # hard-coded '~/.ms_agent' — a no-arg ProfileManager used to read a
+        # different file than a UI writing to a redirected home (dead link).
+        if global_dir is None:
+            from ms_agent.project.paths import global_home
+            self._dir = global_home()
+        else:
+            self._dir = Path(os.path.expanduser(global_dir))
         self._path = self._dir / PROFILE_FILENAME
 
     @property
@@ -29,10 +39,6 @@ class ProfileManager:
             return ''
         return self._path.read_text(encoding='utf-8')
 
+    @locked(lambda self, content: self._dir / '.prompt-files')
     def write(self, content: str) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix('.tmp')
-        tmp.write_text(content, encoding='utf-8')
-        # replace() is atomic and cross-platform; rename() raises on Windows
-        # when the destination already exists.
-        tmp.replace(self._path)
+        atomic_write_text(self._path, content)

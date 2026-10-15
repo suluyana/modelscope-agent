@@ -79,6 +79,10 @@ if not BUILTIN_SKILLS_DIR.exists():
         BUILTIN_SKILLS_DIR = _candidate
 
 from ms_agent.project.paths import global_home as _global_home  # noqa: E402
+from ms_agent.config.skills_manager import (  # noqa: E402
+    global_standard_skills_tree,
+    project_standard_skills_tree,
+)
 
 USER_SKILLS_DIR = _global_home() / 'skills'
 
@@ -125,10 +129,17 @@ class SkillCatalog:
         # walks it and stops at SKILL.md roots). Subdirectories are
         # organization, not origin: legacy installed/ & custom/ keep working
         # as plain subpaths.
+        standard_user_skills = global_standard_skills_tree()
+        if standard_user_skills.exists():
+            sources.append(
+                SkillSource(
+                    type=SkillSourceType.LOCAL_DIR,
+                    path=str(standard_user_skills)))
+
         if USER_SKILLS_DIR.exists():
             sources.append(
-                SkillSource(type=SkillSourceType.LOCAL_DIR,
-                            path=str(USER_SKILLS_DIR)))
+                SkillSource(
+                    type=SkillSourceType.LOCAL_DIR, path=str(USER_SKILLS_DIR)))
 
         # 3a. Structured sources (higher priority)
         if hasattr(skills_config, 'sources') and skills_config.sources:
@@ -156,6 +167,13 @@ class SkillCatalog:
 
         # 4. Workspace auto-discover (highest priority)
         if getattr(skills_config, 'auto_discover', False):
+            standard_workspace_skills = project_standard_skills_tree(
+                str(Path.cwd()))
+            if standard_workspace_skills.exists():
+                sources.append(
+                    SkillSource(
+                        type=SkillSourceType.LOCAL_DIR,
+                        path=str(standard_workspace_skills)))
             workspace_skills = Path.cwd() / 'skills'
             if workspace_skills.exists():
                 sources.append(
@@ -183,8 +201,9 @@ class SkillCatalog:
         seen: set = set()
         unique: List[SkillSource] = []
         for source in sources:
-            path = (str(Path(source.path).expanduser().resolve())
-                    if source.path else None)
+            path = (
+                str(Path(source.path).expanduser().resolve())
+                if source.path else None)
             key = (source.type, path, source.repo_id, source.url,
                    source.subdir, source.plugin_id)
             if key in seen:

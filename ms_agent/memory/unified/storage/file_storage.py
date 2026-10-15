@@ -3,13 +3,12 @@ character budget, and entry-level add / replace / remove operations.
 """
 from __future__ import annotations
 
-import os
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ms_agent.utils.atomic_file import atomic_write_text
 from ms_agent.utils.logger import get_logger
 from ..config import MemoryConfig
 from ..protocols import MemoryEntry
@@ -37,6 +36,11 @@ class FileMemoryStorage:
         self.char_limit = config.char_limit
         self.security_scan = config.security_scan
         self._content_cache: Optional[str] = None
+        # (mtime_ns, size) of the file the cache was read from. External
+        # writers exist (the WebUI memory editor, hand edits) and MEMORY.md
+        # rides in the system prompt — a never-expiring cache made those
+        # edits invisible to a running session.
+        self._cache_stat: Optional[tuple] = None
 
     # ------------------------------------------------------------------
     # MemoryStorage protocol
@@ -168,26 +172,29 @@ class FileMemoryStorage:
     # ------------------------------------------------------------------
 
     def _read(self) -> str:
-        if self._content_cache is not None:
+        try:
+            st = self.memory_path.stat()
+            stat_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._content_cache = None
+            self._cache_stat = None
+            return ''
+        if self._content_cache is not None and self._cache_stat == stat_key:
             return self._content_cache
-        if self.memory_path.exists():
-            content = self.memory_path.read_text(encoding='utf-8')
-            self._content_cache = content
-            return content
-        return ''
+        content = self.memory_path.read_text(encoding='utf-8')
+        self._content_cache = content
+        self._cache_stat = stat_key
+        return content
 
     def _write(self, content: str) -> None:
-        self.memory_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.memory_path.parent, suffix='.tmp')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(content)
-            os.replace(tmp, self.memory_path)
-        except Exception:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
+        atomic_write_text(self.memory_path, content)
         self._content_cache = content
+        try:
+            st = self.memory_path.stat()
+            self._cache_stat = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._cache_stat = None
 
     def invalidate_cache(self) -> None:
         self._content_cache = None
+        self._cache_stat = None

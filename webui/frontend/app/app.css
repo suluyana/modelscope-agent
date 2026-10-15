@@ -1,0 +1,372 @@
+/* Tailwind v4. Skip the preflight layer so antd's own resets win.
+ *
+ * THE cascade layer order, declared identically here and in root.tsx <head>.
+ * It has to be in both, and the two copies have to stay character-identical.
+ *
+ * A layer ranks where its name is FIRST SEEN, so whichever of the two the
+ * browser parses first fixes the order and the other is a no-op — which is the
+ * point: neither position is dependable on its own. root.tsx renders its copy
+ * ahead of everything, but only while React leaves it there; when React
+ * re-mounts the root Layout (the error boundary taking over after a client-side
+ * render error) it removes and re-appends the <head> nodes it owns, landing them
+ * AFTER the <style> Vite injected for this file. With the statement only in
+ * root.tsx, `utilities` was then first seen here and `antd` first seen in the
+ * baked sheet below it — so antd out-ranked the utilities meant to override it,
+ * and every antd component on the error page rendered with its own default
+ * chrome (a primary button losing its fill and white text to
+ * `.ant-btn-variant-text`). Declaring it here too makes the order hold under
+ * any arrangement of <head>.
+ *
+ * Any layer name missing from the list gets appended *after* `utilities` the
+ * first time it is seen, i.e. it silently wins over Tailwind. `properties` is
+ * Tailwind's own `--tw-*` fallback shim and must stay first (lowest); `antd` /
+ * `antdx` come from the sheet baked by scripts/genAntdCss.tsx (antd runs
+ * zero-runtime) and must sit under `utilities`.
+ *
+ * Names used below: `theme` and `utilities` (the two Tailwind imports), plus
+ * `properties` — which Tailwind emits as the very first statement of its
+ * compiled output. */
+@layer properties, theme, base, antd, antdx, components, utilities;
+
+/* x-markdown typography themes (light/dark class applied by <Markdown/>).
+ * Imported here (not in the component) so the css always goes through Vite's
+ * pipeline — a deep package css import would crash Node SSR. Plus KaTeX's
+ * stylesheet for the Latex math plugin. */
+@import '@ant-design/x-markdown/themes/light.css';
+@import '@ant-design/x-markdown/themes/dark.css';
+
+/* Class-based dark mode: any descendant of an element with class "dark"
+ * (typically <html>) gets dark: variants. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* ================================================================
+ * MSA Design System → Tailwind v4 @theme token registration
+ * Usage examples:
+ *   bg-msa-bg-1   text-msa-text-1   border-msa-line-1
+ *   rounded-msa-8  shadow-msa-s  text-msa-sm
+ * ================================================================ */
+@theme {
+  /* --- Background --- */
+  --color-msa-bg-1: var(--msa-bg-1);
+  --color-msa-bg-2: var(--msa-bg-2);
+
+  /* --- Brand: Purple --- */
+  --color-msa-purple-0: var(--msa-purple-0);
+  --color-msa-purple-1: var(--msa-purple-1);
+  --color-msa-purple-2: var(--msa-purple-2);
+  --color-msa-purple-3: var(--msa-purple-3);
+  --color-msa-purple-4: var(--msa-purple-4);
+  --color-msa-purple-5: var(--msa-purple-5);
+  --color-msa-purple-6: var(--msa-purple-6);
+  --color-msa-purple-7: var(--msa-purple-7);
+  --color-msa-purple-8: var(--msa-purple-8);
+  --color-msa-purple-9: var(--msa-purple-9);
+  --color-msa-purple-10: var(--msa-purple-10);
+
+  /* --- Brand: Blue --- */
+  --color-msa-blue-0: var(--msa-blue-0);
+  --color-msa-blue-1: var(--msa-blue-1);
+  --color-msa-blue-2: var(--msa-blue-2);
+  --color-msa-blue-3: var(--msa-blue-3);
+  --color-msa-blue-4: var(--msa-blue-4);
+  --color-msa-blue-5: var(--msa-blue-5);
+  --color-msa-blue-6: var(--msa-blue-6);
+  --color-msa-blue-7: var(--msa-blue-7);
+  --color-msa-blue-8: var(--msa-blue-8);
+  --color-msa-blue-9: var(--msa-blue-9);
+  --color-msa-blue-10: var(--msa-blue-10);
+
+  /* --- Brand: Green --- */
+  --color-msa-green-0: var(--msa-green-0);
+  --color-msa-green-1: var(--msa-green-1);
+  --color-msa-green-2: var(--msa-green-2);
+  --color-msa-green-3: var(--msa-green-3);
+  --color-msa-green-4: var(--msa-green-4);
+  --color-msa-green-5: var(--msa-green-5);
+  --color-msa-green-6: var(--msa-green-6);
+  --color-msa-green-7: var(--msa-green-7);
+  --color-msa-green-8: var(--msa-green-8);
+  --color-msa-green-9: var(--msa-green-9);
+  --color-msa-green-10: var(--msa-green-10);
+
+  /* --- Neutral --- */
+  --color-msa-neutral-0: var(--msa-neutral-0);
+  --color-msa-neutral-1: var(--msa-neutral-1);
+  --color-msa-neutral-2: var(--msa-neutral-2);
+  --color-msa-neutral-3: var(--msa-neutral-3);
+  --color-msa-neutral-4: var(--msa-neutral-4);
+  --color-msa-neutral-5: var(--msa-neutral-5);
+  --color-msa-neutral-6: var(--msa-neutral-6);
+  --color-msa-neutral-7: var(--msa-neutral-7);
+  --color-msa-neutral-8: var(--msa-neutral-8);
+  --color-msa-neutral-9: var(--msa-neutral-9);
+  --color-msa-neutral-10: var(--msa-neutral-10);
+
+  /* --- Decoration --- */
+  --color-msa-deco-purple: var(--msa-deco-purple);
+  --color-msa-deco-green: var(--msa-deco-green);
+  --color-msa-deco-blue: var(--msa-deco-blue);
+  --color-msa-deco-pink: var(--msa-deco-pink);
+  --color-msa-deco-yellow: var(--msa-deco-yellow);
+  --color-msa-deco-orange: var(--msa-deco-orange);
+  --color-msa-deco-orange1: var(--msa-deco-orange1);
+  --color-msa-deco-green2: var(--msa-deco-green2);
+  --color-msa-deco-pink2: var(--msa-deco-pink2);
+  --color-msa-deco-pink3: var(--msa-deco-pink3);
+  --color-msa-deco-red: var(--msa-deco-red);
+  --color-msa-deco-gray: var(--msa-deco-gray);
+
+  /* --- Text --- */
+  --color-msa-text-0: var(--msa-text-0);
+  --color-msa-text-1: var(--msa-text-1);
+  --color-msa-text-2: var(--msa-text-2);
+  --color-msa-text-3: var(--msa-text-3);
+  --color-msa-text-brand1: var(--msa-text-brand1);
+  --color-msa-text-brand2: var(--msa-text-brand2);
+  --color-msa-text-danger: var(--msa-text-danger);
+  --color-msa-text-disabled: var(--msa-text-disabled);
+
+  /* --- Icon (currentColor glyphs) --- */
+  --color-msa-icon-neutral: var(--msa-icon-neutral);
+
+  /* --- Fill --- */
+  --color-msa-fill-0: var(--msa-fill-0);
+  --color-msa-fill-1: var(--msa-fill-1);
+  --color-msa-fill-2: var(--msa-fill-2);
+  --color-msa-fill-3: var(--msa-fill-3);
+  --color-msa-fill-4: var(--msa-fill-4);
+  --color-msa-fill-5: var(--msa-fill-5);
+  --color-msa-fill-6: var(--msa-fill-6);
+  --color-msa-fill-trans: var(--msa-fill-trans);
+  --color-msa-fill-purple: var(--msa-fill-purple);
+  --color-msa-fill-green: var(--msa-fill-green);
+  --color-msa-fill-orange: var(--msa-fill-orange);
+  --color-msa-fill-cyan: var(--msa-fill-cyan);
+  --color-msa-fill-gray: var(--msa-fill-gray);
+  --color-msa-fill-blue: var(--msa-fill-blue);
+  --color-msa-fill-tag: var(--msa-fill-tag);
+  --color-msa-fill-code-box: var(--msa-fill-code-box);
+  --color-msa-fill-input: var(--msa-fill-input);
+  --color-msa-fill-error: var(--msa-fill-error);
+  --color-msa-fill-warning: var(--msa-fill-warning);
+  --color-msa-fill-brand: var(--msa-fill-brand);
+
+  /* --- Line / Border --- */
+  --color-msa-line-0: var(--msa-line-0);
+  --color-msa-line-1: var(--msa-line-1);
+  --color-msa-line-2: var(--msa-line-2);
+  --color-msa-line-3: var(--msa-line-3);
+  --color-msa-line-input: var(--msa-line-input);
+
+  /* --- Border Radius --- */
+  --radius-msa-0: 0px;
+  --radius-msa-2: 2px;
+  --radius-msa-4: 4px;
+  --radius-msa-6: 6px;
+  --radius-msa-8: 8px;
+  --radius-msa-12: 12px;
+  --radius-msa-16: 16px;
+  --radius-msa-24: 24px;
+  --radius-msa-full: 9999px;
+
+  /* --- Shadows --- */
+  --shadow-msa-light: 2px 2px 10px 2px rgba(63, 63, 63, 0.04);
+  --shadow-msa-s: 0px 1px 6px 0px rgba(38, 36, 76, 0.12);
+  --shadow-msa-m: 0px 2px 32px 0px rgba(39, 37, 76, 0.08);
+  --shadow-msa-l: 0px 2px 32px 0px rgba(39, 37, 76, 0.08);
+  --shadow-msa-popup: 0px 3px 6px -4px rgba(0, 0, 0, 0.12), 0px 6px 16px 0px rgba(0, 0, 0, 0.08), 0px 9px 28px 8px rgba(0, 0, 0, 0.05);
+  --shadow-msa-modal: 0px 6px 16px -8px rgba(0, 0, 0, 0.08), 0px 9px 28px 0px rgba(0, 0, 0, 0.05), 0px 12px 48px 16px rgba(0, 0, 0, 0.03);
+  --shadow-msa-btn-blue: 0px 6px 8px 0px rgba(97, 92, 237, 0.12);
+  --shadow-msa-btn-blue-hover: 0px 6px 8px 0px rgba(97, 92, 237, 0.2);
+  --shadow-msa-btn-red: 0px 6px 8px 0px rgba(235, 47, 47, 0.12);
+  --shadow-msa-btn-red-hover: 0px 6px 8px 0px rgba(235, 47, 47, 0.2);
+
+  /* --- Typography --- */
+  --font-family-msa: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', helvetica, arial, sans-serif;
+  --font-family-msa-mono: 'Monaco', 'Menlo', 'Consolas', monospace;
+
+  --font-size-msa-xs: 12px;
+  --font-size-msa-sm: 13px;
+  --font-size-msa-base: 14px;
+  --font-size-msa-lg: 16px;
+  --font-size-msa-xl: 18px;
+  --font-size-msa-2xl: 20px;
+  --font-size-msa-3xl: 24px;
+  --font-size-msa-4xl: 32px;
+}
+
+/* ================================================================
+ * Global Resets
+ * ================================================================ */
+/* Tell the engine which palette the page is in, so BROWSER-DRAWN surfaces we
+   can't style follow the theme: scrollbars, form controls, `<select>` popups,
+   date/color pickers, spellcheck underlines, the canvas behind overscroll, and
+   the default background before CSS paints.
+
+   Driven off the same `.dark` class on <html> that everything else keys on
+   (set during SSR in root.tsx, toggled by theme.tsx) — so it is correct on the
+   very first frame, with no JS and no hydration gap. `only` prevents the engine
+   from silently substituting the other scheme. */
+html {
+  color-scheme: only light;
+}
+
+html.dark {
+  color-scheme: only dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  font-family: var(--msa-font-family);
+  font-size: var(--msa-font-size-base);
+  line-height: var(--msa-line-height-base);
+  background: var(--msa-bg-2);
+  color: var(--msa-text-1);
+}
+
+/* Tailwind preflight is off; restore the bits we rely on. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* --- Scrollbars -----------------------------------------------------------
+   One thin, translucent, reveal-on-hover scrollbar for the whole app,
+   replacing the browser default (a thick, always-visible grey track). The
+   thumb is invisible until the pointer enters the scroll container, then
+   fades in as a slim pill; hovering the thumb itself deepens it. Colour is
+   the theme-aware neutral token faded with `color-mix`, so it adapts
+   light/dark and never becomes a hardcoded value.
+
+   Unlayered on purpose: these must outrank antd's layered styles, and the
+   WebKit pseudo-elements below already override the `color-scheme` bar. */
+
+/* How much width a scrollbar steals from the content box. 0 is the overlay
+   case (macOS default, mobile) and the SSR default; a blocking script at the top
+   of <body> overwrites it on <html> with the real measurement before the app
+   lays out. See ScrollArea. */
+:root {
+  --msa-scrollbar-w: 0px;
+}
+
+* {
+  scrollbar-width: thin;
+  /* thumb track — transparent until hover (Firefox has no hover pseudo). */
+  scrollbar-color: transparent transparent;
+}
+
+*:hover {
+  scrollbar-color: color-mix(in srgb, var(--msa-text-3) 45%, transparent) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* The 2px transparent border + padding-box clip shrinks the visible pill to
+   ~4px, thinner than the 8px hit area it still keeps for grabbing. */
+*::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 9999px;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--msa-text-3) 35%, transparent);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--msa-text-3) 60%, transparent);
+}
+
+/* --- Keyboard focus ring ---------------------------------------------------
+   One brand-coloured ring for the whole app. antd bakes its own
+   `:focus-visible` outline from a pale derived tint (colorPrimaryBorder,
+   #d2c4ff) at a heavy 3px, and elements antd doesn't reset fall back to the
+   browser's black ring — so the same keyboard focus looked pale here and
+   black there.
+
+   Layering does the work, not specificity: root.tsx pins the order
+   `… antd, antdx, components, utilities`, so a rule in `components` outranks
+   every antd focus outline (in `antd`/`antdx`) by layer precedence alone —
+   no matter how many `.ant-*` classes those selectors stack — while still
+   sitting BELOW `utilities`, so a deliberate Tailwind `outline-none` on a
+   component that manages its own focus keeps winning. Colour is the
+   theme-aware brand token (adapts light/dark), thinner than antd's default. */
+@layer components {
+  :focus-visible {
+    outline: 2px solid var(--msa-text-brand1);
+    outline-offset: 1px;
+  }
+
+  /* Text-entry fields already carry their own focus treatment (antd draws a
+     brand border + ring on them), so the outline above would double it into a
+     twin purple ring. They match `:focus-visible` even on mouse click, hence
+     the explicit opt-out. antd's input WRAPPERS focus via `:focus-within`, not
+     `:focus-visible`, so only these inner controls need it. */
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  [contenteditable]:focus-visible {
+    outline: none;
+  }
+
+  /* Segmented: drop antd's raised look. The selected item + moving thumb carry
+     `box-shadow: boxShadowTertiary` (a global alias token, not a Segmented
+     component token), so it can't be turned off in msaTheme.ts — the flat MSA
+     control keeps only the white pill fill. Layer precedence beats the baked
+     `antd` rule without stacking `.ant-*` selectors. */
+  .ant-segmented .ant-segmented-item-selected,
+  .ant-segmented .ant-segmented-thumb {
+    box-shadow: none;
+  }
+
+  .ant-dropdown-menu-submenu-title {
+    display: flex;
+    align-items: center;
+  }
+}
+
+/* --- Anti-flicker loading (skeletons / spinners) ---------------------------
+   Fast responses used to flash a skeleton for a frame or two. Pure-CSS
+   two-phase gate (SSR-safe, no hydration timing):
+   invisible for the first 250ms — a fast load never shows a skeleton at
+   all — then a 150ms fade-in for genuinely slow loads. Apply to the
+   skeleton/spinner WRAPPER that mounts while data is loading. */
+@keyframes msa-loading-reveal {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.msa-loading-defer {
+  opacity: 0;
+  animation: msa-loading-reveal 150ms ease-out 250ms forwards;
+}

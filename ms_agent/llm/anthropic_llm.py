@@ -5,9 +5,13 @@ from omegaconf import DictConfig, OmegaConf
 from typing import Any, Dict, Generator, Iterator, List, Optional, Union
 
 from ms_agent.llm import LLM
+from ms_agent.llm.io import OpenedStream, interrupt_stream
+from ms_agent.llm.thinking import create_with_thinking_fallback
 from ms_agent.llm.utils import Message, Tool, ToolCall
-from ms_agent.utils import assert_package_exist, retry
+from ms_agent.utils import assert_package_exist, get_logger, retry
 from ms_agent.utils.constants import get_service_config
+
+logger = get_logger()
 
 
 class _SSEEventInjector(httpx.SyncByteStream):
@@ -164,6 +168,14 @@ class Anthropic(LLM):
 
         self.args: Dict = OmegaConf.to_container(
             getattr(config, 'generation_config', DictConfig({})))
+        self._active_stream = None
+
+    def interrupt(self) -> None:
+        """Close the owned HTTP stream, including before iteration starts."""
+        stream = self._active_stream
+        interrupt_stream(stream)
+        if self._active_stream is stream:
+            self._active_stream = None
 
     def format_tools(self,
                      tools: Optional[List[Tool]]) -> Optional[List[Dict]]:
@@ -278,10 +290,22 @@ class Anthropic(LLM):
             kwargs['extra_body'] = extra_body
         params.update(kwargs)
 
-        if stream:
-            return self.client.messages.stream(**params)
-        else:
-            return self.client.messages.create(**params)
+        def _send(**call):
+            call.setdefault('model', self.model)
+            if stream:
+                opened = OpenedStream(self.client.messages.stream(**call))
+                self._active_stream = opened
+                return opened
+            return self.client.messages.create(**call)
+
+        # This legacy engine owned no repair at all: a model that cannot think
+        # rejected the `thinking` block with a hard 400 and the error went
+        # straight to the caller, while the transport port of this same engine
+        # recovered. Bring it in line — `model` is passed through `_send` so it
+        # cannot collide with the wrapper's own named argument.
+        rest = {k: v for k, v in params.items() if k != 'model'}
+        return create_with_thinking_fallback(_send, self.client, self.model,
+                                             logger, **rest)
 
     @retry(max_attempts=LLM.retry_count, delay=3.0)
     def generate(self,
@@ -320,53 +344,58 @@ class Anthropic(LLM):
         )
         tool_call_id_map = {}  # index -> tool_call_id (用于去重 yield)
         with stream_manager as stream:
-            full_content = ''
-            full_thinking = ''
-            for event in stream:
-                event_type = getattr(event, 'type')
-                if event_type == 'message_start':
-                    msg = event.message
-                    current_message.id = msg.id
-                    tool_call_id_map = {}
-                    yield current_message
-                elif event_type == 'content_block_delta':
-                    if event.delta.type == 'thinking_delta':
-                        full_thinking += event.delta.thinking
-                        current_message.reasoning_content = full_thinking
-                    elif event.delta.type == 'text_delta':
-                        full_content += event.delta.text
+            self._active_stream = stream
+            try:
+                full_content = ''
+                full_thinking = ''
+                for event in stream:
+                    event_type = getattr(event, 'type')
+                    if event_type == 'message_start':
+                        msg = event.message
+                        current_message.id = msg.id
+                        tool_call_id_map = {}
+                        yield current_message
+                    elif event_type == 'content_block_delta':
+                        if event.delta.type == 'thinking_delta':
+                            full_thinking += event.delta.thinking
+                            current_message.reasoning_content = full_thinking
+                        elif event.delta.type == 'text_delta':
+                            full_content += event.delta.text
+                            current_message.content = full_content
+                        yield current_message
+                    elif event_type == 'message_stop':
+                        final_msg = getattr(event, 'message')
+                        full_content = ''
+                        used_tool_call_ids = set()
+                        for idx, block in enumerate(event.message.content):
+                            if block is None:
+                                continue
+                            if block.type == 'text':
+                                full_content += block.text
+                            elif block.type == 'tool_use':
+                                tool_call_id = tool_call_id_map.get(idx)
+                                tool_call = ToolCall(
+                                    id=tool_call_id,
+                                    index=len(current_message.tool_calls),
+                                    type='function',
+                                    tool_name=block.name,
+                                    arguments=block.input,
+                                )
+                                current_message.tool_calls.append(tool_call)
+                                used_tool_call_ids.add(tool_call_id)
                         current_message.content = full_content
-                    yield current_message
-                elif event_type == 'message_stop':
-                    final_msg = getattr(event, 'message')
-                    full_content = ''
-                    used_tool_call_ids = set()
-                    for idx, block in enumerate(event.message.content):
-                        if block is None:
-                            continue
-                        if block.type == 'text':
-                            full_content += block.text
-                        elif block.type == 'tool_use':
-                            tool_call_id = tool_call_id_map.get(idx)
-                            tool_call = ToolCall(
-                                id=tool_call_id,
-                                index=len(current_message.tool_calls),
-                                type='function',
-                                tool_name=block.name,
-                                arguments=block.input,
-                            )
-                            current_message.tool_calls.append(tool_call)
-                            used_tool_call_ids.add(tool_call_id)
-                    current_message.content = full_content
-                    current_message.partial = False
-                    current_message.completion_tokens = getattr(
-                        final_msg.usage, 'output_tokens',
-                        current_message.completion_tokens)
-                    current_message.prompt_tokens = getattr(
-                        final_msg.usage, 'input_tokens',
-                        current_message.prompt_tokens)
+                        current_message.partial = False
+                        current_message.completion_tokens = getattr(
+                            final_msg.usage, 'output_tokens',
+                            current_message.completion_tokens)
+                        current_message.prompt_tokens = getattr(
+                            final_msg.usage, 'input_tokens',
+                            current_message.prompt_tokens)
 
-                    yield current_message
+                        yield current_message
+            finally:
+                if self._active_stream is stream:
+                    self._active_stream = None
 
     @staticmethod
     def _format_output_message(completion) -> Message:

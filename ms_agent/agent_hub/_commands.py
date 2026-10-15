@@ -11,7 +11,8 @@ import getpass
 import os
 import sys
 import zipfile
-from modelscope_hub.agent import AgentApi
+from modelscope_hub.agent import (AgentApi, agent_last_modified,
+                                  agent_visibility_label)
 from modelscope_hub.errors import APIError
 from pathlib import Path
 
@@ -27,6 +28,46 @@ logger = get_logger()
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _print_openhuman_next_steps(root) -> None:
+    """After a successful convert/download, remind the user that the result is
+    not yet usable: openhuman discovers agents only through the
+    ``workspace/agents/<id>.toml`` registry, which we deliberately do not
+    generate, so they must create it by hand.
+
+    Uses ``Logger.info`` rather than ``display``/``print`` per the tech lead's
+    requirement.
+    """
+    agents_dir = f'{root}/agents'
+    doc = ('https://github.com/tinyhumansai/openhuman/blob/main/'
+           'gitbooks/developing/architecture/agent-harness.md')
+    example = ('https://github.com/tinyhumansai/openhuman/blob/main/'
+               'src/openhuman/agent/registry/agents/researcher/agent.toml')
+    logger.info(
+        '转换/下载已完成，但当前还不能直接使用（若尚未注册）。OpenHuman 只通过 '
+        'workspace/agents/<agent-id>.toml 注册表发现智能体，本次仅写入了 persona/skill 文件。\n'
+        '请手动完成：\n'
+        '  官方文档（如何构建 agent.toml）：' + doc + '\n'
+        '  官方示例（researcher/agent.toml）：' + example + '\n'
+        f'  1) 在 {agents_dir}/ 下手动创建 <agent-id>.toml，包含 id / when_to_use / '
+        'system_prompt.inline（粘贴 SOUL.md 内容）/ model.exact="inherit"；id 仅限字母、数字、"_"、"-"。\n'
+        '  2) UI「设置 → 智能体 → 新建智能体」，id / model / 工具白名单与 TOML 保持一致。\n'
+        '  3) UI「设置 → 智能体配置 → 新建配置」，base agent id 填同一个 id。\n'
+        '  4) 新建一个对话即可使用。')
+    logger.info(
+        'Conversion/download finished, but the agent is NOT usable yet '
+        '(if you have not registered it). OpenHuman discovers agents only via the '
+        'workspace/agents/<agent-id>.toml registry; this run wrote persona/skill files only.\n'
+        'Manual steps:\n'
+        '  Official docs (how to build agent.toml): ' + doc + '\n'
+        '  Official example (researcher/agent.toml): ' + example + '\n'
+        f'  1) Create {agents_dir}/<agent-id>.toml with: id / when_to_use / '
+        'system_prompt.inline (paste the SOUL.md content) / model.exact="inherit"; '
+        'id may contain only letters, digits, "_", "-".\n'
+        '  2) UI "Settings → Agents → New Agent": keep id / model / tool allowlist consistent with the TOML.\n'
+        '  3) UI "Settings → Agent Config → New Config": set base agent id to the same id.\n'
+        '  4) Start a new conversation.')
 
 
 def _fail(message: str) -> int:
@@ -133,9 +174,49 @@ def resolve_local_name(name: str | None, framework: str, local_dir=None):
                   f'Please specify --name to select one.')
 
 
+STABLE_FRAMEWORKS = frozenset(['ms-agent', 'qwenpaw'])
+
+_TRY_EXP_ENV = 'TRY_EXP_FRAMEWORKS'
+
+
+def _experimental_enabled() -> bool:
+    """True when ``TRY_EXP_FRAMEWORKS`` opts into the experimental frameworks.
+
+    Read on every call (not cached at import time) so tests and callers can
+    flip the variable within a live process.
+    """
+    return os.environ.get(_TRY_EXP_ENV,
+                          '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _enabled_frameworks() -> set[str]:
+    """Registered frameworks the current environment is allowed to use."""
+    if _experimental_enabled():
+        return set(FRAMEWORK_REGISTRY)
+    return {fw for fw in FRAMEWORK_REGISTRY if fw in STABLE_FRAMEWORKS}
+
+
 def available_frameworks() -> str:
-    """Comma-separated list of registered frameworks."""
-    return ', '.join(sorted(FRAMEWORK_REGISTRY))
+    """Comma-separated list of frameworks usable in the current environment."""
+    return ', '.join(sorted(_enabled_frameworks()))
+
+
+def check_framework(framework: str, label: str = 'framework') -> str | None:
+    """Validate *framework*, returning an error message or ``None`` if OK.
+
+    Distinguishes a genuinely unknown name from a registered-but-experimental
+    one: the latter gets a hint about ``TRY_EXP_FRAMEWORKS`` instead of a
+    misleading "unknown framework", since the framework does exist and works
+    -- it is only gated.
+    """
+    if framework in _enabled_frameworks():
+        return None
+    if framework in FRAMEWORK_REGISTRY:
+        return (f"{label} '{framework}' is experimental and not enabled. "
+                f'Set {_TRY_EXP_ENV}=True to use it. '
+                f'Enabled: {available_frameworks()}')
+    return (f"unknown {label} '{framework}'. "
+            f'Available: {available_frameworks()}')
 
 
 def build_spec(framework: str, name: str, local_dir=None) -> WorkspaceSpec:
@@ -206,10 +287,10 @@ def convert_resources(
         source_defaults=get_defaults(source_fw),
         target_defaults=get_defaults(target_fw),
         fill_missing_defaults=fill_missing_defaults,
-        overflow_target=(_file_per_agent_identity_path(dst_spec)
-                         if dst_spec is not None else None),
-        identity_source=(_file_per_agent_identity_path(src_spec)
-                         if src_spec is not None else None),
+        overflow_target=(_file_per_agent_identity_path(
+            dst_spec, for_target=True) if dst_spec is not None else None),
+        identity_source=(_file_per_agent_identity_path(
+            src_spec, for_target=False) if src_spec is not None else None),
         existing_skills=(_existing_skill_names(existing_files)
                          if existing_files else None),
     )
@@ -288,10 +369,9 @@ def _convert_resources_all(
 
 def cmd_status(framework: str, local_dir=None) -> int:
     """List discoverable sub-agents for a framework."""
-    if framework not in FRAMEWORK_REGISTRY:
-        return _fail(
-            f"unknown framework '{framework}'. Available: {available_frameworks()}"
-        )
+    err = check_framework(framework)
+    if err:
+        return _fail(err)
 
     spec = build_spec(framework, DEFAULT_AGENT_NAME, local_dir)
     agents = spec.list_agents()
@@ -318,10 +398,9 @@ def cmd_upload(
     username: str | None = None,
 ) -> int:
     """Upload local agent files to remote."""
-    if framework not in FRAMEWORK_REGISTRY:
-        return _fail(
-            f"unknown framework '{framework}'. Available: {available_frameworks()}"
-        )
+    err = check_framework(framework)
+    if err:
+        return _fail(err)
 
     local_name, err = resolve_local_name(name, framework, local_dir)
     if err:
@@ -347,9 +426,11 @@ def cmd_upload(
     # boilerplate is never pushed -- keeps upload and convert 1:1-consistent
     # about what "the user's own files" are.
     from ._sync import drop_unchanged_defaults, sanitize_outbound
+    redacted: list = []
     try:
         resources = drop_unchanged_defaults(
-            sanitize_outbound(resources, spec), framework, spec)
+            sanitize_outbound(resources, spec, findings=redacted), framework,
+            spec)
     except ValueError as e:
         # Fail-closed sanitize: a config file that cannot be parsed cannot be
         # verified secret-free -- abort instead of pushing plaintext keys.
@@ -371,6 +452,17 @@ def cmd_upload(
         headers=['FILE', 'SIZE'],
         color=display.COLOR_WRITTEN,
     )
+    if redacted:
+        # Before the dry-run return, so --dry-run shows what would be stripped.
+        display.table(
+            'Secrets redacted',
+            [(f.rel, f.kind, f'line {f.line}' if f.line else 'structural')
+             for f in sorted(redacted)],
+            headers=['FILE', 'KIND', 'WHERE'],
+            color=display.COLOR_MERGED,
+            note=f'{len(redacted)} secret value(s) replaced with '
+            f'[REDACTED:*] in the uploaded copy; local files are untouched.',
+        )
 
     if dry_run:
         print('\n[dry-run] nothing uploaded.')
@@ -529,10 +621,9 @@ def cmd_download(
     if not repo:
         return _fail(
             '--repo is required for download (the remote repository name)')
-    if framework not in FRAMEWORK_REGISTRY:
-        return _fail(
-            f"unknown framework '{framework}'. Available: {available_frameworks()}"
-        )
+    err = check_framework(framework)
+    if err:
+        return _fail(err)
 
     if not endpoint:
         return _fail('not logged in. Provide endpoint.')
@@ -648,10 +739,9 @@ def cmd_download(
 
     # Optional format conversion.
     target_fw = target or framework
-    if target_fw not in FRAMEWORK_REGISTRY:
-        return _fail(
-            f"unknown target framework '{target_fw}'. Available: {available_frameworks()}"
-        )
+    err = check_framework(target_fw, 'target framework')
+    if err:
+        return _fail(err)
 
     local_name = name or DEFAULT_AGENT_NAME
     spec = build_spec(target_fw, local_name, local_dir)
@@ -743,8 +833,24 @@ def cmd_download(
         print('\n[dry-run] nothing written.')
         return 0
 
+    # Back up whatever is on disk before overwriting it. Download is the most
+    # frequently used overwrite path, so it needs the same restore point that
+    # convert / restore / watch --pull already create; without it a download
+    # over a locally edited workspace was unrecoverable. The label follows the
+    # shared ``{fw}_{name}_{date}_{time}`` convention (all-scope: ``{fw}_...``)
+    # that ``backups -f <fw>`` parses, so this safety copy stays visible under
+    # the framework filter.
+    from ._sync import backup_local
+    if spec.collect():
+        backup_label = (
+            target_fw
+            if local_name == ALL_AGENT_NAME else f'{target_fw}_{local_name}')
+        display.meta('backup', backup_local(spec, backup_label))
+
     written = spec.apply(filtered)
     display.done(f'Wrote {len(written)} file(s) under {root}')
+    if target_fw == 'openhuman' and written:
+        _print_openhuman_next_steps(root)
 
     # Download is overwrite/add-only and never deletes local files. The remote
     # holds only the user's customized content (unchanged framework defaults are
@@ -755,16 +861,27 @@ def cmd_download(
     return 0
 
 
-def _file_per_agent_identity_path(dst_spec: WorkspaceSpec) -> str | None:
-    """Resolve the per-agent identity file for a file-per-agent target.
+def _file_per_agent_identity_path(spec: WorkspaceSpec, *,
+                                  for_target: bool) -> str | None:
+    """Resolve the per-agent identity file of a file-per-agent layout.
 
     File-per-agent frameworks (e.g. qoder) declare a ``{name}`` placeholder
-    pattern such as ``agents/{name}.md``.  Format it with the destination
-    agent name so converted persona content can be routed into that file.
-    Returns ``None`` when the layout has no single ``{name}`` file pattern.
+    pattern such as ``agents/{name}.md``.  Format it with the agent name so
+    persona content can be routed there.  Returns ``None`` when the layout
+    has no single ``{name}`` file pattern.
+
+    ``for_target=True`` resolves the overflow target (where converted persona
+    lands); qoder opts out there: imported persona folds into the shared
+    ``AGENTS.md`` instead of spawning ``agents/<name>.md``.
+    ``for_target=False`` resolves the identity source (flag this layout's own
+    persona file so it folds into the target persona instead of being
+    dropped); qoder must stay in there -- skipping it on the source side
+    loses the persona on every qoder->X conversion.
     """
-    name = dst_spec.agent_name or DEFAULT_AGENT_NAME
-    for pattern in dst_spec.patterns:
+    if for_target and spec.product_name == 'qoder':
+        return None
+    name = spec.agent_name or DEFAULT_AGENT_NAME
+    for pattern in spec.patterns:
         # Only single-file placeholders (no wildcard) identify the persona file;
         # skip glob patterns like ``skills/{name}/*`` if any exist.
         if '{name}' in pattern and '*' not in pattern:
@@ -876,15 +993,18 @@ def convert_workspace(
         default_paths = set()
         skipped_skills = []
     else:
-        # File-per-agent targets (e.g. qoder ``agents/{name}.md``) keep
-        # per-agent identity in a dedicated sub-agent file; route overflow
-        # (persona content with no shared mapping) there instead of the
-        # shared catch-all so it does not pollute other sub-agents.
-        # Symmetrically, a file-per-agent SOURCE's persona file is flagged so
-        # it folds into the target's persona file instead of being dropped.
+        # File-per-agent targets declare a per-agent identity file
+        # (``agents/{name}.md``); overflow (persona content with no shared
+        # mapping) is routed there instead of the shared catch-all so it does
+        # not pollute other sub-agents. qoder opts out on the target side:
+        # its imported persona folds into the shared AGENTS.md instead (see
+        # _file_per_agent_identity_path). Symmetrically, a file-per-agent
+        # SOURCE's persona file is flagged so it folds into the target's
+        # persona file instead of being dropped.
         overflow_target = None
         if any('{name}' in p for p in dst_spec.patterns):
-            overflow_target = _file_per_agent_identity_path(dst_spec)
+            overflow_target = _file_per_agent_identity_path(
+                dst_spec, for_target=True)
         result = merge_resources(
             incoming=resources,
             source_product=source_fw,
@@ -892,7 +1012,8 @@ def convert_workspace(
             source_defaults=get_defaults(source_fw),
             target_defaults=get_defaults(target_fw),
             overflow_target=overflow_target,
-            identity_source=_file_per_agent_identity_path(src_spec),
+            identity_source=_file_per_agent_identity_path(
+                src_spec, for_target=False),
             fill_missing_defaults=False,
             existing_skills=_existing_skill_names(existing_paths),
         )
@@ -912,10 +1033,19 @@ def convert_workspace(
     # as-is; without this filter they would leak into the target framework.
     # Mirrors the dst-spec guard in cmd_download's download path.
     dropped: list[str] = []
+    dropped_memory_payloads: list[str] = []
     if source_fw != target_fw:
         dst_patterns = dst_spec.resolved_patterns()
         dropped = sorted(
             k for k in converted if not dst_spec.matches(k, dst_patterns))
+        # Non-Markdown memory payloads cannot be hosted by any target's
+        # Markdown-only memory: report them separately from generic drops.
+        dropped_memory_payloads = [
+            k for k in dropped
+            if k.startswith(('memory/', 'memories/'))
+            and not k.endswith('.md')
+        ]
+        dropped = [k for k in dropped if k not in dropped_memory_payloads]
         converted = {
             k: v
             for k, v in converted.items() if dst_spec.matches(k, dst_patterns)
@@ -946,8 +1076,9 @@ def convert_workspace(
               ('written', len(effective), display.COLOR_WRITTEN)]
     if merge_pairs:
         counts.append(('merged', len(merge_pairs), display.COLOR_MERGED))
-    if dropped:
-        counts.append(('dropped', len(dropped), display.COLOR_DROPPED))
+    if dropped or dropped_memory_payloads:
+        counts.append(('dropped', len(dropped) + len(dropped_memory_payloads),
+                       display.COLOR_DROPPED))
     display.summary(counts)
 
     display.file_list('Written', effective, color=display.COLOR_WRITTEN)
@@ -964,6 +1095,15 @@ def convert_workspace(
         color=display.COLOR_DROPPED,
         marker='[drop]',
         note=f'not part of the {target_fw} workspace spec',
+    )
+    display.file_list(
+        'Memory payloads not supported',
+        dropped_memory_payloads,
+        color=display.COLOR_DROPPED,
+        marker='[drop]',
+        note=(f'non-Markdown memory files; {target_fw} memory is '
+              'Markdown-only, so they cannot travel cross-framework '
+              '(kept on same-framework sync)'),
     )
     display.file_list(
         'Skipped',
@@ -998,6 +1138,8 @@ def convert_workspace(
 
     written = dst_spec.apply(effective)
     display.done(f'Wrote {len(written)} file(s) under {dst_root}')
+    if target_fw == 'openhuman':
+        _print_openhuman_next_steps(dst_root)
     return 0
 
 
@@ -1013,12 +1155,18 @@ def cmd_convert(
     """Local-only format conversion: read a workspace, convert, write it out."""
     for fw, label in ((source_fw, '--from-framework'), (target_fw,
                                                         '--target-framework')):
-        if fw not in FRAMEWORK_REGISTRY:
-            return _fail(
-                f"unknown framework '{fw}' for {label}. Available: {available_frameworks()}"
-            )
+        err = check_framework(fw, f'framework for {label}')
+        if err:
+            return _fail(err)
 
-    src_name = from_name or DEFAULT_AGENT_NAME
+    if from_name:
+        src_name = from_name
+    else:
+        # An omitted --from-name asks the framework which agent it should
+        # convert: frameworks with an "active" sub-agent notion (openhuman's
+        # activeProfileId) return it, everything else returns ``default``.
+        src_name = build_spec(source_fw, DEFAULT_AGENT_NAME,
+                              local_dir).resolve_default_agent_name()
     dst_name = target_name or src_name
     src_spec = build_spec(source_fw, src_name, local_dir)
     dst_spec = build_spec(target_fw, dst_name, out_dir)
@@ -1058,10 +1206,9 @@ def cmd_watch(
     from ._cache import pid_file
     from ._watcher import daemonize, watch_loop
 
-    if framework not in FRAMEWORK_REGISTRY:
-        return _fail(
-            f"unknown framework '{framework}'. Available: {available_frameworks()}"
-        )
+    err = check_framework(framework)
+    if err:
+        return _fail(err)
 
     if name:
         local_name, err = resolve_local_name(name, framework, local_dir)
@@ -1275,10 +1422,10 @@ def cmd_recover(
         if not zip_path.exists():
             return _fail(f'backup not found: {fname} (looked in {cdir})')
 
-    if framework and framework not in FRAMEWORK_REGISTRY:
-        return _fail(
-            f"unknown framework '{framework}'. Available: {available_frameworks()}"
-        )
+    if framework:
+        err = check_framework(framework)
+        if err:
+            return _fail(err)
 
     # Reject a corrupt / non-zip archive up front -- BEFORE the pre-restore
     # backup and the delete-extra-files pass below touch the workspace, so a
@@ -1454,9 +1601,8 @@ def cmd_list(
         repo_name = item.get('Name') or item.get('name') or ''
         repo_id = f'{owner_name}/{repo_name}' if owner_name else repo_name
         fw = item.get('Framework') or item.get('framework') or '-'
-        vis = item.get('Visibility') or item.get('visibility') or '-'
-        updated = item.get('GmtModified') or item.get(
-            'LastUpdatedDate') or item.get('last_updated_date') or '-'
+        vis = agent_visibility_label(item)
+        updated = agent_last_modified(item)
         if isinstance(updated, str) and 'T' in updated:
             updated = updated.split('T')[0]
         rows.append((repo_id, fw, vis, updated))

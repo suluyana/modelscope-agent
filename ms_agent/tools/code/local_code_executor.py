@@ -4,8 +4,8 @@ import inspect
 import io
 import json
 import os
-import shlex
 import shutil
+import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -19,6 +19,81 @@ from ms_agent.utils.utils import install_package
 from ms_agent.utils.workspace_context import WorkspaceContext
 
 logger = get_logger()
+
+#: Ambient variables a POSIX command may read without them carrying anything
+#: the agent should not have. The environment is built as an allow-list rather
+#: than inherited, so anything missing here is simply absent for every command
+#: the agent runs — and an absent one is not a neutral default:
+#:
+#: * ``USER``/``LOGNAME`` unset makes ``git commit`` and anything deriving an
+#:   identity from the environment fail or record the wrong author.
+#: * ``TMPDIR`` unset sends every tool that wants scratch space to ``/tmp``,
+#:   which is outside the workspace and therefore refused by the path policy —
+#:   leaving the agent with nowhere to write a temporary file at all.
+#: * ``SSL_CERT_FILE``/``REQUESTS_CA_BUNDLE`` unset breaks TLS for interpreters
+#:   with no system trust store, so ``pip install`` fails to verify PyPI.
+#: * The proxy variables are how a developer behind one reaches the network;
+#:   dropping them turns every fetch into a timeout.
+#:
+#: Credentials are still NOT forwarded: no ``*_API_KEY``, ``*_TOKEN``,
+#: ``AWS_*``, ``GITHUB_*`` or similar appears here, and the tool's own
+#: ``shell_env`` config remains the way to pass one deliberately.
+_POSIX_ENV_PASSTHROUGH = (
+    'PATH',
+    'HOME',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'TMPDIR',
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'TERM',
+    'TZ',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+    'REQUESTS_CA_BUNDLE',
+    'CURL_CA_BUNDLE',
+    'NODE_EXTRA_CA_CERTS',
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'ALL_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'all_proxy',
+    'no_proxy',
+)
+
+
+#: Set on every command the agent runs, unless the environment already says
+#: otherwise. Nothing here changes what a command DOES — it changes what the
+#: command assumes about who is reading.
+#:
+#: A pager is the sharp edge: ``git log`` or ``systemctl status`` hands its
+#: output to ``less``, which waits for a keypress that will never come, and the
+#: tool call sits there until it times out. Progress bars and colour codes are
+#: milder, but they fill the result with control characters that cost context
+#: and read as noise. ``AI_AGENT`` is a cross-vendor convention some tools
+#: (``gh``) report in their User-Agent.
+_AGENT_FRIENDLY_ENV = {
+    'PAGER': 'cat',
+    'GIT_PAGER': 'cat',
+    'MANPAGER': 'cat',
+    # -F quit if it all fits on one screen, -R keep colour, -X no alternate
+    # screen. Needed because PAGER=cat only covers programs that CONSULT it;
+    # anything invoking `less` directly would still sit waiting for a key.
+    'LESS': '-FRX',
+    'GIT_TERMINAL_PROMPT': '0',
+    'GIT_MERGE_AUTOEDIT': 'no',
+    'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+    'PIP_PROGRESS_BAR': 'off',
+    'PYTHONUNBUFFERED': '1',
+    'TQDM_DISABLE': '1',
+    'DEBIAN_FRONTEND': 'noninteractive',
+    'NO_COLOR': '1',
+    'AI_AGENT': 'ms_agent',
+}
 
 
 def _is_relative_to(path: Path, base: Path) -> bool:
@@ -265,16 +340,25 @@ class LocalCodeExecutionTool(ToolBase):
 
         self.exclude_func(
             getattr(getattr(config, 'tools', None), 'code_executor', None))
-        if 'file_operation' not in self.exclude_functions:
+        self._uses_kernel = any(self._function_enabled(name) for name in
+                                ('notebook_executor', 'reset_executor'))
+        if self._function_enabled('file_operation'):
             logger.warning(
                 'file_operation is not suggested to be included in local code execution tool.'
             )
 
-        results = self._check_dependencies()
-        logger.info(f'Dependency check results: {results}\n'
-                    f'Make sure to install the missing dependencies.')
+        if (self._function_enabled('notebook_executor')
+                or self._function_enabled('python_executor')):
+            results = self._check_dependencies()
+            logger.info(f'Dependency check results: {results}\n'
+                        f'Make sure to install the missing dependencies.')
 
-        logger.info('LocalCodeExecutionTool initialized (ipykernel based)')
+        logger.info('LocalCodeExecutionTool initialized')
+
+    def _function_enabled(self, name: str) -> bool:
+        if self.include_functions:
+            return name in self.include_functions
+        return name not in self.exclude_functions
 
     def set_task_manager(self, task_manager) -> None:
         """Attach process-wide TaskManager for background shell (see shell_executor)."""
@@ -328,22 +412,44 @@ class LocalCodeExecutionTool(ToolBase):
         else:
             env: Dict[str, str] = {
                 'INHERITED_FROM_LOCAL': 'False',
-                'PATH': os.environ.get('PATH', ''),
-                'HOME': os.environ.get('HOME', ''),
-                'LANG': os.environ.get('LANG', ''),
             }
+            for key in _POSIX_ENV_PASSTHROUGH:
+                value = os.environ.get(key)
+                if value is not None:
+                    env[key] = value
+            env.setdefault('PATH', '')
+            # Set outright, NOT deferring to whatever the parent had. These
+            # exist to undo settings made for a human at a terminal, so
+            # inheriting them defeats the entire point: a developer's
+            # `PAGER=less` is exactly the value that leaves `git log` waiting
+            # for a keypress nobody will press. A deliberate choice still wins
+            # — `tools.code_executor.shell_env` is applied after this.
+            env.update(_AGENT_FRIENDLY_ENV)
+            if os.name == 'nt':
+                # ``create_subprocess_shell`` uses the native Windows command
+                # processor. Keep the non-secret OS/user variables that cmd
+                # and programs using temporary/profile directories require.
+                for key in (
+                        'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP',
+                        'TMP', 'TMPDIR', 'USERPROFILE', 'HOMEDRIVE',
+                        'HOMEPATH', 'USERNAME', 'APPDATA', 'LOCALAPPDATA',
+                        'PROGRAMDATA', 'OS', 'PROCESSOR_ARCHITECTURE'):
+                    value = os.environ.get(key)
+                    if value is not None:
+                        env[key] = value
 
-        if not self.tool_config or not hasattr(self.tool_config, field):
-            return env
-        env_cfg = getattr(self.tool_config, field)
-        if isinstance(env_cfg, dict):
-            items = env_cfg.items()
-        else:
-            try:
-                items = env_cfg.items()
-            except AttributeError:
-                return env
+        # The image supplies its system tool path separately from the SDK's
+        # service PATH. Local installs keep their existing environment unless
+        # the deployment explicitly configures this override.
+        shell_path = os.environ.get('MS_AGENT_SHELL_PATH')
+        if field == 'shell_env' and shell_path:
+            env['PATH'] = shell_path
+            for key in ('VIRTUAL_ENV', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV',
+                        'PYTHONHOME', 'PYTHONPATH'):
+                env.pop(key, None)
 
+        env_cfg = getattr(self.tool_config, field, None)
+        items = env_cfg.items() if hasattr(env_cfg, 'items') else ()
         for key, value in items:
             if value is None:
                 continue
@@ -356,10 +462,28 @@ class LocalCodeExecutionTool(ToolBase):
                 env['PATH'] = os.pathsep.join(paths + [env.get('PATH', '')])
         return env
 
+    def _shell_environment_hint(self) -> str:
+        path = self.shell_env.get('PATH', '')
+        python = (shutil.which('python', path=path)
+                  or shutil.which('python3', path=path))
+        pip = (shutil.which('pip', path=path)
+               or shutil.which('pip3', path=path))
+        return (
+            f'Default Python: {python or "not found on PATH"}; '
+            f'pip: {pip or "not found on PATH"}. '
+            f'The SDK service runs with {sys.executable}. '
+            'Do not install or upgrade ordinary task dependencies in the SDK '
+            'service environment. Reuse an existing project environment, or '
+            'create a project virtualenv when different package versions '
+            'are needed. When installing into a container system Python with '
+            'uv, use `uv pip install --system`; project virtualenvs do not '
+            'need that flag.\n\n')
+
     async def connect(self) -> None:
         if self._initialized:
             return
-        await self.kernel_session.start()
+        if self._uses_kernel:
+            await self.kernel_session.start()
         self._initialized = True
 
     async def cleanup(self) -> None:
@@ -369,7 +493,8 @@ class LocalCodeExecutionTool(ToolBase):
         self._watcher_tasks.clear()
         if not self._initialized:
             return
-        await self.kernel_session.stop()
+        if self._uses_kernel:
+            await self.kernel_session.stop()
         self._initialized = False
 
     async def _get_tools_inner(self) -> Dict[str, Any]:
@@ -447,12 +572,30 @@ class LocalCodeExecutionTool(ToolBase):
                 Tool(
                     tool_name='shell_executor',
                     server_name='code_executor',
-                    description=
-                    ('Execute shell commands locally under the workspace output directory (cwd). '
-                     'Subject to policy (read_only vs workspace_write, network toggle). '
-                     'Large stdout/stderr may be spilled to .ms_agent_artifacts. '
-                     'Use run_in_background=true to return immediately with task_id; poll via task notifications.'
-                     ),
+                    description=(
+                        'Run a shell command.\n'
+                        '\n' + self._shell_environment_hint() +
+                        'Each call starts a NEW shell in the workspace root, '
+                        f'which is {self._ws.root}. Nothing carries over '
+                        'between calls: not the working directory, not '
+                        'environment variables, and not an activated '
+                        'virtualenv or conda environment.\n'
+                        '\n'
+                        'So do each of those in the SAME call as the work '
+                        'that needs it, chained with && — for example '
+                        '`cd sub && ls`, or '
+                        '`. .venv/bin/activate && pip install requests && '
+                        'python -c "import requests"`. Prefer absolute paths '
+                        'or a leading cd over assuming a directory from an '
+                        'earlier call.\n'
+                        '\n'
+                        'Paths are restricted to the workspace (plus the OS '
+                        'temp directory); reading credential files and running '
+                        'code inline (python -c, heredocs) may require '
+                        'approval. Large output is spilled to '
+                        '.ms_agent/artifacts and the result says where. Use '
+                        'run_in_background=true for a long command: it returns '
+                        'a task_id immediately.'),
                     parameters={
                         'type': 'object',
                         'properties': {
@@ -588,16 +731,6 @@ class LocalCodeExecutionTool(ToolBase):
                 ensure_ascii=False,
                 indent=2)
 
-    def _prepare_shell_command(self, command: str) -> str:
-        """Wrap composite shell input in ``sh -lc`` when needed (matches sandbox behavior)."""
-        shell_meta = ('&&', '||', '|', ';', '>', '<', '`', '$(', 'cd ',
-                      'export ')
-        already_wrapped = command.lstrip().startswith(
-            ('sh ', 'bash ', '/bin/sh ', '/bin/bash '))
-        if not already_wrapped and any(meta in command for meta in shell_meta):
-            return f'sh -lc {shlex.quote(command)}'
-        return command
-
     async def notebook_executor(self,
                                 code: str,
                                 description: str = '',
@@ -701,7 +834,16 @@ class LocalCodeExecutionTool(ToolBase):
         exec_timeout = timeout or self._shell_timeout
         call_id = call_id or f'shell-{os.urandom(4).hex()}'
 
-        shell_cmd = self._prepare_shell_command(command)
+        # Handed to the shell verbatim. ``create_subprocess_shell`` already runs
+        # it under ``/bin/sh -c`` (``cmd.exe`` on Windows), which understands
+        # every compound form on its own, so there is nothing to pre-wrap.
+        # Wrapping used to be conditional on the command CONTAINING a
+        # metacharacter, and the wrapper was a LOGIN shell: adding a `;` to a
+        # command re-ran the profile, which on macOS reorders PATH via
+        # path_helper, so `python3 -V` and `python3 -V ; true` resolved to
+        # different interpreters. Installing with one form and importing with
+        # the other is then a ModuleNotFoundError with no visible cause.
+        shell_cmd = command
 
         if run_in_background:
             if self._task_manager is None:

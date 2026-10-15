@@ -14,6 +14,10 @@ _CONSECUTIVE_SLASHES = re.compile(r'[/\\]+')
 _WINDOWS_DRIVE_ROOT = re.compile(r'^[A-Za-z]:/?$')
 _WINDOWS_DRIVE_CHILD = re.compile(r'^[A-Za-z]:/[^/]+$')
 _ROOT_CHILD = re.compile(r'^/[^/]+$')
+#: A dangerous-removal entry that is nothing but separators and stars (``*``,
+#: ``/*``). Meaningful as a literal argument, useless as a glob: fnmatch's ``*``
+#: crosses ``/``, so such an entry matches every path in existence.
+_WILDCARD_ONLY = re.compile(r'^[/\\*]+$')
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,27 @@ def _is_under_allowed(resolved: Path, allowed_dirs: Sequence[str]) -> bool:
     return False
 
 
+def matches_sensitive(resolved: str, patterns: Sequence[str]) -> bool:
+    """Whether a resolved path is one of the configured sensitive locations.
+
+    Compared against both the literal pattern and its ``~``-expanded form, and
+    a directory pattern (``~/.ssh/*``) also matches the directory itself, so
+    listing it is judged the same as reading a file inside it.
+    """
+    import fnmatch
+
+    for raw in patterns or ():
+        pattern = os.path.expanduser(str(raw))
+        if fnmatch.fnmatch(resolved, pattern):
+            return True
+        # `~/.ssh/*` should also cover `~/.ssh` and anything nested deeper.
+        if pattern.endswith('/*'):
+            parent = pattern[:-2]
+            if resolved == parent or resolved.startswith(parent + os.sep):
+                return True
+    return False
+
+
 def validate_path(
     path: str,
     cwd: str,
@@ -93,6 +118,7 @@ def validate_path(
     *,
     read_only_dirs: Sequence[str] = (),
     home_dir: str | None = None,
+    sensitive_paths: Sequence[str] = (),
 ) -> PathValidationResult:
     """Validate a single filesystem path for a given operation type.
 
@@ -124,10 +150,7 @@ def validate_path(
         )
 
     if _has_glob(path):
-        # Heuristic: if path contains parentheses or is very long, it's likely
-        # code content (e.g., from heredoc), not a real file path. Skip glob check.
-        looks_like_code = '(' in path or ')' in path or len(path) > 200
-        if op_type in ('write', 'create') and not looks_like_code:
+        if op_type in ('write', 'create'):
             return PathValidationResult(
                 allowed=False,
                 resolved_path=path,
@@ -143,6 +166,19 @@ def validate_path(
         resolved = (Path(cwd) / path).resolve()
 
     resolved_str = str(resolved)
+
+    # Credential stores are gated wherever they sit. The list existed already
+    # but only the write path consulted it, so `cat ~/.ssh/id_rsa` was judged
+    # purely on "is it in the workspace" — and under the default loose read
+    # policy that resolved to allow, putting the key in the transcript.
+    if op_type == 'read' and matches_sensitive(resolved_str, sensitive_paths):
+        return PathValidationResult(
+            allowed=False,
+            resolved_path=resolved_str,
+            action='ask',
+            reason=f'Read of sensitive path: {resolved_str}',
+            category='sensitive_read',
+        )
 
     if not _is_under_allowed(resolved, allowed_dirs):
         if op_type == 'read':
@@ -182,35 +218,44 @@ def is_dangerous_removal_path(
 
     ``extra_patterns`` are configurable (``safety_rules.dangerous_removal_paths``):
     each is expanded (``~``) and matched against the normalized path both
-    literally and as an fnmatch glob (REVIEW P1-8)."""
+    literally and as an fnmatch glob (REVIEW P1-8).
+
+    A wildcard-ONLY pattern (``*``, ``/*``) is compared literally and never as a
+    glob. Those entries exist to catch the user typing ``rm *`` — the argument
+    itself — but ``fnmatch(anything, '*')`` is unconditionally true, so as globs
+    they made EVERY path dangerous and no ``rm`` could run at all, not even
+    ``rm build/out.txt``. The literal comparison (plus the fixed checks below)
+    still catches what they were written for."""
     import fnmatch
-    normalized = _CONSECUTIVE_SLASHES.sub('/', path)
-    if normalized.endswith('/') and len(normalized) > 1:
-        normalized = normalized.rstrip('/')
+
+    def _norm(raw: str) -> str:
+        out = _CONSECUTIVE_SLASHES.sub('/', raw)
+        return out.rstrip('/') if out.endswith('/') and len(out) > 1 else out
+
+    # Judge the argument both AS WRITTEN (`~`, `*` — what the user typed, and
+    # what the pattern list is phrased in) and EXPANDED (`/Users/me` — what rm
+    # would actually delete). Checking only the written form let `rm ~` through.
+    candidates = {_norm(path), _norm(os.path.expanduser(path))}
 
     for pat in extra_patterns or ():
-        pat_expanded = _CONSECUTIVE_SLASHES.sub('/',
-                                                os.path.expanduser(str(pat)))
-        if (normalized == pat_expanded.rstrip('/')
-                or fnmatch.fnmatch(normalized, pat_expanded)):
+        raw = _norm(str(pat))
+        expanded = _norm(os.path.expanduser(str(pat)))
+        if candidates & {raw, expanded}:
+            return True
+        if _WILDCARD_ONLY.match(expanded):
+            continue
+        if any(fnmatch.fnmatch(c, expanded) for c in candidates):
             return True
 
-    if normalized == '*':
-        return True
-    if normalized.endswith('/*') or normalized.endswith('\\*'):
-        return True
-    if normalized == '/':
-        return True
-
     home = os.path.expanduser('~').replace('\\', '/')
-    if normalized == home:
-        return True
-
-    if _ROOT_CHILD.match(normalized):
-        return True
-    if _WINDOWS_DRIVE_ROOT.match(normalized):
-        return True
-    if _WINDOWS_DRIVE_CHILD.match(normalized):
-        return True
+    for normalized in candidates:
+        if normalized == '*' or normalized.endswith(('/*', '\\*')):
+            return True
+        if normalized == '/' or normalized == home:
+            return True
+        if (_ROOT_CHILD.match(normalized)
+                or _WINDOWS_DRIVE_ROOT.match(normalized)
+                or _WINDOWS_DRIVE_CHILD.match(normalized)):
+            return True
 
     return False

@@ -67,6 +67,8 @@ ms-agent run --config path/to/agent.yaml --query "你好"
 | `--animation_mode` | 视频生成项目的动画模式，取值 `auto` / `human` | `None` |
 | `--knowledge_search_paths` | 知识检索路径，逗号分隔 | `None` |
 
+工作区自动快照默认关闭。如需在每次任务开始前保存 Git 快照，在 Agent 的 YAML 配置顶层设置 `enable_snapshots: true`。关闭此选项不会删除已有快照。
+
 ---
 
 ## tui — 终端交互界面
@@ -91,19 +93,28 @@ ms-agent tui --config path/to/agent.yaml
 
 ## ui — Web UI 服务
 
-启动 Web UI 服务。
+启动 WebUI 并在浏览器中打开。PyPI 发布的安装包包含构建好的页面和样式，首次启动会在用户缓存中安装前端运行依赖；从 Git 或源码安装时还会按需构建前端。
 
 ```shell
-ms-agent ui --host 0.0.0.0 --port 7860
+ms-agent ui
+ms-agent ui --port 8080 --no-browser
 ```
 
-| 参数 | 说明 | 默认值 |
+| 参数 | 行为 | 默认值 |
 | --- | --- | --- |
-| `--host` | 绑定的服务主机 | `0.0.0.0` |
-| `--port` | 绑定的服务端口 | `7860` |
-| `--reload` | 开发模式启用自动重载（开关） | `false` |
-| `--production` | 生产模式（服务已构建的前端，开关） | `false` |
-| `--no-browser` | 不自动打开浏览器（开关） | `false` |
+| `--host` | 公开监听地址 | `127.0.0.1` |
+| `--port` | 固定公开端口，已占用时报错 | 从 8000 开始选择可用端口 |
+| `--backend-port` | 内部回环 API 端口，与公开端口不同 | 后续可用端口 |
+| `--no-browser` | 不自动打开浏览器 | `false` |
+| `--skip-install` | 不下载或同步依赖，仍检查构建和 CSS | `false` |
+| `--production` | 默认 SSR 行为的兼容参数 | `false` |
+| `--reload` | 暂不支持，请使用文档中的开发命令 | `false` |
+| `--prepare-only` | 准备资源/依赖后退出 | `false` |
+| `--startup-timeout` | 启动超时秒数 | `120` |
+
+WebUI 需要 Python 3.12+、Node.js 22.22.0+ 和 pnpm 10.17.1；源码运行另需 uv 0.5+。端口必须空闲，前端与内部 API 不能使用同一端口。任一服务异常退出时，启动器会停止另一服务。配置与会话默认保存在 `~/.ms_agent`，可通过 `MS_AGENT_HOME` 指定其他目录。
+
+安装、配置、Windows 和热更新开发说明见 [WebUI 完整指南](https://github.com/modelscope/ms-agent/blob/main/webui/README_ZH.md)。
 
 ---
 

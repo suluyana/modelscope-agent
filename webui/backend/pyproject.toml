@@ -1,0 +1,73 @@
+[project]
+name = "ms-agent-webui-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # WebUI exposes shell execution by default. Optional Python/Notebook
+    # dependencies are installed separately when those tools are enabled.
+    "anthropic>=0.117.0",
+    "beautifulsoup4",
+    "exa-py>=2.16.0",
+    "fastapi>=0.139.0",
+    "httpx>=0.28.1",
+    "lxml",
+    "markdown>=3.10",
+    "mem0ai>=2.0.12",
+    "ms-agent",
+    "pydantic-settings>=2.14.2",
+    # httpx refuses to CONSTRUCT a client — any client, even for a host covered
+    # by NO_PROXY — when ALL_PROXY names a socks5:// endpoint and this is
+    # missing, so a developer behind the usual local proxy gets an ImportError
+    # instead of a working backend. 12 KB, pure Python, no dependencies.
+    "socksio>=1.0.0",
+    "sse-starlette>=3.4.5",
+    "uvicorn[standard]>=0.50.2",
+    # Direct dependency: the skill change tracker uses its public API.  Do not
+    # rely on uvicorn's optional transitive dependency remaining installed.
+    "watchfiles>=1.2.0",
+]
+
+[project.optional-dependencies]
+# Offline embeddings for vector memory (fastembed drags in onnxruntime,
+# ~100 MB of wheels + a one-time ~220 MB model download on first use):
+#   uv sync --extra local-embed
+local-embed = ["fastembed>=0.8"]
+
+[project.scripts]
+dev = "app.main:dev"
+serve = "app.main:serve"
+webui = "app.launcher:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv]
+# The launcher and docs rely on `uv sync --locked --inexact`; refuse
+# outright on a uv too old to honour those flags.
+required-version = ">=0.5.0"
+
+[[tool.uv.index]]
+# Package registry URLs are recorded in uv.lock. After changing the index,
+# regenerate the lockfile with `uv lock`; --frozen keeps the existing URLs.
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[tool.uv.sources]
+# Use the SDK in this checkout. Installed packages use the active Python
+# environment instead of synchronizing a source environment with uv.
+ms-agent = { path = "../..", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]

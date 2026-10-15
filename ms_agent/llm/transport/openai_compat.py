@@ -20,13 +20,34 @@ from __future__ import annotations
 
 import inspect
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Dict, Generator, Iterable, List, Optional, Union
 
+from ms_agent.llm import multimodal
+from ms_agent.llm.io import interrupt_stream
+from ms_agent.llm.thinking import apply_effort, create_with_thinking_fallback
 from ms_agent.llm.transport.base import Transport
 from ms_agent.llm.utils import Message, Tool, ToolCall
+from ms_agent.llm.vision import create_with_vision_fallback
+from ms_agent.llm.vision import delivery_reason as vision_delivery_reason
 from ms_agent.utils import MAX_CONTINUE_RUNS, assert_package_exist, get_logger
 
 logger = get_logger()
+
+#: Field names carrying the model's reasoning, in preference order. Most
+#: OpenAI-compatible vendors use ``reasoning_content`` (DashScope, ModelScope,
+#: Zhipu, DeepSeek); OpenRouter normalizes everything it proxies into
+#: ``reasoning`` instead, so reading only the first name made every model
+#: routed through it look like it never thought.
+_REASONING_FIELDS = ('reasoning_content', 'reasoning')
+
+
+def _reasoning_of(delta_or_message: Any) -> str:
+    for field in _REASONING_FIELDS:
+        value = getattr(delta_or_message, field, None)
+        if value:
+            return value
+    return ''
 
 
 class OpenAICompatTransport(Transport):
@@ -49,9 +70,23 @@ class OpenAICompatTransport(Transport):
         continue_gen_stop: Optional[List[str]] = None,
         max_continue_runs: Optional[int] = None,
         strip_reasoning_tags: bool = False,
+        vision: Optional['multimodal.VisionOptions'] = None,
+        vision_supported: bool = True,
     ):
         assert_package_exist('openai')
         import openai
+
+        # Image-attachment handling. Passed explicitly rather than via
+        # generation_config because that dict is forwarded wholesale as API
+        # kwargs (`self._call_llm(..., **args)`), so a private key in it would
+        # be sent to the endpoint and rejected.
+        self._vision = vision or multimodal.VisionOptions()
+        # Whether THIS model accepts images. Resolved by the caller from the
+        # per-model capability flag; False degrades attachments to text.
+        self._vision_supported = bool(vision_supported)
+        # What happened to each image on the most recently formatted request.
+        # See _format_input_message.
+        self._last_deliveries: List[multimodal.ImageDelivery] = []
 
         self.model = model
         self.base_url = self._normalize_base_url(base_url)
@@ -171,17 +206,59 @@ class OpenAICompatTransport(Transport):
             cache_indice = max(cache_indices) if cache_indices else None
 
         openai_messages = []
+        # Order-matched fallback for a tool row that reaches us without its id.
+        # OpenAI-compatible gateways reject such a message outright
+        # ("missing field `tool_call_id`"), killing the whole turn, so pair it
+        # with the preceding assistant turn's calls instead. The Anthropic
+        # transport has carried the same guard for a while; this keeps the two
+        # symmetric. Note `to_dict_clean()` omits falsy values, so a None/'' id
+        # disappears from the dict entirely rather than arriving as None.
+        pending_tool_ids: List[str] = []
+        # One ordinal per PICTURE for the whole request — see
+        # multimodal.image_index for why neither per-turn nor per-appearance
+        # numbering works.
+        numbering: Dict[str, int] = {}
+        deliveries: List[multimodal.ImageDelivery] = []
         for idx, message in enumerate(messages):
+            # Image refs must be read BEFORE to_dict_clean(), which strips them
+            # (they are this method's input, never wire output).
+            attachments = (message.attachments if isinstance(message, Message)
+                           else message.get('attachments')) or []
             if isinstance(message, Message):
                 if isinstance(message.content, str):
                     message.content = message.content.strip()
                 message = message.to_dict_clean()
             else:
                 message = dict(message)
+                message.pop('attachments', None)
 
             content = message.get('content', '')
             if isinstance(content, str):
                 content = content.strip()
+
+            # Expand image refs into native blocks. Text-only turns come back
+            # as the same plain string, so nothing changes for them (prefix
+            # caching included).
+            # Not for a tool message: the Chat Completions SCHEMA allows
+            # only text parts in `role: "tool"`, so its images go to the
+            # synthetic user turn appended after it (below). Five compatible
+            # providers were measured to accept inline image parts here anyway,
+            # but hoisting is valid under the schema AND under all of them — see
+            # multimodal.TOOL_MEDIA_PROMPT for the full measurement.
+            if attachments and message.get('role') != 'tool':
+                content, built = multimodal.openai_content(
+                    content,
+                    attachments,
+                    self._vision,
+                    vision_supported=self._images_allowed(),
+                    reason=vision_delivery_reason(
+                        getattr(self.client, 'base_url', ''), self.model),
+                    numbering=numbering,
+                    priors=[
+                        str((a or {}).get('delivery') or '')
+                        for a in attachments if isinstance(a, dict)
+                    ])
+                deliveries.extend(built)
 
             if cache_indice is not None and idx == cache_indice:
                 content = self._to_structured_content(
@@ -203,12 +280,75 @@ class OpenAICompatTransport(Transport):
             # assistant messages accept it. Mirrors the legacy adapter — the
             # framework no longer injects a placeholder utterance for these.
             if (formatted_message.get('role') == 'assistant'
-                    and formatted_message.get('tool_calls')
-                    and not content):
+                    and formatted_message.get('tool_calls') and not content):
                 formatted_message['content'] = None
 
+            role = formatted_message.get('role')
+            if role == 'assistant':
+                pending_tool_ids = [
+                    tc.get('id') for tc in (formatted_message.get('tool_calls')
+                                            or []) if isinstance(tc, dict)
+                    and tc.get('id')
+                ]
+            elif role == 'tool' and not formatted_message.get('tool_call_id'):
+                if pending_tool_ids:
+                    formatted_message['tool_call_id'] = pending_tool_ids.pop(0)
+                else:
+                    logger.warning(
+                        'tool message has no tool_call_id and no preceding '
+                        'assistant tool_calls to match it against; the provider '
+                        'will likely reject this request')
+
             openai_messages.append(formatted_message)
+
+            # A tool result's images ride on a synthetic user turn right
+            # after it, because the Chat Completions schema restricts a tool
+            # message to text parts (see multimodal.TOOL_MEDIA_PROMPT).
+            if attachments and role == 'tool':
+                if multimodal.tool_media_withheld(attachments, self._vision,
+                                                  self._images_allowed()):
+                    # The tool said it attached pictures; this request will not
+                    # carry them. Saying so here is the only thing that stops
+                    # the tool's own text from being the last word.
+                    formatted_message['content'] = '\n'.join(
+                        filter(None, [
+                            str(formatted_message.get('content') or ''),
+                            multimodal.TOOL_MEDIA_WITHHELD,
+                        ]))
+                media = multimodal.openai_tool_media_message(
+                    attachments,
+                    self._vision,
+                    vision_supported=self._images_allowed(),
+                    numbering=numbering)
+                if media is not None:
+                    openai_messages.append(media)
+        # Read by _call_llm for the recovery ladder and by hosts that want to
+        # show the user what actually happened. Instance state rather than a
+        # changed return type: this method has six call sites and one request is
+        # formatted at a time per transport instance.
+        self._last_deliveries = deliveries
         return openai_messages
+
+    def _images_allowed(self) -> bool:
+        """Whether to encode pixels at all for this request.
+
+        The per-model switch, and nothing else. There is deliberately no memory
+        of past refusals to consult — see ``llm/vision.py`` for why.
+        """
+        return bool(self._vision_supported)
+
+    def _mark_images_degraded(self, reason: str) -> None:
+        """Correct this request's delivery record after recovery dropped images.
+
+        The record is built while formatting, i.e. before the endpoint has had a
+        chance to object, so left alone it would say "delivered" for exactly the
+        requests the user most needs told about.
+        """
+        self._last_deliveries = [
+            d if d.state != multimodal.DELIVERED else replace(
+                d, state=multimodal.DEGRADED, reason=reason)
+            for d in self._last_deliveries
+        ]
 
     # ------------------------------------------------------------------ #
     # entry point
@@ -225,6 +365,14 @@ class OpenAICompatTransport(Transport):
         args = self.args.copy()
         args.update(kwargs)
         stream = args.get('stream', False)
+        # NOT lowered here — `_call_llm` does it, exactly once per request.
+        # Lowering twice is destructive rather than idempotent: the canonical
+        # key and DashScope's wire key are both spelled `reasoning_effort`, so a
+        # second pass reads the `enable_thinking` the first pass just added as
+        # "the caller is driving thinking by hand" and stands down, deleting our
+        # own tier. `reasoning_effort` is a real OpenAI parameter, so it survives
+        # the filter below and reaches `_call_llm` intact; continuation calls
+        # re-lower from the same canonical value.
         args = {key: value for key, value in args.items() if key in parameters}
 
         # Format tools once and thread the formatted list through the
@@ -266,7 +414,10 @@ class OpenAICompatTransport(Transport):
         underlying HTTP response unblocks that read (it raises inside ``next()``,
         which the caller discards). A no-op when nothing is streaming.
         """
-        self._close_stream(self._active_stream)
+        stream = self._active_stream
+        interrupt_stream(stream)
+        if self._active_stream is stream:
+            self._active_stream = None
 
     # ------------------------------------------------------------------ #
     # inline <think> handling (e.g. MiniMax M-series)
@@ -316,8 +467,46 @@ class OpenAICompatTransport(Transport):
         stream_options_config = self.args.get('stream_options', {})
         if is_streaming and stream_options_config.get('include_usage', True):
             kwargs.setdefault('stream_options', {})['include_usage'] = True
-        return self.client.chat.completions.create(
-            model=self.model, messages=messages, tools=tools, **kwargs)
+        # `reasoning_effort` is the one knob callers set; each endpoint spells it
+        # differently, so lower it here — as late as possible, when the base_url
+        # that decides the spelling is known. Thinking is also per-model and a
+        # refusal is a hard 400. Both live in llm/thinking.py.
+        kwargs = apply_effort(
+            kwargs, base_url=str(getattr(self.client, 'base_url', '')))
+
+        # Images are the other per-model hard-400: a text-only model rejects the
+        # whole request rather than ignoring the image blocks, which would make
+        # it unusable the moment a user attaches a file. The fallback runs a
+        # recovery ladder (shrink / thin the batch / drop) chosen by what the
+        # endpoint actually complained about. Wrapped OUTSIDE the thinking
+        # fallback so the two compose: a request can be retried for thinking
+        # and, independently, for images.
+        sent_images = any(
+            multimodal.has_image_blocks(m.get('content')) for m in messages
+            if isinstance(m, dict))
+
+        def create(messages, **params):
+            result = self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=tools, **params)
+            if is_streaming:
+                # Keep the actual HTTP stream, before the fallback layers wrap
+                # it in generators. Closing a wrapper before its first next()
+                # (or while next() is running) cannot close the connection.
+                self._active_stream = result
+            return result
+
+        return create_with_vision_fallback(
+            lambda messages, **kw: create_with_thinking_fallback(
+                lambda **kw2: create(messages=messages, **kw2), self.client,
+                self.model, logger, **kw),
+            base_url=getattr(self.client, 'base_url', ''),
+            model=self.model,
+            messages=messages,
+            sent_images=sent_images,
+            max_edge=getattr(getattr(self, '_vision', None), 'max_edge', 0),
+            on_degrade=self._mark_images_degraded,
+            logger_=logger,
+            **kwargs)
 
     # ------------------------------------------------------------------ #
     # usage
@@ -416,10 +605,8 @@ class OpenAICompatTransport(Transport):
                                   **kwargs) -> Generator[Message, None, None]:
         flag = self._continue_flag
         message = None
-        # Track the stream so interrupt() can close it from another thread; a
-        # continuation rebinds it below. The finally releases it on every exit
-        # path (normal end, error, or GeneratorExit when the consumer stops).
-        self._active_stream = completion
+        # _call_llm tracks the raw HTTP stream for interruption. Also close its
+        # fallback wrappers on normal end, error, or GeneratorExit.
         try:
             for chunk in completion:
                 message_chunk = self._stream_format_output_message(chunk)
@@ -450,14 +637,13 @@ class OpenAICompatTransport(Transport):
                     first_run = not messages[-1].to_dict().get(flag, False)
                     if self.continue_gen_mode and chunk.choices[
                             0].finish_reason in [
-                            'length', 'null'
-                    ] and (max_runs is None or max_runs != 0):
+                                'length', 'null'
+                            ] and (max_runs is None or max_runs != 0):
                         logger.info(
                             f'finish_reason: {chunk.choices[0].finish_reason}, '
                             f'continue generate.')
                         completion = self._call_llm_for_continue_gen(
                             messages, message, tools, **kwargs)
-                        self._active_stream = completion
                         for chunk in self._stream_continue_generate(
                                 messages, completion, tools,
                                 max_runs - 1 if max_runs is not None else None,
@@ -474,8 +660,8 @@ class OpenAICompatTransport(Transport):
                 yield message
         finally:
             self._close_stream(completion)
-            if self._active_stream is completion:
-                self._active_stream = None
+            self.interrupt()
+            self._active_stream = None
 
     @staticmethod
     def _stream_format_output_message(completion_chunk) -> Message:
@@ -484,8 +670,7 @@ class OpenAICompatTransport(Transport):
         content = ''
         if completion_chunk.choices and completion_chunk.choices[0].delta:
             content = completion_chunk.choices[0].delta.content
-            reasoning_content = getattr(completion_chunk.choices[0].delta,
-                                        'reasoning_content', '')
+            reasoning_content = _reasoning_of(completion_chunk.choices[0].delta)
             if completion_chunk.choices[0].delta.tool_calls:
                 func = completion_chunk.choices[0].delta.tool_calls
                 tool_calls = [
@@ -515,11 +700,7 @@ class OpenAICompatTransport(Transport):
     @staticmethod
     def _format_output_message(completion) -> Message:
         content = completion.choices[0].message.content or ''
-        if hasattr(completion.choices[0].message, 'reasoning_content'):
-            reasoning_content = completion.choices[
-                0].message.reasoning_content or ''
-        else:
-            reasoning_content = ''
+        reasoning_content = _reasoning_of(completion.choices[0].message)
         tool_calls = None
         if completion.choices[0].message.tool_calls:
             tool_calls = [

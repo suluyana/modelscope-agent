@@ -11,6 +11,7 @@ from ms_agent.agent_hub._merge import (
     _extract_user_diff_text,
     _resolve_target_path,
     merge_resources,
+    merged_away_pairs,
 )
 
 
@@ -41,6 +42,25 @@ class TestSectionMergerParse(unittest.TestCase):
         sections = self.merger.parse_sections("")
         self.assertEqual(len(sections), 1)
         self.assertEqual(sections[0].title, "")
+
+    def test_parse_ignores_headings_inside_html_comment(self):
+        # ms-agent's PROFILE/AGENTS templates carry example ``## `` headings
+        # INSIDE an <!-- guidance --> block. Those are not real sections; the
+        # whole comment must stay in one preamble section so the template
+        # header is never mangled when user content is folded in.
+        content = (
+            "---\nversion: 1\n---\n\n"
+            "<!--\n# About Me\n## Preferences\n## Context\n-->\n"
+            "## Real Section\nreal body")
+        sections = self.merger.parse_sections(content)
+        titles = [s.title for s in sections]
+        self.assertIn("## Real Section", titles)
+        self.assertNotIn("## Preferences", titles)
+        self.assertNotIn("## Context", titles)
+        # round-trip keeps the commented headings verbatim inside the preamble.
+        restored = self.merger.sections_to_content(sections)
+        self.assertIn("<!--", restored)
+        self.assertIn("## Preferences", restored)
 
 
 class TestSectionMergerDiff(unittest.TestCase):
@@ -246,16 +266,57 @@ class TestResolveTargetPath(unittest.TestCase):
 
     def test_cross_product_memory_md(self):
         self.assertEqual(_resolve_target_path("nanobot", "memory/MEMORY.md", "openclaw"), "MEMORY.md")
+        # qoder user-level auto memory joins the same MEMORY.md group.
+        self.assertEqual(
+            _resolve_target_path("qoder", "memory/MEMORY.md", "hermes"),
+            "memories/MEMORY.md")
+        self.assertEqual(
+            _resolve_target_path("qoder", "memory/MEMORY.md", "openclaw"),
+            "MEMORY.md")
+        self.assertEqual(
+            _resolve_target_path("hermes", "memories/MEMORY.md", "qoder"),
+            "memory/MEMORY.md")
+        # ms-agent has no memory slot, so qoder memory has no semantic target
+        # there either (folds into the catch-all instead).
+        self.assertIsNone(
+            _resolve_target_path("qoder", "memory/MEMORY.md", "ms-agent"))
 
     def test_cross_product_ms_agent_profile(self):
-        # ms-agent profile.md <-> qwenpaw PROFILE.md (persona semantic group)
-        self.assertEqual(_resolve_target_path("ms-agent", "profile.md", "qwenpaw"), "PROFILE.md")
-        self.assertEqual(_resolve_target_path("qwenpaw", "PROFILE.md", "ms-agent"), "profile.md")
+        # qwenpaw has no USER.md slot (its profile lives in the composite
+        # PROFILE.md), so the USER group does not declare it: ms-agent
+        # PROFILE.md -> qwenpaw resolves to None and folds into the catch-all
+        # with a visible "merged" hint instead of writing a dead file.
+        # qwenpaw PROFILE.md -> ms-agent has no counterpart (narrow group),
+        # so it resolves to None too (overflow into catch-all).
+        self.assertIsNone(_resolve_target_path("ms-agent", "PROFILE.md", "qwenpaw"))
+        self.assertIsNone(_resolve_target_path("qwenpaw", "PROFILE.md", "ms-agent"))
 
-    def test_cross_product_ms_agent_memory(self):
-        self.assertEqual(_resolve_target_path("ms-agent", "MEMORY.md", "openclaw"), "MEMORY.md")
-        self.assertEqual(_resolve_target_path("openclaw", "MEMORY.md", "ms-agent"), "MEMORY.md")
-        self.assertEqual(_resolve_target_path("ms-agent", "MEMORY.md", "nanobot"), "memory/MEMORY.md")
+    def test_cross_product_qoder_user_md_is_loose_memory(self):
+        # qoder has no memory/USER.md convention (its memory topic files are
+        # free-form), so it is NOT in the USER group: the file falls back to
+        # its source path and is handled as loose memory (re-homed / inlined
+        # per target), never written as a dead profile file.
+        self.assertEqual(
+            _resolve_target_path("qoder", "memory/USER.md", "hermes"),
+            "memory/USER.md")
+        self.assertEqual(
+            _resolve_target_path("qoder", "memory/USER.md", "nanobot"),
+            "memory/USER.md")
+        # Frameworks WITH a real USER slot keep their group mappings.
+        self.assertEqual(
+            _resolve_target_path("openclaw", "USER.md", "hermes"),
+            "memories/USER.md")
+        self.assertEqual(
+            _resolve_target_path("nanobot", "USER.md", "ms-agent"),
+            "PROFILE.md")
+
+    def test_cross_product_ms_agent_no_memory_slot(self):
+        # ms-agent has NO memory slot (memory is project-level at runtime, not
+        # part of the global home layout). An inbound MEMORY.md therefore has no
+        # semantic target and returns None, letting the merger fold it into the
+        # catch-all instructions file instead of writing a dead MEMORY.md.
+        self.assertIsNone(_resolve_target_path("openclaw", "MEMORY.md", "ms-agent"))
+        self.assertIsNone(_resolve_target_path("nanobot", "memory/MEMORY.md", "ms-agent"))
 
     def test_cross_product_no_mapping_passthrough(self):
         result = _resolve_target_path("nanobot", "skills/my-skill/SKILL.md", "openclaw")
@@ -278,6 +339,295 @@ class TestMergeResources(unittest.TestCase):
         )
         self.assertIn("SOUL.md", result.merged_files)
         self.assertEqual(result.merged_files["SOUL.md"], "my soul")
+
+    def test_qoder_memory_maps_and_topic_files_pass_through(self):
+        """The memory index maps onto the target's MEMORY.md slot while loose
+        topic files land under openclaw's import convention
+        ``memory/imports/<source>/``; index links are rewritten to keep
+        resolving, and both travel verbatim (memory is user data, never
+        rebased onto a target template)."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# Memory Index\n\n- [t](t.md) — x\n",
+                "memory/t.md": "---\nname: t\n---\n\ntopic body\n",
+            },
+            source_product="qoder",
+            target_product="openclaw",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertEqual(result.merged_files["MEMORY.md"],
+                         "# Memory Index\n\n- [t](memory/imports/qoder/t.md) — x\n")
+        self.assertEqual(result.merged_files["memory/imports/qoder/t.md"],
+                         "---\nname: t\n---\n\ntopic body\n")
+
+    def test_loose_memory_inlined_for_hermes_as_entry_store(self):
+        """hermes reads two fixed ``§``-delimited entry stores and never
+        scans its memory directory: loose detail inlines into
+        ``memories/MEMORY.md`` and the file is converted to entries -- more
+        than one, round-trip stable, within the char budget."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# Memory Index\n\n- [t](t.md) — x\n",
+                "memory/t.md": "topic body MARKER\n",
+            },
+            source_product="qoder",
+            target_product="hermes",
+            source_defaults={},
+            target_defaults={},
+        )
+        store = result.merged_files["memories/MEMORY.md"]
+        self.assertNotIn("memories/t.md", result.merged_files)
+        self.assertNotIn("memory/t.md", result.merged_files)
+        entries = [e.strip() for e in store.split("\n§\n") if e.strip()]
+        # The index bullet AND the inlined topic both became entries.
+        self.assertGreater(len(entries), 1)
+        self.assertTrue(any("MARKER" in e for e in entries))
+        # The dangling link was de-linked (its file no longer exists).
+        self.assertNotIn("](t.md)", store)
+        # Drift-guard round trip: parsing the written file reproduces it.
+        self.assertEqual(store.strip(), "\n§\n".join(entries))
+        self.assertLessEqual(max(map(len, entries)), 2200)
+
+    def test_hermes_inlined_frontmatter_not_leaked_as_entry(self):
+        """A topic file's YAML frontmatter sits mid-document once inlined,
+        where the extractor's head-strip cannot reach it: it must be removed
+        per file so metadata never becomes a junk entry."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# idx\n",
+                "memory/t.md": "---\nname: t\nmetadata:\n  type: user\n---\n\nreal content HERE\n",
+            },
+            source_product="qoder",
+            target_product="hermes",
+            source_defaults={},
+            target_defaults={},
+        )
+        store = result.merged_files["memories/MEMORY.md"]
+        entries = [e.strip() for e in store.split("\n§\n") if e.strip()]
+        self.assertTrue(any("real content HERE" in e for e in entries))
+        self.assertFalse(
+            any("name: t" in e or e.strip().startswith("---")
+                for e in entries), str(entries))
+
+    def test_loose_memory_inlined_for_openhuman_memory_md(self):
+        """openhuman's memory is the root ``MEMORY.md`` alone (its wiki vault
+        is derived output), so loose detail -- including an unmapped USER
+        profile -- inlines into it instead of being written beside it."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# Memory Index\n",
+                "memory/t.md": "topic body\n",
+                "memory/USER.md": "profile body\n",
+            },
+            source_product="qoder",
+            target_product="openhuman",
+            source_defaults={},
+            target_defaults={},
+        )
+        merged = result.merged_files["MEMORY.md"]
+        self.assertIn("# Memory Index", merged)
+        self.assertIn("topic body", merged)
+        self.assertIn("profile body", merged)
+        self.assertFalse(any(k.startswith("wiki/")
+                             for k in result.merged_files))
+
+    def test_loose_memory_inlined_for_nanobot(self):
+        """nanobot reads ONLY ``memory/MEMORY.md``: loose detail inlines as
+        sourced sections (index as base, links to inlined files de-linked,
+        merges recorded for the CLI hint table); with no source index the
+        inlined sections alone form the file."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# idx\n\n- [pref](pref.md) — zh\n",
+                "memory/pref.md": "prefers Chinese\n",
+            },
+            source_product="qoder",
+            target_product="nanobot",
+            source_defaults={},
+            target_defaults={},
+        )
+        merged = result.merged_files["memory/MEMORY.md"]
+        self.assertTrue(merged.startswith("# idx"))
+        self.assertIn("## Imported from qoder memory/pref.md", merged)
+        self.assertIn("prefers Chinese", merged)
+        self.assertNotIn("](pref.md)", merged)
+        self.assertNotIn("memory/pref.md", result.merged_files)
+        self.assertIn(("memory/pref.md", "memory/MEMORY.md"),
+                      merged_away_pairs(result))
+
+        orphan = merge_resources(
+            incoming={"memory/t.md": "topic body\n"},
+            source_product="qoder",
+            target_product="nanobot",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertIn("## Imported from qoder memory/t.md",
+                      orphan.merged_files["memory/MEMORY.md"])
+
+    def test_loose_non_md_memory_not_rehomed(self):
+        """Non-Markdown payloads (openclaw ``memory/*.json``, nanobot
+        ``history.jsonl``) keep their original path -- the target-spec
+        filter decides their fate exactly as before."""
+        result = merge_resources(
+            incoming={"memory/notes.json": "{}"},
+            source_product="qoder",
+            target_product="hermes",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertIn("memory/notes.json", result.merged_files)
+        self.assertNotIn("memories/notes.json", result.merged_files)
+
+    def test_loose_memory_keeps_path_for_ms_agent(self):
+        """ms-agent has no home-level memory slot: loose detail keeps its
+        original path at the merge level and the target-spec filter drops
+        it (memory stays out of ms-agent by design)."""
+        result = merge_resources(
+            incoming={"memory/t.md": "topic body\n"},
+            source_product="qoder",
+            target_product="ms-agent",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertEqual(result.merged_files.get("memory/t.md"),
+                         "topic body\n")
+
+    def test_hermes_entry_budget_skips_overflow(self):
+        """An entry that would bust hermes' 2200-char budget is SKIPPED
+        (never truncated) and counted, so the written store stays within the
+        budget its memory tools enforce."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# idx\n",
+                "memory/big.md": "x" * 2500 + "\n",
+                "memory/small.md": "small note\n",
+            },
+            source_product="qoder",
+            target_product="hermes",
+            source_defaults={},
+            target_defaults={},
+        )
+        store = result.merged_files["memories/MEMORY.md"]
+        entries = [e.strip() for e in store.split("\n§\n") if e.strip()]
+        self.assertLessEqual(max(map(len, entries)), 2200)
+        self.assertTrue(any("small note" in e for e in entries))
+        self.assertFalse(any("x" * 100 in e for e in entries))
+        self.assertTrue(
+            any(a.action == "merged" and "skipped over" in a.detail
+                for a in result.actions))
+
+    def test_hermes_source_entries_rendered_as_markdown(self):
+        """hermes as SOURCE: its ``§`` entry stores are rendered as plain
+        Markdown paragraphs for the target (no stray ``§`` noise), and a
+        source with no index gets a minimal qoder index built so the moved
+        detail files are discoverable (qoder reads ONLY its index)."""
+        result = merge_resources(
+            incoming={
+                "memories/MEMORY.md": "entry one\n§\nentry two\n",
+                "memories/note.md": "note body\n",
+            },
+            source_product="hermes",
+            target_product="qoder",
+            source_defaults={},
+            target_defaults={},
+        )
+        index = result.merged_files["memory/MEMORY.md"]
+        self.assertNotIn("§", index)
+        self.assertIn("entry one", index)
+        self.assertIn("entry two", index)
+        # The loose note moved to memory/note.md and the created index
+        # references it (qoder discovers detail ONLY through the index).
+        self.assertEqual(result.merged_files["memory/note.md"], "note body\n")
+        self.assertIn("](note.md)", index)
+
+        # Index-less source: the loose file re-homes and a minimal index is
+        # created referencing it.
+        flat = merge_resources(
+            incoming={"memories/note.md": "note body\n"},
+            source_product="hermes",
+            target_product="qoder",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertEqual(flat.merged_files["memory/note.md"], "note body\n")
+        self.assertIn("](note.md)", flat.merged_files["memory/MEMORY.md"])
+
+    def test_memory_index_not_rebased_onto_target_default(self):
+        """Memory is user data: a target default template for the memory slot
+        (nanobot ships one) must never be merged under the incoming index --
+        the placeholder boilerplate would be read back as real memories."""
+        result = merge_resources(
+            incoming={"MEMORY.md": "# real memory\nREAL-MARKER\n"},
+            source_product="openclaw",
+            target_product="nanobot",
+            source_defaults={},
+            target_defaults={
+                "memory/MEMORY.md":
+                "# Long-term Memory\n\n(Important facts about the user)\n"
+            },
+        )
+        self.assertEqual(result.merged_files["memory/MEMORY.md"],
+                         "# real memory\nREAL-MARKER\n")
+
+    def test_user_content_folds_into_qwenpaw_catch_all(self):
+        """USER content for a target with no USER slot (qwenpaw) folds into
+        the catch-all AGENTS.md with a merged hint -- never a dead
+        memory/USER.md file (qwenpaw injects AGENTS/SOUL/PROFILE only)."""
+        result = merge_resources(
+            incoming={"USER.md": "# User\nCall me CAPTAIN-USER.\n"},
+            source_product="openclaw",
+            target_product="qwenpaw",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertNotIn("memory/USER.md", result.merged_files)
+        self.assertIn("CAPTAIN-USER", result.merged_files.get("AGENTS.md", ""))
+        self.assertIn(("USER.md", "AGENTS.md"), merged_away_pairs(result))
+
+    def test_openhuman_memory_goals_folds_cross_framework(self):
+        """MEMORY_GOALS.md has no counterpart elsewhere: same-framework it
+        travels verbatim, cross-framework it folds into the catch-all with a
+        merged hint instead of being silently dropped."""
+        same = merge_resources(
+            incoming={"MEMORY_GOALS.md": "[g1] goal\n"},
+            source_product="openhuman",
+            target_product="openhuman",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertEqual(same.merged_files["MEMORY_GOALS.md"], "[g1] goal\n")
+        cross = merge_resources(
+            incoming={"MEMORY_GOALS.md": "[g1] GOAL-MARKER\n"},
+            source_product="openhuman",
+            target_product="openclaw",
+            source_defaults={},
+            target_defaults={},
+        )
+        self.assertNotIn("MEMORY_GOALS.md", cross.merged_files)
+        self.assertIn("GOAL-MARKER", cross.merged_files.get("AGENTS.md", ""))
+
+    def test_openhuman_injection_cap_skips_and_reports(self):
+        """openhuman injects MEMORY.md under a hard 2000-char cap: inlined
+        detail beyond the cap is skipped and reported, not written where it
+        would never be read."""
+        result = merge_resources(
+            incoming={
+                "memory/MEMORY.md": "# idx\n",
+                "memory/huge.md": "y" * 2500 + "\n",
+            },
+            source_product="qoder",
+            target_product="openhuman",
+            source_defaults={},
+            target_defaults={},
+        )
+        merged = result.merged_files["MEMORY.md"]
+        self.assertLessEqual(len(merged), 2000)
+        self.assertNotIn("yyyy", merged)
+        self.assertTrue(
+            any(a.action == "skip" and "injection cap" in a.detail
+                for a in result.actions))
 
     def test_fills_missing_from_target_defaults(self):
         """merge_resources fills target defaults for absent source files."""

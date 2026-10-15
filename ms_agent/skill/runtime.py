@@ -35,10 +35,14 @@ class SkillRuntime:
         self._last_applied_version: int = 0
         self._system_content_builder: Optional[Callable[[], str]] = None
         # False when the host delivers skill updates as in-conversation
-        # notices (``skills.update_notice``): the system prompt then stays
-        # byte-stable for the whole session — prefix-cache friendly — and
-        # maybe_refresh_system_prompt() becomes a no-op.
+        # notices (``skills.update_notice``): the SKILL SECTION of the system
+        # prompt is then frozen at its session-start snapshot (byte-stable —
+        # prefix-cache friendly; changes are announced via notices), while the
+        # OTHER head layers (base/persona/instructions/profile/memory) keep
+        # hot-reloading through the content compare — an edited AGENTS.md must
+        # apply next round even in notice mode (source-tiered refresh).
         self.head_refresh_enabled: bool = True
+        self._frozen_skill_section: Optional[str] = None
 
     @property
     def catalog(self) -> 'SkillCatalog':
@@ -112,9 +116,25 @@ class SkillRuntime:
     def needs_refresh(self) -> bool:
         return self._version != self._last_applied_version
 
-    def maybe_refresh_system_prompt(
-        self, messages: list
-    ) -> bool:
+    def build_skill_section(self) -> str:
+        """The skill section for the system prompt, honoring notice mode.
+
+        With ``head_refresh_enabled`` (default) this is a live rebuild. In
+        notice mode (``skills.update_notice``) the section is computed once
+        and frozen for the session: skill changes must not perturb the head
+        (they are announced in-conversation instead), yet the head as a whole
+        stays hot-reloadable for the instruction/persona layers.
+        """
+        if self._injector is None:
+            return ''
+        if self.head_refresh_enabled:
+            return self._injector.build_skill_prompt_section()
+        if self._frozen_skill_section is None:
+            self._frozen_skill_section = \
+                self._injector.build_skill_prompt_section()
+        return self._frozen_skill_section
+
+    def maybe_refresh_system_prompt(self, messages: list) -> bool:
         """Keep messages[0] in step with the current skill state.
 
         Rebuilds the system prompt via _system_content_builder (injected by
@@ -126,11 +146,12 @@ class SkillRuntime:
         time; an apply-once version latch would let that stale copy through
         on every later round. An in-step prompt compares equal — zero churn.
 
+        Runs in notice mode too: the builder pins the skill section via
+        build_skill_section(), so only instruction/persona/profile changes can
+        alter the head there — skill toggles still never touch it.
+
         Returns True if the system prompt was actually updated.
         """
-        if not self.head_refresh_enabled:
-            self._last_applied_version = self._version
-            return False
         if not messages or not self._system_content_builder:
             self._last_applied_version = self._version
             return False
@@ -161,14 +182,18 @@ class SkillRuntime:
         self._catalog.reload()
         self._version += 1
 
-    def sync_with_config(self, skills_config) -> bool:
+    def sync_with_config(self, skills_config, *, force: bool = True) -> bool:
         """Resync the catalog from an updated skills config; bump the
         version only when the effective skill surface (inventory, metadata,
         disabled set) actually changed, so maybe_refresh_system_prompt()
         rebuilds messages[0] on real change and stays a no-op otherwise.
 
-        Returns True when the surface changed.
+        Existing callers retain the full-resync behavior by default.  A host
+        with an authoritative change tracker may pass ``force=False`` to skip
+        I/O for a known-clean turn.  Returns True when the surface changed.
         """
+        if not force:
+            return False
         before = self._surface()
         self._catalog.resync(skills_config)
         after = self._surface()

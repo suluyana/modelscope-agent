@@ -65,8 +65,9 @@ class TestConvertTargetNameLanding(unittest.TestCase):
 
     root-per-agent (openclaw/qwenpaw): target-name lands via directory prefix.
     single-agent   (hermes):           target-name has no path effect (by design).
-    file-per-agent (qoder):            target-name lands in agents/{name}.md,
-                                       keeping the shared AGENTS.md clean.
+    file-per-agent (qoder):            converted persona folds into the shared
+                                       AGENTS.md; --target-name has no path
+                                       effect.
     """
 
     def setUp(self):
@@ -170,12 +171,12 @@ class TestConvertTargetNameLanding(unittest.TestCase):
         self.assertIn("SOUL.md", files)
         self.assertIn("Bot A creative AI.", files["SOUL.md"])
 
-    def test_qwenpaw_to_qoder_targetname_lands_in_agents_file(self):
-        """file-per-agent target: --target-name lands in agents/{name}.md.
+    def test_qwenpaw_to_qoder_persona_folds_into_agents_md(self):
+        """file-per-agent target: converted persona folds into AGENTS.md.
 
-        The converted persona (SOUL/PROFILE) is routed to the per-agent file
-        agents/bot-a.md, while the shared AGENTS.md must NOT be polluted with
-        that identity content.
+        The imported persona (SOUL/PROFILE) folds into the shared AGENTS.md
+        instead of spawning agents/{name}.md; --target-name is still accepted
+        but no longer picks a landing file.
         """
         out = self.base / "qoder_home"
         rc = cmd_convert(
@@ -185,18 +186,16 @@ class TestConvertTargetNameLanding(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         files = _read_all(out)
-        # Persona now lands in the dedicated per-agent file.
-        self.assertIn("agents/bot-a.md", files,
-                      "file-per-agent target must route persona to agents/{name}.md")
-        self.assertIn("Bot A creative AI.", files["agents/bot-a.md"])
-        self.assertIn("Bot A profile.", files["agents/bot-a.md"])
-        # Shared AGENTS.md, if present, must not carry the imported persona.
-        if "AGENTS.md" in files:
-            self.assertNotIn("Bot A creative AI.", files["AGENTS.md"],
-                             "shared AGENTS.md must stay free of per-agent identity")
+        # Persona folds into the shared AGENTS.md ...
+        self.assertIn("AGENTS.md", files,
+                      "qoder target must fold persona into AGENTS.md")
+        self.assertIn("Bot A creative AI.", files["AGENTS.md"])
+        self.assertIn("Bot A profile.", files["AGENTS.md"])
+        # ... and no per-agent identity file is spawned.
+        self.assertNotIn("agents/bot-a.md", files)
 
-    def test_qwenpaw_to_qoder_default_name_lands_in_agents_default(self):
-        """file-per-agent target without --target-name: persona -> agents/default.md."""
+    def test_qwenpaw_to_qoder_default_name_persona_folds_into_agents_md(self):
+        """file-per-agent target without --target-name: persona -> AGENTS.md."""
         out = self.base / "qoder_default_home"
         # from_name=default -> source lives in the default sub-agent workspace.
         src_default = self.base / "src_default"
@@ -211,9 +210,10 @@ class TestConvertTargetNameLanding(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         files = _read_all(out)
-        self.assertIn("agents/default.md", files,
-                      "default persona must land in agents/default.md")
-        self.assertIn("Bot A creative AI.", files["agents/default.md"])
+        self.assertIn("AGENTS.md", files,
+                      "default persona must fold into AGENTS.md")
+        self.assertIn("Bot A creative AI.", files["AGENTS.md"])
+        self.assertNotIn("agents/default.md", files)
 
 
 # ===========================================================================
@@ -480,26 +480,28 @@ class TestFourFrameworkConvertMatrix(unittest.TestCase):
         self.assertEqual(rc, 0, f"{source_fw}->{target_fw} convert failed")
         return _read_all(build_spec(target_fw, "bot-a", str(out)).workspace_root)
 
-    def test_ms_agent_to_qwenpaw_persona_maps_to_profile(self):
-        """ms-agent (single-agent) -> qwenpaw (root-per-agent): profile.md
-        identity lands in PROFILE.md (persona semantic group), memory verbatim."""
+    def test_ms_agent_to_qwenpaw_persona_folds_into_agents(self):
+        """ms-agent (single-agent) -> qwenpaw (root-per-agent): qwenpaw has
+        no USER.md slot (its PROFILE.md is a composite identity+profile
+        file), so PROFILE.md content folds into the catch-all AGENTS.md with
+        a merged hint instead of writing a dead memory/USER.md."""
         files = self._convert(
             {
-                "profile.md": "# Profile\nMS_PERSONA_MARKER identity.\n",
-                "MEMORY.md": "# Memory\nMS_MEM_MARKER fact.\n",
+                "PROFILE.md": "---\nversion: 1\n---\n\n# About Me\n- Call me: MS_PERSONA_MARKER\n",
                 "skills/write/SKILL.md": "# Write\nWriting skill.\n",
             },
             "ms-agent", "qwenpaw",
         )
-        self.assertIn("PROFILE.md", files)
-        self.assertIn("MS_PERSONA_MARKER", files["PROFILE.md"])
-        # plain memory carried over verbatim.
-        self.assertEqual(files.get("MEMORY.md"), "# Memory\nMS_MEM_MARKER fact.\n")
+        self.assertNotIn("memory/USER.md", files)
+        self.assertIn("AGENTS.md", files)
+        self.assertIn("MS_PERSONA_MARKER", files["AGENTS.md"])
         # skill carried over.
         self.assertIn("skills/write/SKILL.md", files)
 
-    def test_qwenpaw_to_ms_agent_profile_maps_to_lowercase(self):
-        """qwenpaw -> ms-agent: PROFILE.md identity lands in profile.md."""
+    def test_qwenpaw_to_ms_agent_profile_overflows_to_agents(self):
+        """qwenpaw -> ms-agent: qwenpaw's PROFILE.md is in its own narrow
+        semantic group (no ms-agent counterpart), so it overflows into the
+        catch-all AGENTS.md. The user content is preserved there."""
         files = self._convert(
             {
                 "SOUL.md": "# Soul\nQP soul.\n",
@@ -507,10 +509,9 @@ class TestFourFrameworkConvertMatrix(unittest.TestCase):
             },
             "qwenpaw", "ms-agent",
         )
-        self.assertIn("profile.md", files)
-        self.assertIn("QP_PERSONA_MARKER", files["profile.md"])
-        # ms-agent is single-agent: no uppercase PROFILE.md, no agent dir.
-        self.assertNotIn("PROFILE.md", files)
+        self.assertIn("AGENTS.md", files)
+        self.assertIn("QP_PERSONA_MARKER", files["AGENTS.md"])
+        # ms-agent stays single-agent.
         self.assertFalse(any("bot-a" in p for p in files))
 
     def test_openclaw_to_hermes_identity_and_user(self):
@@ -543,8 +544,10 @@ class TestFourFrameworkConvertMatrix(unittest.TestCase):
         self.assertIn("memory/USER.md", files)
         self.assertIn("HM_USER_MARKER", files["memory/USER.md"])
 
-    def test_openclaw_to_ms_agent_memory_kept(self):
-        """openclaw -> ms-agent: MEMORY.md carried over, output is single-agent."""
+    def test_openclaw_to_ms_agent_memory_folds_into_agents(self):
+        """openclaw -> ms-agent: ms-agent has no memory slot (memory is
+        project-level at runtime), so MEMORY.md content is folded into the
+        catch-all AGENTS.md rather than written as a dead global file."""
         files = self._convert(
             {
                 "SOUL.md": "# Soul\nOC soul.\n",
@@ -552,8 +555,11 @@ class TestFourFrameworkConvertMatrix(unittest.TestCase):
             },
             "openclaw", "ms-agent",
         )
-        self.assertIn("MEMORY.md", files)
-        self.assertIn("OC_MEM_MARKER", files["MEMORY.md"])
+        # no standalone memory file in the ms-agent global layout.
+        self.assertNotIn("MEMORY.md", files)
+        # content is preserved by folding into the catch-all instructions file.
+        self.assertIn("AGENTS.md", files)
+        self.assertIn("OC_MEM_MARKER", files["AGENTS.md"])
         # single-agent target: no agent-prefixed dirs.
         self.assertFalse(any("bot-a" in p for p in files))
 
@@ -600,7 +606,7 @@ class TestQoderPersonaOutbound(unittest.TestCase):
             "qwenpaw": "workspaces/default/AGENTS.md",
             "nanobot": "AGENTS.md",
             "openhuman": "SOUL.md",
-            "ms-agent": "profile.md",
+            "ms-agent": "AGENTS.md",
         }
         for target, home in expected_home.items():
             files = self._convert(target)
@@ -614,7 +620,8 @@ class TestQoderPersonaOutbound(unittest.TestCase):
                 f"qoder->{target}: shared rules lost")
 
     def test_reverse_direction_not_regressed(self):
-        """hermes -> qoder still folds SOUL.md into agents/<target-name>.md."""
+        """hermes -> qoder still folds SOUL.md -- into the shared AGENTS.md,
+        not into agents/<target-name>.md."""
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src"
             src.mkdir()
@@ -625,9 +632,10 @@ class TestQoderPersonaOutbound(unittest.TestCase):
                 from_name="default", target_name="test-architect",
                 local_dir=str(src), out_dir=str(out))
             self.assertEqual(rc, 0)
-            persona = out / "agents" / "test-architect.md"
-            self.assertTrue(persona.is_file())
-            self.assertIn("GOLD-HERMES-PERSONA", persona.read_text())
+            shared = out / "AGENTS.md"
+            self.assertTrue(shared.is_file())
+            self.assertIn("GOLD-HERMES-PERSONA", shared.read_text())
+            self.assertFalse((out / "agents" / "test-architect.md").is_file())
 
 
 class TestHermesOptionalSkillsOutbound(unittest.TestCase):
@@ -687,6 +695,323 @@ class TestHermesOptionalSkillsOutbound(unittest.TestCase):
             kept = out / "optional-skills" / "git-helper" / "SKILL.md"
             self.assertTrue(kept.is_file())
             self.assertIn("OPTSKILL", kept.read_text())
+
+
+class TestQoderCommandsToSkillOutbound(unittest.TestCase):
+    """Qoder ``commands/<x>.md`` must convert to a target skill.
+
+    The host runs qoder commands via the skill framework (a
+    ``name``/``description`` frontmatter + body, triggered by ``/<x>``), so
+    they are skills in all but path. No other framework has a ``commands/``
+    slot, so carrying the path over verbatim let the target-spec filter drop
+    it -- imported on paper, never loaded. Cross-product each command is
+    re-homed as ``skills/<x>/SKILL.md``; qoder->qoder keeps it verbatim.
+    """
+
+    def _make_src(self, td):
+        src = Path(td) / "src"
+        (src / "agents").mkdir(parents=True)
+        (src / "commands").mkdir(parents=True)
+        (src / "AGENTS.md").write_text("# Agents\n")
+        (src / "agents" / "default.md").write_text("# Default\npersona\n")
+        (src / "commands" / "check-user-resources.md").write_text(
+            "---\nname: check-user-resources\n"
+            "description: check system resources\n---\n\nGOLD-QODER-COMMAND\n")
+        return src
+
+    def test_command_becomes_skill_on_every_target(self):
+        for target in ("openclaw", "qwenpaw", "nanobot", "openhuman",
+                       "hermes", "ms-agent"):
+            with tempfile.TemporaryDirectory() as td:
+                src = self._make_src(td)
+                out = Path(td) / "out"
+                rc = cmd_convert(
+                    "qoder", target,
+                    from_name="default", target_name="default",
+                    local_dir=str(src), out_dir=str(out))
+                self.assertEqual(rc, 0)
+                hits = [
+                    str(p.relative_to(out)) for p in out.rglob("*")
+                    if p.is_file() and "GOLD-QODER-COMMAND" in p.read_text()
+                ]
+                self.assertEqual(
+                    len(hits), 1,
+                    f"qoder->{target}: command lost or duplicated: {hits}")
+                self.assertIn(
+                    "skills/check-user-resources/SKILL.md", hits[0])
+                self.assertNotIn("commands/", hits[0])
+
+    def test_same_framework_keeps_command_prefix(self):
+        """qoder -> qoder stays byte-faithful: commands/ untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_src(td)
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "qoder", "qoder",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            kept = out / "commands" / "check-user-resources.md"
+            self.assertTrue(kept.is_file())
+            self.assertIn("GOLD-QODER-COMMAND", kept.read_text())
+            self.assertFalse(
+                (out / "skills" / "check-user-resources").exists())
+
+
+class TestPrivateConfigDroppedOnConvert(unittest.TestCase):
+    """Framework-private config files must not survive a cross convert.
+
+    ``config.yaml`` exists in both hermes and ms-agent but with incompatible
+    formats, and ``skill.json`` in both ms-agent and qwenpaw. They have no
+    cross-framework meaning, so carrying them over left an unparseable file in
+    the target workspace. They are dropped cross-product; same-framework sync
+    still keeps them verbatim.
+    """
+
+    def test_hermes_to_ms_agent_drops_config_yaml(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            (src / "skills" / "s").mkdir(parents=True)
+            (src / "SOUL.md").write_text("# Soul\nGOLD-PERSONA\n")
+            (src / "config.yaml").write_text("llm:\n  model: x\nhooks: {}\n")
+            (src / "skills" / "s" / "SKILL.md").write_text("GOLD-SKILL\n")
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "hermes", "ms-agent",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            names = {p.name for p in out.rglob("*") if p.is_file()}
+            self.assertNotIn("config.yaml", names)
+            # persona + user skill still migrate
+            all_text = "".join(
+                p.read_text() for p in out.rglob("*") if p.is_file())
+            self.assertIn("GOLD-PERSONA", all_text)
+            self.assertIn("GOLD-SKILL", all_text)
+
+    def test_ms_agent_to_hermes_drops_config_and_skills_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            src.mkdir()
+            (src / "SOUL.md").write_text("# Who You Are\nGOLD-PERSONA\n")
+            (src / "config.yaml").write_text("llm:\n  model: x\ntools: {}\n")
+            (src / "skills.json").write_text('{"sources": [], "disabled": ["x"]}')
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "ms-agent", "hermes",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            names = {p.name for p in out.rglob("*") if p.is_file()}
+            self.assertNotIn("config.yaml", names)
+            self.assertNotIn("skills.json", names)
+            all_text = "".join(
+                p.read_text() for p in out.rglob("*") if p.is_file())
+            self.assertIn("GOLD-PERSONA", all_text)
+
+    def test_openhuman_to_ms_agent_keeps_skill_tree_drops_provenance(self):
+        """openhuman -> ms-agent: a skill is an atomic directory, so the tree
+        travels -- SKILL.md plus asset subdirs -- and skills must never vanish
+        (regression for a report where they were lost entirely). But
+        openhuman's per-skill PROVENANCE sidecars (``_meta.json`` marketplace
+        record, ``metadata.json`` github source) are framework-private and are
+        dropped on the cross-framework convert (BUG-0828); same-framework sync
+        still keeps them.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            (src / "skills" / "weather" / "references").mkdir(parents=True)
+            (src / "skills" / "news-daily").mkdir(parents=True)
+            (src / "SOUL.md").write_text("# Soul\nGOLD-PERSONA\n")
+            (src / "skills" / "weather" / "SKILL.md").write_text("GOLD-WEATHER\n")
+            (src / "skills" / "weather" / "references" / "formats.md").write_text(
+                "GOLD-ASSET\n")
+            (src / "skills" / "weather" / "_meta.json").write_text('{"k": 1}')
+            (src / "skills" / "news-daily" / "SKILL.md").write_text("GOLD-NEWS\n")
+            (src / "skills" / "news-daily" / "metadata.json").write_text('{"k": 2}')
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "openhuman", "ms-agent",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            rels = {
+                str(p.relative_to(out))
+                for p in out.rglob("*") if p.is_file()
+            }
+            # SKILL.md and asset subdirs travel ...
+            for expected in (
+                    "skills/weather/SKILL.md",
+                    "skills/weather/references/formats.md",
+                    "skills/news-daily/SKILL.md"):
+                self.assertIn(expected, rels)
+            # ... but the openhuman-private provenance sidecars are dropped.
+            self.assertNotIn("skills/weather/_meta.json", rels)
+            self.assertNotIn("skills/news-daily/metadata.json", rels)
+            self.assertEqual(
+                (out / "skills" / "weather" / "SKILL.md").read_text(),
+                "GOLD-WEATHER\n")
+
+    def test_qwenpaw_to_ms_agent_drops_agent_and_skill_json(self):
+        """qwenpaw -> ms-agent: qwenpaw's private ``agent.json`` (config) and
+        ``skill.json`` (skill manifest) are dropped -- ms-agent uses neither
+        format, so carrying them over would leave unloadable files in the
+        target. The persona and real skills still migrate.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            # qwenpaw is root-per-agent: default agent lives in workspaces/default.
+            ws = src / "workspaces" / "default"
+            (ws / "skills" / "foo").mkdir(parents=True)
+            (ws / "SOUL.md").write_text("# Soul\nGOLD-PERSONA\n")
+            (ws / "agent.json").write_text('{"id": "bot"}')
+            (ws / "skill.json").write_text('{"skills": [{"name": "a"}]}')
+            (ws / "skills" / "foo" / "SKILL.md").write_text("GOLD-SKILL\n")
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "qwenpaw", "ms-agent",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            names = {p.name for p in out.rglob("*") if p.is_file()}
+            self.assertNotIn("agent.json", names)
+            self.assertNotIn("skill.json", names)
+            # persona + user skill still migrate.
+            rels = {
+                str(p.relative_to(out))
+                for p in out.rglob("*") if p.is_file()
+            }
+            self.assertIn("skills/foo/SKILL.md", rels)
+            all_text = "".join(
+                p.read_text() for p in out.rglob("*") if p.is_file())
+            self.assertIn("GOLD-PERSONA", all_text)
+
+    def test_qwenpaw_to_ms_agent_keeps_full_skill_tree(self):
+        """qwenpaw -> ms-agent: a skill is a whole directory, so its auxiliary
+        files (references/, scripts/, ...) must migrate alongside SKILL.md --
+        not just the SKILL.md itself. Regression: ms-agent's allowlist used
+        ``skills/*/SKILL.md`` and dropped every deeper runtime dependency.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            sk = src / "workspaces" / "default" / "skills" / "Daily-AI-News"
+            (sk / "references").mkdir(parents=True)
+            (sk / "scripts").mkdir(parents=True)
+            (src / "workspaces" / "default" / "SOUL.md").write_text("# Soul\nQP\n")
+            (sk / "SKILL.md").write_text("# Daily AI News\n")
+            (sk / "references" / "news_sources.md").write_text("sources\n")
+            (sk / "scripts" / "generate_queries.py").write_text("print(1)\n")
+            (sk / "scripts" / "requirements.txt").write_text("requests\n")
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "qwenpaw", "ms-agent",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            rels = {
+                str(p.relative_to(out))
+                for p in out.rglob("*") if p.is_file()
+            }
+            for expected in (
+                    "skills/Daily-AI-News/SKILL.md",
+                    "skills/Daily-AI-News/references/news_sources.md",
+                    "skills/Daily-AI-News/scripts/generate_queries.py",
+                    "skills/Daily-AI-News/scripts/requirements.txt"):
+                self.assertIn(expected, rels)
+
+    def test_same_framework_keeps_settings_json(self):
+        """ms-agent → ms-agent: private config (settings.json) is kept on a
+        same-framework convert (it's only dropped cross-framework)."""
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            src.mkdir()
+            (src / "SOUL.md").write_text("# Soul\n")
+            (src / "settings.json").write_text('{"model": "GOLD-CFG"}')
+            out = Path(td) / "out"
+            rc = cmd_convert(
+                "ms-agent", "ms-agent",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            kept = out / "settings.json"
+            self.assertTrue(kept.is_file())
+            self.assertIn("GOLD-CFG", kept.read_text())
+
+
+class TestOpenhumanCuratedMemory(unittest.TestCase):
+    """``MEMORY.md`` is OpenHuman's curated long-term memory (injected every
+    session, maintained by the archivist sub-agent) and must map onto the other
+    products' MEMORY slot. Because a named agent's ``workspace_root`` already
+    resolves to ``personalities/<Profile>/``, the same pattern covers both the
+    workspace-level file and each Profile's own copy.
+    """
+
+    def _make_src(self, td: Path) -> Path:
+        src = td / "src"
+        (src / "personalities" / "researcher-2" / "skills" / "paper-hunt").mkdir(
+            parents=True)
+        (src / "SOUL.md").write_text("# Soul\nGLOBAL-PERSONA\n")
+        (src / "MEMORY.md").write_text("GLOBAL-MEMORY\n")
+        prof = src / "personalities" / "researcher-2"
+        (prof / "SOUL.md").write_text("# Soul\nPROFILE-PERSONA\n")
+        (prof / "MEMORY.md").write_text("PROFILE-MEMORY\n")
+        (prof / "skills" / "paper-hunt" / "SKILL.md").write_text("PROFILE-SKILL\n")
+        return src
+
+    def test_workspace_memory_travels_to_openclaw(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = self._make_src(td)
+            out = td / "out"
+            rc = cmd_convert(
+                "openhuman", "openclaw",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            mem = out / "workspace" / "MEMORY.md"
+            self.assertTrue(mem.is_file())
+            self.assertIn("GLOBAL-MEMORY", mem.read_text())
+
+    def test_profile_memory_and_skills_travel_to_hermes(self):
+        """A Profile carries its *own* memory and skill tree, not the global
+        ones -- the per-Profile scope is what ``workspace_root`` selects.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = self._make_src(td)
+            out = td / "out"
+            rc = cmd_convert(
+                "openhuman", "hermes",
+                from_name="researcher-2", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            mem = out / "memories" / "MEMORY.md"
+            self.assertTrue(mem.is_file())
+            self.assertIn("PROFILE-MEMORY", mem.read_text())
+            self.assertNotIn("GLOBAL-MEMORY", mem.read_text())
+            skill = out / "skills" / "paper-hunt" / "SKILL.md"
+            self.assertTrue(skill.is_file())
+            self.assertEqual(skill.read_text(), "PROFILE-SKILL\n")
+
+    def test_memory_maps_back_from_hermes(self):
+        """Inbound direction: hermes ``memories/MEMORY.md`` lands on the
+        OpenHuman workspace root, not in a nested memory dir.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "hermes"
+            (src / "memories").mkdir(parents=True)
+            (src / "SOUL.md").write_text("# Soul\nH-PERSONA\n")
+            (src / "memories" / "MEMORY.md").write_text("H-MEMORY\n")
+            out = td / "out"
+            rc = cmd_convert(
+                "hermes", "openhuman",
+                from_name="default", target_name="default",
+                local_dir=str(src), out_dir=str(out))
+            self.assertEqual(rc, 0)
+            mem = out / "MEMORY.md"
+            self.assertTrue(mem.is_file())
+            self.assertIn("H-MEMORY", mem.read_text())
 
 
 if __name__ == "__main__":

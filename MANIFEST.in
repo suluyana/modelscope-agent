@@ -4,14 +4,21 @@ include requirements.txt
 recursive-include requirements *.txt
 recursive-include ms_agent/ *.yaml
 
+# agent_hub cross-framework conversion templates (markdown, not yaml)
+recursive-include ms_agent/agent_hub/default_configs *
+
 # Include projects
 recursive-include projects *
 
-# Include webui backend
-recursive-include webui/backend *.py
+# WebUI files are selected explicitly by build_py.get_source_files().
+include .dev_scripts/webui/webui_packaging.py
+include .dev_scripts/webui/prepare_webui.py
+include .dev_scripts/webui/README.md
+include setup.cfg
+prune .agents
 
-# Include webui frontend dist (will be built during setup)
-recursive-include webui/frontend/dist *
+# Include Capability Gateway skill package (copied into ms_agent/skills at build)
+recursive-include ms-agent-skills *
 
 # Exclude development files
 global-exclude *.pyc

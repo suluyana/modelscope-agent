@@ -1,5 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """CLI command tests: helper functions, upload/download/convert flows (stubbed client)."""
+import base64
+import contextlib
+import io
+import os
 import tempfile
 import unittest
 import zipfile
@@ -9,6 +13,7 @@ from unittest import mock
 from ms_agent.agent_hub._commands import (
     available_frameworks,
     build_spec,
+    check_framework,
     cmd_convert,
     cmd_download,
     cmd_list,
@@ -58,6 +63,68 @@ class _RepoStub:
 # ---------------------------------------------------------------------------
 # Helper function unit tests
 # ---------------------------------------------------------------------------
+
+
+class TestExperimentalFrameworkGate(unittest.TestCase):
+    """Only ms-agent / qwenpaw are exposed unless TRY_EXP_FRAMEWORKS is set.
+
+    conftest turns the gate ON for the rest of the suite (the gated frameworks
+    still need their regressions), so each test here pins the env var itself
+    rather than relying on the ambient value.
+    """
+
+    def _clear(self):
+        return mock.patch.dict(os.environ, {"TRY_EXP_FRAMEWORKS": ""})
+
+    def _enable(self, value="True"):
+        return mock.patch.dict(os.environ, {"TRY_EXP_FRAMEWORKS": value})
+
+    def test_stable_frameworks_always_allowed(self):
+        with self._clear():
+            for fw in ("ms-agent", "qwenpaw"):
+                self.assertIsNone(check_framework(fw))
+
+    def test_gated_frameworks_rejected_by_default(self):
+        with self._clear():
+            for fw in ("qoder", "hermes", "nanobot", "openclaw", "openhuman"):
+                err = check_framework(fw)
+                self.assertIsNotNone(err, f"{fw} should be gated by default")
+                # points at the opt-in, and does not pretend the name is bogus
+                self.assertIn("TRY_EXP_FRAMEWORKS", err)
+                self.assertNotIn("unknown", err)
+
+    def test_gated_frameworks_allowed_when_enabled(self):
+        for value in ("True", "true", "1", "yes", "on"):
+            with self._enable(value):
+                self.assertIsNone(
+                    check_framework("qoder"), f"{value!r} should enable")
+
+    def test_falsy_values_keep_gate_closed(self):
+        for value in ("", "false", "0", "no"):
+            with self._enable(value):
+                self.assertIsNotNone(
+                    check_framework("qoder"), f"{value!r} must not enable")
+
+    def test_unknown_framework_is_reported_as_unknown(self):
+        for ctx in (self._clear(), self._enable()):
+            with ctx:
+                err = check_framework("bogus")
+                self.assertIn("unknown", err)
+                self.assertNotIn("TRY_EXP_FRAMEWORKS", err)
+
+    def test_available_frameworks_reflects_the_gate(self):
+        with self._clear():
+            self.assertEqual(available_frameworks(), "ms-agent, qwenpaw")
+        with self._enable():
+            listed = available_frameworks()
+            for fw in ("qoder", "hermes", "ms-agent", "qwenpaw"):
+                self.assertIn(fw, listed)
+
+    def test_commands_exit_nonzero_for_gated_framework(self):
+        with self._clear():
+            with mock.patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertEqual(cmd_status("qoder"), 1)
+            self.assertIn("TRY_EXP_FRAMEWORKS", err.getvalue())
 
 
 class TestRepoName(unittest.TestCase):
@@ -186,6 +253,15 @@ class _StubClient:
     # Subclasses/tests may set this to simulate pre-existing remote files.
     preset_remote = []
 
+    # Metadata returned by ``repo_info`` for the post-create visibility
+    # read-back. Default ``{}`` (unknown) makes verification proceed, matching
+    # every existing upload test; a test can set ``{"private": False}`` to
+    # simulate the server ignoring a private request.
+    preset_repo_info = {}
+
+    # Per-path remote sha256 from list_repo_files_detail, to simulate incremental/up-to-date remotes.
+    preset_remote_sha = {}
+
     def __init__(self, *args, **kwargs):
         self.created = []
         self.created_visibility = []
@@ -197,6 +273,9 @@ class _StubClient:
 
     def check_repo(self, path, name):
         return False
+
+    def repo_info(self, path, name):
+        return type(self).preset_repo_info
 
     def list_repo_files(self, path, name, revision="master"):
         return list(type(self).preset_remote)
@@ -221,6 +300,17 @@ class _StubClient:
                 self.uploaded_resources[a["path"]] = base64.b64decode(a["content"])
         return {"success": True}
 
+    def list_repo_files_detail(self, path, name, revision="master"):
+        from ms_agent.agent_hub._sync import sha256_content
+        shas = type(self).preset_remote_sha
+        return [
+            RemoteFileInfo(
+                path=p,
+                sha256=shas.get(p, sha256_content(("stub:" + p).encode())),
+                is_lfs=False,
+            ) for p in type(self).preset_remote
+        ]
+
     def upload_lfs_file(self, path, name, file_path, content, **kwargs):
         self.lfs_uploads.append((file_path, content))
         if self.uploaded_resources is None:
@@ -239,6 +329,9 @@ class TestUploadCmd(unittest.TestCase):
         (self.root / "skills" / "test-skill").mkdir(parents=True)
         (self.root / "skills" / "test-skill" / "SKILL.md").write_text("skill")
         _StubClient.instances = []
+        _StubClient.preset_remote = []
+        _StubClient.preset_repo_info = {}
+        _StubClient.preset_remote_sha = {}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -282,6 +375,109 @@ class TestUploadCmd(unittest.TestCase):
         self.assertIn("AGENTS.md", client.uploaded_resources)
         for v in client.uploaded_resources.values():
             self.assertIsInstance(v, bytes)
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
+    def test_private_request_honored_proceeds(self):
+        """Server confirms private -> upload proceeds normally."""
+        _StubClient.preset_repo_info = {"private": True}
+        try:
+            rc = cmd_upload(
+                framework="qoder", name="reviewer",
+                local_dir=str(self.root),
+                endpoint="http://s", token="tok", username="u",
+                visibility="private",
+            )
+        finally:
+            _StubClient.preset_repo_info = {}
+        self.assertEqual(rc, 0)
+        client = _StubClient.instances[0]
+        self.assertEqual(client.created_visibility, ["private"])
+        self.assertIsNotNone(client.uploaded_resources)
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
+    def test_private_request_created_public_aborts_before_upload(self):
+        """Server ignored private (repo is public) -> abort, nothing uploaded.
+
+        Regression: this used to log a cheerful "private" success while the
+        repo was public -- a silent leak with exit code 0.
+        """
+        _StubClient.preset_repo_info = {"private": False}
+        try:
+            rc = cmd_upload(
+                framework="qoder", name="reviewer",
+                local_dir=str(self.root),
+                endpoint="http://s", token="tok", username="u",
+                visibility="private",
+            )
+        finally:
+            _StubClient.preset_repo_info = {}
+        self.assertEqual(rc, 1)  # non-zero: the failure is observable on CLI
+        client = _StubClient.instances[0]
+        # Repo was created, but NO content was pushed after the mismatch.
+        self.assertEqual(client.created_visibility, ["private"])
+        self.assertIsNone(client.uploaded_resources)
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
+    def test_unverifiable_visibility_proceeds(self):
+        """Metadata unreadable -> proceed rather than block a real upload."""
+        _StubClient.preset_repo_info = {}  # unknown
+        rc = cmd_upload(
+            framework="qoder", name="reviewer",
+            local_dir=str(self.root),
+            endpoint="http://s", token="tok", username="u",
+            visibility="private",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIsNotNone(_StubClient.instances[0].uploaded_resources)
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
+    def test_private_request_existing_public_repo_aborts_before_upload(self):
+        """Existing public repo + private request -> abort before any upload."""
+        _StubClient.preset_repo_info = {"private": False}
+        _StubClient.preset_remote = ["AGENTS.md", "agents/reviewer.md"]
+        try:
+            rc = cmd_upload(
+                framework="qoder", name="reviewer",
+                local_dir=str(self.root),
+                endpoint="http://s", token="tok", username="u",
+                visibility="private",
+            )
+        finally:
+            _StubClient.preset_repo_info = {}
+            _StubClient.preset_remote = []
+            _StubClient.preset_remote_sha = {}
+        self.assertEqual(rc, 1)  # non-zero: the failure is observable on CLI
+        client = _StubClient.instances[0]
+        # No content was pushed after the visibility mismatch.
+        self.assertIsNone(client.uploaded_resources)
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
+    def test_private_request_existing_public_repo_aborts_even_when_up_to_date(
+            self):
+        """In-sync remote still aborts: guard runs before the up-to-date early return."""
+        from ms_agent.agent_hub._sync import sha256_content
+        _StubClient.preset_repo_info = {"private": False}
+        _StubClient.preset_remote = ["AGENTS.md", "agents/reviewer.md"]
+        _StubClient.preset_remote_sha = {
+            "AGENTS.md":
+            sha256_content((self.root / "AGENTS.md").read_bytes()),
+            "agents/reviewer.md":
+            sha256_content((self.root / "agents" / "reviewer.md").read_bytes()),
+        }
+        try:
+            rc = cmd_upload(
+                framework="qoder", name="reviewer",
+                local_dir=str(self.root),
+                endpoint="http://s", token="tok", username="u",
+                visibility="private",
+            )
+        finally:
+            _StubClient.preset_repo_info = {}
+            _StubClient.preset_remote = []
+            _StubClient.preset_remote_sha = {}
+        self.assertEqual(rc, 1)  # non-zero: the failure is observable on CLI
+        # No content was pushed despite the remote already being in sync.
+        self.assertIsNone(_StubClient.instances[0].uploaded_resources)
 
     @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
     def test_full_upload_prunes_stale_remote_in_scope(self):
@@ -410,6 +606,78 @@ class TestUploadCmd(unittest.TestCase):
         client = _StubClient.instances[0]
         self.assertEqual(client.created_visibility, ["private"])
 
+    def test_create_repo_sends_boolean_private_not_visibility(self):
+        """The agent API takes a boolean ``private`` (inverted), not the old
+        ``visibility`` string: a string is rejected 400 by the server, and a
+        missing field silently defaults to public. The caller-facing label
+        stays ``public``/``private`` on purpose."""
+        from modelscope_hub.agent import AgentApi
+
+        sent = {}
+
+        class _FakeOpenApi:
+
+            def request(self, method, path=None, **kw):
+                sent.clear()
+                sent.update(kw.get("json_body") or {})
+                return {}
+
+        api = AgentApi.__new__(AgentApi)
+        api._openapi = _FakeOpenApi()
+
+        AgentApi.create_repo(api, "grp", "a", visibility="private")
+        self.assertEqual(sent["private"], True)
+        self.assertNotIn("visibility", sent)
+
+        AgentApi.create_repo(api, "grp", "b")  # default public
+        self.assertEqual(sent["private"], False)
+        self.assertIsInstance(sent["private"], bool)
+        self.assertNotIn("visibility", sent)
+
+        with self.assertRaises(ValueError):
+            AgentApi.create_repo(api, "grp", "c", visibility="Public")
+
+    def test_agent_field_readers_handle_renamed_and_legacy_keys(self):
+        """``private`` is an INVERTED boolean, so ``private=False`` (public)
+        must not be swallowed by a falsy ``or``-chain; the renamed time field
+        and the legacy spellings are both accepted."""
+        from modelscope_hub.agent import (agent_last_modified,
+                                          agent_visibility_label)
+        self.assertEqual(agent_visibility_label({"private": False}), "public")
+        self.assertEqual(agent_visibility_label({"Private": False}), "public")
+        self.assertEqual(agent_visibility_label({"private": True}), "private")
+        self.assertEqual(agent_visibility_label({"Private": True}), "private")
+        # legacy servers still send the string form, in any casing / with
+        # padding / as the int enum or its numeric string
+        self.assertEqual(
+            agent_visibility_label({"Visibility": "private"}), "private")
+        self.assertEqual(
+            agent_visibility_label({"Visibility": "Public"}), "public")
+        self.assertEqual(
+            agent_visibility_label({"visibility": "PRIVATE"}), "private")
+        self.assertEqual(
+            agent_visibility_label({"Visibility": "  public  "}), "public")
+        self.assertEqual(agent_visibility_label({"Visibility": 5}), "public")
+        self.assertEqual(agent_visibility_label({"Visibility": 1}), "private")
+        self.assertEqual(agent_visibility_label({"Visibility": "5"}), "public")
+        # new field wins over a stale legacy one
+        self.assertEqual(
+            agent_visibility_label({"private": False, "Visibility": "private"}),
+            "public")
+        # unknown / empty values are never guessed into "private"
+        self.assertEqual(agent_visibility_label({"Visibility": "weird"}),
+                         "weird")
+        self.assertEqual(agent_visibility_label({"Visibility": ""}), "-")
+        self.assertEqual(agent_visibility_label({}), "-")
+
+        self.assertEqual(
+            agent_last_modified({"LastModified": "2026-07-16T10:30:00Z"}),
+            "2026-07-16T10:30:00Z")
+        self.assertEqual(
+            agent_last_modified({"GmtModified": "2026-07-16T18:30:00+08:00"}),
+            "2026-07-16T18:30:00+08:00")
+        self.assertEqual(agent_last_modified({}), "-")
+
     @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
     def test_upload_global_only_no_agents_dir(self):
         """When no agents/ directory exists, upload only shared (global) files."""
@@ -513,7 +781,7 @@ class TestBackupsFilterCmd(unittest.TestCase):
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
-            rc = cmd_recover(target="last", framework="qoder")
+            cmd_recover(target="last", framework="qoder")
         # rc=1 because the fake zip doesn't have valid data to restore,
         # but it should attempt the qoder_reviewer (latest qoder) not qwenpaw.
         self.assertNotIn("no backups found", buf.getvalue().lower())
@@ -968,8 +1236,8 @@ class TestDownload(unittest.TestCase):
     def test_download_convert_parity_with_local_convert(self):
         """Regression (BUG-020): ``download --target-framework`` must produce
         the SAME file set as a local ``convert`` -- same persona routing for
-        file-per-agent targets (agents/<name>.md, no shared AGENTS.md
-        pollution) and no invented target default templates."""
+        file-per-agent targets (folded into the shared AGENTS.md, no
+        per-agent file spawned) and no invented target default templates."""
         from ms_agent.agent_hub._commands import cmd_convert
         src = Path(self.tmp.name) / "src"
         src.mkdir()
@@ -996,9 +1264,13 @@ class TestDownload(unittest.TestCase):
             cv_files = sorted(
                 str(p.relative_to(cv)) for p in cv.rglob("*") if p.is_file())
             self.assertEqual(dl_files, cv_files, f"target={target}")
-        # file-per-agent target: persona landed in its private file.
-        self.assertTrue((Path(self.tmp.name) / "dl_qoder" / "agents"
-                         / "myagent.md").is_file())
+        # file-per-agent target: persona folded into the shared AGENTS.md;
+        # no per-agent identity file spawned.
+        dl_agents_md = Path(self.tmp.name) / "dl_qoder" / "AGENTS.md"
+        self.assertTrue(dl_agents_md.is_file())
+        self.assertIn("soul", dl_agents_md.read_text())
+        self.assertFalse((Path(self.tmp.name) / "dl_qoder" / "agents"
+                          / "myagent.md").is_file())
 
     def test_download_without_login_fails(self):
         rc = cmd_download(
@@ -1270,7 +1542,7 @@ class TestFrameworkUploadCoverage(unittest.TestCase):
     LAYOUTS = {
         "openclaw": {"SOUL.md": "# Soul\noc\n", "USER.md": "# User\noc\n"},
         "hermes": {"SOUL.md": "# Soul\nhm\n", "memories/USER.md": "# User\nhm\n"},
-        "ms-agent": {"profile.md": "# Profile\nms\n", "MEMORY.md": "# Memory\nms\n"},
+        "ms-agent": {"SOUL.md": "# Soul\nms\n", "PROFILE.md": "# Profile\nms\n"},
         "qwenpaw": {"SOUL.md": "# Soul\nqp\n", "PROFILE.md": "# Profile\nqp\n"},
     }
 
@@ -1311,8 +1583,8 @@ class TestFrameworkUploadCoverage(unittest.TestCase):
     def test_upload_ms_agent(self):
         client = self._upload("ms-agent", self.LAYOUTS["ms-agent"])
         self.assertEqual(client.created[0], ("u", "ms-agent-default", "ms-agent"))
-        self.assertIn("profile.md", client.uploaded_resources)
-        self.assertIn("MEMORY.md", client.uploaded_resources)
+        self.assertIn("SOUL.md", client.uploaded_resources)
+        self.assertIn("PROFILE.md", client.uploaded_resources)
 
     def test_upload_qwenpaw(self):
         client = self._upload("qwenpaw", self.LAYOUTS["qwenpaw"])
@@ -1422,38 +1694,44 @@ class TestUploadSanitization(unittest.TestCase):
         self.assertEqual(pushed["id"], "default")
 
     @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
-    def test_upload_scrubs_ms_agent_yaml_secrets(self):
-        """ms-agent agent.yaml/config.yaml llm.*_api_key + mcpServers env are
-        blanked on push; non-secret structure survives."""
-        agent_yaml = (
-            "llm:\n"
-            "  service: modelscope\n"
-            "  model: Qwen/Qwen3-235B-A22B-Instruct-2507\n"
-            "  modelscope_api_key: ms-LEAKME111\n"
-            "mcpServers:\n"
-            "  fetch:\n"
-            "    command: fetch-server\n"
-            "    env:\n"
-            "      FETCH_TOKEN: env-LEAKME222\n"
-        )
+    def test_upload_scrubs_ms_agent_mcp_json_secrets(self):
+        """ms-agent mcp.json server ``env`` blocks are blanked on push; the
+        non-secret server definition (command / args) survives.
+
+        ``mcp.json`` is where ms-agent concentrates plaintext MCP keys. The
+        legacy ``agent.yaml`` / ``config.yaml`` are NOT collected: the former is
+        package-internal and the latter project-level, so neither exists under
+        the global home this spec models.
+        """
+        import json
+        mcp = json.dumps({
+            "mcpServers": {
+                "fetch": {
+                    "command": "fetch-server",
+                    "args": ["--port", "8080"],
+                    "env": {"FETCH_TOKEN": "env-LEAKME222"},
+                }
+            }
+        })
         root = self._write_ws(
             "ms-agent",
-            {"profile.md": "# Profile\ncustom\n", "agent.yaml": agent_yaml})
+            {"SOUL.md": "# Soul\ncustom\n", "mcp.json": mcp})
         rc = cmd_upload(
             framework="ms-agent", name=None, local_dir=str(root),
             endpoint="http://s", token="tok", username="u",
         )
         self.assertEqual(rc, 0)
         client = _StubClient.instances[0]
-        self.assertIn("agent.yaml", client.uploaded_resources)
-        pushed = client.uploaded_resources["agent.yaml"].decode("utf-8")
-        # Both the llm api_key and the mcpServers env secret are gone.
-        self.assertNotIn("ms-LEAKME111", pushed)
+        self.assertIn("mcp.json", client.uploaded_resources)
+        pushed = client.uploaded_resources["mcp.json"].decode("utf-8")
+        # The env secret is gone.
         self.assertNotIn("env-LEAKME222", pushed)
         # Non-secret structure / values preserved.
-        self.assertIn("service: modelscope", pushed)
-        self.assertIn("modelscope_api_key:", pushed)
-        self.assertIn("mcpServers:", pushed)
+        data = json.loads(pushed)
+        server = data["mcpServers"]["fetch"]
+        self.assertEqual(server["command"], "fetch-server")
+        self.assertEqual(server["args"], ["--port", "8080"])
+        self.assertEqual(server["env"]["FETCH_TOKEN"], "")
 
     @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
     def test_upload_scrubs_ms_agent_settings_json_secrets(self):
@@ -1489,6 +1767,94 @@ class TestUploadSanitization(unittest.TestCase):
         self.assertNotIn("sk-LEAKME333", raw)
         self.assertNotIn("env-LEAKME444", raw)
 
+    # BUG-0909-01: skills/*, persona and memory files used to upload verbatim.
+    B64_PERSONA_KEY = base64.b64encode(b"sk-S28PersonaB64Leak1").decode()
+    SKILL_SENTINELS = (
+        "sk-SkillScriptLeak01",
+        "ghp_SkillPat7x9Qm2Rt4V",
+        "S32SkillEnvLeak0001",
+        "S33SkillUrlLeak0001",
+        "S34SkillDocLeak0001",
+        "sk-S26PersonaProse01",
+        "sk-S27PersonaBearer1",
+        B64_PERSONA_KEY,
+    )
+
+    def _skill_tree_files(self):
+        import json
+        return {
+            "SOUL.md": (
+                "# Persona\n\n"
+                "You are a helpful weather assistant.\n\n"
+                "调用 API 时使用 sk-S26PersonaProse01 作为密钥。\n\n"
+                "```bash\n"
+                'curl -H "Authorization: Bearer sk-S27PersonaBearer1" '
+                "https://api.example.com/v1\n"
+                "```\n\n"
+                f'    echo "{self.B64_PERSONA_KEY}" | base64 -d\n\n'
+                "Benign lines that must survive:\n\n"
+                "- Use `os.environ[\"DASHSCOPE_API_KEY\"]` to read the key.\n"
+                "- Pass `--api-key <YOUR_KEY>` on the command line.\n"),
+            "skills/weather/scripts/leak_point.py": (
+                '"""Fetch the forecast."""\n'
+                "import os\n\n"
+                'API_KEY = "sk-SkillScriptLeak01"\n'
+                'GITHUB_TOKEN = "ghp_SkillPat7x9Qm2Rt4V"\n\n\n'
+                "def fetch(city):\n"
+                '    return city, os.environ.get("OPENWEATHER_KEY", "")\n'),
+            "skills/weather/mcp.json": json.dumps({
+                "mcpServers": {
+                    "weather": {
+                        "command": "uvx",
+                        "args": ["-y", "mcp-server-weather"],
+                        "env": {"OPENWEATHER_KEY": "S32SkillEnvLeak0001"},
+                        "url": ("https://api.example.com/v1"
+                                "?api_key=S33SkillUrlLeak0001"),
+                    }
+                }
+            }),
+            "skills/weather/SKILL.md": (
+                "---\nname: weather\n---\n\n"
+                "```json\n"
+                '{"mcpServers": {"weather": '
+                '{"env": {"OPENWEATHER_KEY": "S34SkillDocLeak0001"}}}}\n'
+                "```\n\n"
+                "```bash\n"
+                'curl -H "Authorization: Bearer $OPENAI_API_KEY" https://h/v1\n'
+                "```\n"),
+        }
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _StubClient)
+    def test_upload_scrubs_skill_tree_and_persona(self):
+        root = self._write_ws("ms-agent", self._skill_tree_files())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_upload(
+                framework="ms-agent", name=None, local_dir=str(root),
+                endpoint="http://s", token="tok", username="u",
+            )
+        self.assertEqual(rc, 0)
+        client = _StubClient.instances[0]
+        # Guard against a vacuous pass: the skill tree really was collected.
+        self.assertIn("skills/weather/scripts/leak_point.py",
+                      client.uploaded_resources)
+        self.assertIn("skills/weather/mcp.json", client.uploaded_resources)
+        blob = "\n".join(v.decode("utf-8", "replace")
+                         for v in client.uploaded_resources.values())
+        for sentinel in self.SKILL_SENTINELS:
+            self.assertNotIn(sentinel, blob)
+        self.assertIn('os.environ.get("OPENWEATHER_KEY", "")', blob)
+        self.assertIn('os.environ["DASHSCOPE_API_KEY"]', blob)
+        self.assertIn("--api-key <YOUR_KEY>", blob)
+        self.assertIn("Bearer $OPENAI_API_KEY", blob)
+        self.assertIn("You are a helpful weather assistant.", blob)
+        # The report names what was stripped without echoing the secret.
+        report = buf.getvalue()
+        self.assertIn("Secrets redacted", report)
+        self.assertIn("skills/weather/scripts/leak_point.py", report)
+        for sentinel in self.SKILL_SENTINELS:
+            self.assertNotIn(sentinel, report)
+
 
 class _OpenclawStub(_RepoStub):
     """Serves an openclaw single sub-agent repo (bare paths)."""
@@ -1512,11 +1878,11 @@ class _HermesStub(_RepoStub):
 
 
 class _MsAgentStub(_RepoStub):
-    """Serves an ms-agent single-agent repo (lowercase profile.md persona)."""
+    """Serves an ms-agent single-agent repo (SOUL.md / PROFILE.md prompt files)."""
 
     FRAMEWORK = "ms-agent"
-    STORE = {"profile.md": "# Profile\nms persona\n",
-             "MEMORY.md": "# Memory\nms memory\n"}
+    STORE = {"SOUL.md": "# Soul\nms persona\n",
+             "PROFILE.md": "# Profile\nms profile\n"}
 
     def __init__(self, *args, **kwargs):
         pass
@@ -1561,8 +1927,56 @@ class TestFrameworkDownloadCoverage(unittest.TestCase):
             endpoint="http://s", token="tok", username="u",
         )
         self.assertEqual(rc, 0)
-        self.assertEqual((self.out / "profile.md").read_text(), "# Profile\nms persona\n")
-        self.assertEqual((self.out / "MEMORY.md").read_text(), "# Memory\nms memory\n")
+        self.assertEqual((self.out / "SOUL.md").read_text(), "# Soul\nms persona\n")
+        self.assertEqual((self.out / "PROFILE.md").read_text(), "# Profile\nms profile\n")
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _MsAgentStub)
+    def test_download_backs_up_existing_files(self):
+        """Download overwrites in place, so it must leave a restore point first
+        -- the same safety net convert / restore / watch --pull provide. The
+        backup zip has to hold the PRE-download content, and be named with the
+        shared ``{fw}_{name}_...`` convention so ``backups -f <fw>`` finds it.
+        """
+        import zipfile
+        from ms_agent.agent_hub._cache import cache_dir
+        self.out.mkdir(parents=True)
+        (self.out / "SOUL.md").write_text("# Soul\nLOCAL-EDIT-KEEPME\n")
+        before = set(cache_dir().glob("ms-agent_*.zip"))
+
+        rc = cmd_download(
+            framework="ms-agent", repo="msa", local_dir=str(self.out),
+            endpoint="http://s", token="tok", username="u",
+        )
+        self.assertEqual(rc, 0)
+        # Remote content won.
+        self.assertEqual(
+            (self.out / "SOUL.md").read_text(), "# Soul\nms persona\n")
+        # ...but the overwritten local edit is recoverable from the new backup.
+        new_zips = set(cache_dir().glob("ms-agent_*.zip")) - before
+        self.assertTrue(new_zips, "download created no backup zip")
+        zip_path = new_zips.pop()
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                saved = zf.read("SOUL.md").decode("utf-8")
+            self.assertIn("LOCAL-EDIT-KEEPME", saved)
+        finally:
+            zip_path.unlink(missing_ok=True)
+
+    @mock.patch("ms_agent.agent_hub._commands.AgentApi", _MsAgentStub)
+    def test_download_into_empty_dir_skips_backup(self):
+        """Nothing on disk means nothing to lose: a first-time download must not
+        litter the cache with an empty restore point.
+        """
+        from ms_agent.agent_hub._cache import cache_dir
+        before = set(cache_dir().glob("ms-agent_*.zip"))
+        rc = cmd_download(
+            framework="ms-agent", repo="msa", local_dir=str(self.out),
+            endpoint="http://s", token="tok", username="u",
+        )
+        self.assertEqual(rc, 0)
+        self.assertFalse(
+            set(cache_dir().glob("ms-agent_*.zip")) - before,
+            "backup created for an empty workspace")
 
 
 # ---------------------------------------------------------------------------

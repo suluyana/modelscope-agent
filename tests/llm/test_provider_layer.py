@@ -38,6 +38,22 @@ class TestProviderRegistry(unittest.TestCase):
         self.assertTrue(EXPECTED_PROVIDERS.issubset(names))
 
     @unittest.skipUnless(test_level() >= 0, 'skip test in current test level')
+    def test_modelscope_is_first_builtin(self):
+        providers = get_registry().list_providers()
+        self.assertTrue(providers)
+        self.assertEqual('modelscope', providers[0].name)
+
+    @unittest.skipUnless(test_level() >= 0, 'skip test in current test level')
+    def test_builtin_display_names_match_product_copy(self):
+        display_names = {
+            provider.name: provider.display_name
+            for provider in get_registry().list_providers()
+        }
+        self.assertEqual('Kimi (Moonshot AI)', display_names['kimi'])
+        self.assertEqual('Alibaba (DashScope)',
+                         display_names['dashscope'])
+
+    @unittest.skipUnless(test_level() >= 0, 'skip test in current test level')
     def test_get_is_case_insensitive(self):
         self.assertEqual('openai', get_registry().get('OpenAI').name)
 
@@ -144,6 +160,44 @@ class TestFromConfigRouting(unittest.TestCase):
             self._make(service='modelscope', model='m',
                        use_provider_router=True, modelscope_api_key='x'))
         self.assertIsInstance(obj, LLMProvider)
+
+
+class TestCustomServiceRouting(unittest.TestCase):
+    """A configured-but-unknown service names a custom provider: it must not be
+    re-resolved to a built-in spec via the model name, or its credentials and
+    endpoint (stored under ``<service>_*``) would be looked up under the wrong
+    provider name."""
+
+    @unittest.skipUnless(test_level() >= 0, 'skip test in current test level')
+    def test_custom_service_keeps_its_name_and_endpoint(self):
+        from ms_agent.llm.router import ProviderRouter
+        config = OmegaConf.create({
+            'llm': {
+                'service': 'ms-test',
+                # Vendor keyword in the model name must not hijack the spec.
+                'model': 'deepseek-v4-flash',
+                'ms-test_api_key': 'sk-custom',
+                'ms-test_base_url': 'https://gateway.invalid/compatible-mode/v1',
+            }
+        })
+        provider = ProviderRouter().create(config)
+        self.assertEqual('ms-test', provider.spec.name)
+        self.assertEqual(
+            'sk-custom',
+            CredentialResolver.resolve_api_key(provider.spec, config))
+        self.assertEqual(
+            'https://gateway.invalid/compatible-mode/v1',
+            CredentialResolver.resolve_base_url(provider.spec, config))
+
+    @unittest.skipUnless(test_level() >= 0, 'skip test in current test level')
+    def test_model_inference_still_applies_without_service(self):
+        from ms_agent.llm.router import ProviderRouter
+        config = OmegaConf.create(
+            {'llm': {
+                'model': 'deepseek-v4-flash',
+                'deepseek_api_key': 'sk-x'
+            }})
+        self.assertEqual('deepseek', ProviderRouter().create(config).spec.name)
 
 
 class TestCredentialResolver(unittest.TestCase):

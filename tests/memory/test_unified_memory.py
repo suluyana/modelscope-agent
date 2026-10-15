@@ -322,6 +322,31 @@ class TestResumeMessageRoundTrip:
         assert msgs[1].tool_call_id == "call_1"
         assert msgs[1].name == "search"
 
+    def test_memory_orchestrator_round_trip_preserves_tool_fields(self):
+        """The unified-memory round-trip runs on EVERY turn, in-memory, before
+        the LLM call — so a field dropped there is dropped from the live
+        request. This previously regressed independently of the assembler
+        (the test above imported the assembler's copy and never covered it),
+        and OpenAI-compatible providers answered with
+        ``missing field 'tool_call_id'``.
+        """
+        from ms_agent.memory.unified.orchestrator import (_dicts_to_messages,
+                                                          _messages_to_dicts)
+        from ms_agent.llm.utils import Message
+
+        msgs = [
+            Message(role="assistant", content="",
+                    tool_calls=[{"id": "call_1", "type": "function"}]),
+            Message(role="tool", content="result",
+                    tool_call_id="call_1", name="search"),
+        ]
+        out = _dicts_to_messages(_messages_to_dicts(msgs))
+        assert out[1].tool_call_id == "call_1"
+        assert out[1].name == "search"
+        # And it must actually reach the wire: to_dict_clean() drops falsy
+        # values, so a lost id disappears from the payload entirely.
+        assert out[1].to_dict_clean()["tool_call_id"] == "call_1"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 2. ViewStrategies
@@ -1601,6 +1626,107 @@ class TestMem0BackendInternals:
         lines = [l for l in formatted.split("\n") if l.strip()]
         assert len(lines) == 10
 
+    def test_format_results_stamps_the_day(self):
+        # mem0 2.x only ever ADDs, so contradicting memories coexist; the date
+        # is the only thing the model can prefer the newer one by.
+        results = [
+            {"memory": "Answers in Chinese", "updated_at": "2026-08-01T10:00:00Z"},
+            {"memory": "Answers in English", "created_at": "2026-08-11T09:00:00Z"},
+        ]
+        formatted = Mem0Backend._format_results(results)
+        assert "- (2026-08-01) Answers in Chinese" in formatted
+        assert "- (2026-08-11) Answers in English" in formatted
+
+    def test_format_results_omits_unusable_timestamp(self):
+        formatted = Mem0Backend._format_results(
+            [{"memory": "Uses ruff", "updated_at": "n/a"}]
+        )
+        assert formatted == "- Uses ruff"
+
+    def _capture_mem0_config(self, monkeypatch):
+        """Run start() against a stand-in mem0 and return the config it got."""
+        import sys
+        import types
+
+        captured = {}
+
+        class FakeMemory:
+
+            @staticmethod
+            def from_config(cfg):
+                captured["cfg"] = cfg
+                return object()
+
+        module = types.ModuleType("mem0")
+        module.Memory = FakeMemory
+        monkeypatch.setitem(sys.modules, "mem0", module)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.backend.start())
+        finally:
+            loop.close()
+        return captured["cfg"]
+
+    def test_language_instructions_are_configured_by_default(self, monkeypatch):
+        """Memories are stored in the user's own language, because that is what
+        the store is later QUERIED in: a differently-worded memory has to
+        survive a cross-lingual embedding hop, and mem0's BM25 leg contributes
+        nothing across languages."""
+        from ms_agent.memory.unified.backends.mem0_adapter import (
+            DEFAULT_CUSTOM_INSTRUCTIONS,
+        )
+
+        cfg = self._capture_mem0_config(monkeypatch)
+        assert cfg["custom_instructions"] == DEFAULT_CUSTOM_INSTRUCTIONS
+
+    def test_configured_instructions_win(self, monkeypatch):
+        self.backend._config.backend_options["mem0"] = {
+            "custom_instructions": "mine"
+        }
+        assert self._capture_mem0_config(monkeypatch)["custom_instructions"] == "mine"
+
+    def test_mem0_appends_instructions_instead_of_replacing_its_prompt(self):
+        """The contract our default relies on. mem0 1.x's
+        `custom_fact_extraction_prompt` REPLACED the extraction prompt (losing
+        every built-in guideline); 2.x's `custom_instructions` is an extra
+        section. If that ever flips back, this fails instead of quietly
+        degrading extraction quality."""
+        prompts = pytest.importorskip("mem0.configs.prompts")
+        from ms_agent.memory.unified.backends.mem0_adapter import (
+            DEFAULT_CUSTOM_INSTRUCTIONS,
+        )
+
+        built = prompts.generate_additive_extraction_prompt(
+            existing_memories=[],
+            new_messages=[{"role": "user", "content": "hi"}],
+            custom_instructions=DEFAULT_CUSTOM_INSTRUCTIONS,
+        )
+        for section in ("## Summary", "## Last k Messages",
+                        "## Recently Extracted Memories",
+                        "## Existing Memories", "## New Messages",
+                        "## Observation Date", "## Current Date"):
+            assert section in built, f"built-in section {section} disappeared"
+        assert DEFAULT_CUSTOM_INSTRUCTIONS in built
+        # ...and the system prompt is mem0's own, untouched by us.
+        assert "Memory Extractor" in prompts.ADDITIVE_EXTRACTION_PROMPT
+
+    def test_search_passes_limit_through(self):
+        # Dropping `limit` here silently capped every caller at mem0's default.
+        seen = {}
+
+        class FakeMem0:
+            def search(self, query, filters=None, top_k=None, **kwargs):
+                seen["top_k"] = top_k
+                return {"results": [{"id": "1", "memory": "x"}]}
+
+        self.backend._mem0 = FakeMem0()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.backend.search("q", limit=3))
+        finally:
+            loop.close()
+        assert seen["top_k"] == 3
+
     def test_inject_without_mem0_passthrough(self):
         loop = asyncio.new_event_loop()
         try:
@@ -1611,9 +1737,18 @@ class TestMem0BackendInternals:
             loop.close()
 
     def test_start_without_mem0_package(self):
+        # Simulate the absence for real: `sys.modules['mem0'] = None` makes
+        # `from mem0 import Memory` raise ImportError regardless of what is
+        # installed. Without this the test only passed by luck — on a machine
+        # WITH mem0, the outcome depended on whether `Memory.from_config`
+        # happened to find working credentials that earlier LLM-backed tests
+        # had exported into os.environ, which made it order-flaky.
+        import sys
+        from unittest.mock import patch
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(self.backend.start())
+            with patch.dict(sys.modules, {'mem0': None}):
+                loop.run_until_complete(self.backend.start())
             assert self.backend._mem0 is None
         finally:
             loop.close()
@@ -1636,11 +1771,13 @@ class TestMem0BackendInternals:
             loop.close()
 
     def test_invalidate(self):
-        self.backend._snapshot = "cached"
-        self.backend._snapshot_dirty = False
+        # invalidate() must drop the per-turn retrieval cache so the next
+        # inject re-queries (an external edit changed what search should see).
+        self.backend._turn_cache_key = "user\x1fquery"
+        self.backend._turn_cache_results = [{"memory": "cached"}]
         self.backend.invalidate()
-        assert self.backend._snapshot is None
-        assert self.backend._snapshot_dirty is True
+        assert self.backend._turn_cache_key is None
+        assert self.backend._turn_cache_results is None
 
     def test_close_safe(self):
         loop = asyncio.new_event_loop()
@@ -1731,3 +1868,40 @@ class TestEndToEnd:
             assert len(log.get_all_messages()) == 4
         finally:
             loop.close()
+
+
+class TestSessionLogErrorDedup:
+    """record_error is idempotent per (round, message).
+
+    A wedged turn used to append one identical record per retry/replay attempt
+    (observed: five copies of the same 400, all round 15), making replay
+    unreadable. Callers that omit ``round`` opt out of dedup on purpose — they
+    have no round identity to key on.
+    """
+
+    def setup_method(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+
+    def test_same_round_same_message_recorded_once(self):
+        log = SessionLog(self.tmpdir, session_key="err_dedup")
+        for _ in range(5):
+            log.record_error({
+                "message": "APIError: <400> boom",
+                "recoverable": False,
+                "round": 15,
+            })
+        assert len(log.get_errors()) == 1
+
+    def test_round_and_message_changes_are_kept(self):
+        log = SessionLog(self.tmpdir, session_key="err_kept")
+        log.record_error({"message": "APIError: boom", "round": 15})
+        log.record_error({"message": "APIError: boom", "round": 16})
+        log.record_error({"message": "different failure", "round": 15})
+        assert len(log.get_errors()) == 3
+
+    def test_callers_without_a_round_opt_out_of_dedup(self):
+        log = SessionLog(self.tmpdir, session_key="err_optout")
+        log.record_error({"message": "no round identity"})
+        log.record_error({"message": "no round identity"})
+        assert len(log.get_errors()) == 2

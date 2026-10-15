@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ms_agent.utils.atomic_file import atomic_write_json
+
 
 class SessionLog:
     """Append-only JSONL session log — the source of truth for message history."""
@@ -60,6 +62,12 @@ class SessionLog:
         self._seq: int = 0
 
         self._ensure_metadata()
+
+    @property
+    def directory(self) -> Path:
+        """The session directory — where per-session sidecar files
+        (plan.json, skill_surface.json, prompt_surface.json, ...) live."""
+        return self._dir
 
     # ------------------------------------------------------------------
     # Write path (append-only)
@@ -103,12 +111,25 @@ class SessionLog:
         turn-level / API errors that must NOT go back to the model (tool-call
         errors stay as ordinary ``role="tool"`` messages instead).  ``event``
         typically carries ``message``, ``error_type``, ``recoverable``, ``round``.
+
+        Idempotent per (round, message): a round that is retried or replayed
+        must not stack identical records. A wedged turn used to append one per
+        attempt, growing a log of dozens of copies of the same failure and
+        making replay unreadable. Dedup needs a ``round`` to key on; without one
+        every call is recorded (callers that omit it are opting out).
         """
+        rnd = event.get('round')
+        if rnd is not None:
+            message = event.get('message')
+            for prior in self.get_errors():
+                if (prior.get('round') == rnd
+                        and prior.get('message') == message):
+                    return
         seq = self._next_seq()
         record = {
-            "_type": "error",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'error',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -126,9 +147,9 @@ class SessionLog:
         """
         seq = self._next_seq()
         record = {
-            "_type": "loop_end",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'loop_end',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -144,9 +165,9 @@ class SessionLog:
         """
         seq = self._next_seq()
         record = {
-            "_type": "permission",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'permission',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -162,9 +183,9 @@ class SessionLog:
         """
         seq = self._next_seq()
         record = {
-            "_type": "skill_invocation",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'skill_invocation',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -179,9 +200,9 @@ class SessionLog:
         """
         seq = self._next_seq()
         record = {
-            "_type": "team_reply",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'team_reply',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -195,9 +216,9 @@ class SessionLog:
         """
         seq = self._next_seq()
         record = {
-            "_type": "team_receipt",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'team_receipt',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -211,10 +232,10 @@ class SessionLog:
         """
         seq = self._next_seq()
         record = {
-            "_type": "team_user",
-            "role": "user",
-            "seq": seq,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            '_type': 'team_user',
+            'role': 'user',
+            'seq': seq,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             **event,
         }
         self._append_line(record)
@@ -230,6 +251,24 @@ class SessionLog:
     @last_consolidated.setter
     def last_consolidated(self, value: int) -> None:
         self._update_meta('last_consolidated', value)
+
+    @property
+    def active_model(self) -> str:
+        """The model that answered the most recent turn, or ''.
+
+        Kept so the next turn can tell whether it is running on a DIFFERENT
+        model — a fact the conversation otherwise contains no trace of, and one
+        the model badly needs. Measured without it: after a switch from a
+        vision model to a text-only one, the model concluded that its own
+        earlier (correct) description of an image had been a hallucination,
+        because the only new information it had was that the image was now
+        absent.
+        """
+        return str(self._read_meta().get('active_model', '') or '')
+
+    @active_model.setter
+    def active_model(self, value: str) -> None:
+        self._update_meta('active_model', str(value or ''))
 
     @property
     def round(self) -> int:
@@ -248,16 +287,39 @@ class SessionLog:
         records = self._read_jsonl_records()
         skip_user = self._legacy_team_user_seqs(records)
         for record in records:
-            if record.get("_type") in (
-                    "metadata", "compaction_event", "error", "permission",
-                    "skill_invocation", "loop_end", "team_reply",
-                    "team_receipt", "team_user"):
+            if record.get('_type') == 'image_delivery':
+                # Not a message — a note about one. Fold it onto the turn
+                # row so readers see an ordinary attachment field.
+                _merge_image_delivery(msgs, record)
                 continue
-            if record.get("seq") in skip_user:
+            if record.get('_type') in ('metadata', 'compaction_event', 'error',
+                                       'permission', 'skill_invocation',
+                                       'loop_end', 'team_reply',
+                                       'team_receipt', 'team_user'):
+                continue
+            if record.get('seq') in skip_user:
                 continue
             msgs.append(record)
         self._messages = msgs
         return msgs
+
+    def record_image_delivery(self, entries: List[Dict[str, Any]]) -> None:
+        """Record what became of a turn's images.
+
+        Written once per turn, after the request has been answered, because
+        that is the earliest moment the answer is known. Kept out of the message
+        stream (it is not something anyone said) and folded back onto the
+        attachment by :meth:`get_all_messages`.
+        """
+        if not entries:
+            return
+        self._append_line({
+            '_type': 'image_delivery',
+            'seq': self._next_seq(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'entries': entries,
+        })
+        self._messages = None  # force a reload so the merge is applied
 
     def get_visible_messages(self) -> List[Dict[str, Any]]:
         """Messages whose ``seq >= last_consolidated`` (the LLM window).
@@ -299,7 +361,7 @@ class SessionLog:
         errors: List[Dict[str, Any]] = []
         if not self._path.exists():
             return errors
-        for line in self._path.read_text(encoding="utf-8").splitlines():
+        for line in self._path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -307,7 +369,7 @@ class SessionLog:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("_type") == "error":
+            if record.get('_type') == 'error':
                 errors.append(record)
         return errors
 
@@ -319,7 +381,7 @@ class SessionLog:
         perms: List[Dict[str, Any]] = []
         if not self._path.exists():
             return perms
-        for line in self._path.read_text(encoding="utf-8").splitlines():
+        for line in self._path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -327,7 +389,7 @@ class SessionLog:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("_type") == "permission":
+            if record.get('_type') == 'permission':
                 perms.append(record)
         return perms
 
@@ -340,7 +402,7 @@ class SessionLog:
         out: List[Dict[str, Any]] = []
         if not self._path.exists():
             return out
-        for line in self._path.read_text(encoding="utf-8").splitlines():
+        for line in self._path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -348,7 +410,7 @@ class SessionLog:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("_type") == "loop_end":
+            if record.get('_type') == 'loop_end':
                 out.append(record)
         return out
 
@@ -361,7 +423,7 @@ class SessionLog:
         out: List[Dict[str, Any]] = []
         if not self._path.exists():
             return out
-        for line in self._path.read_text(encoding="utf-8").splitlines():
+        for line in self._path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -369,7 +431,7 @@ class SessionLog:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("_type") == "skill_invocation":
+            if record.get('_type') == 'skill_invocation':
                 out.append(record)
         return out
 
@@ -381,7 +443,7 @@ class SessionLog:
         out: List[Dict[str, Any]] = []
         if not self._path.exists():
             return out
-        for line in self._path.read_text(encoding="utf-8").splitlines():
+        for line in self._path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -389,7 +451,7 @@ class SessionLog:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("_type") == "team_reply":
+            if record.get('_type') == 'team_reply':
                 out.append(record)
         return out
 
@@ -401,7 +463,7 @@ class SessionLog:
         """
         out: List[Dict[str, Any]] = []
         for record in self._read_jsonl_records():
-            if record.get("_type") == "team_receipt":
+            if record.get('_type') == 'team_receipt':
                 out.append(record)
         return out
 
@@ -415,10 +477,10 @@ class SessionLog:
         legacy = self._legacy_team_user_seqs(records)
         out: List[Dict[str, Any]] = []
         for record in records:
-            if record.get("_type") == "team_user":
+            if record.get('_type') == 'team_user':
                 out.append(record)
-            elif record.get("seq") in legacy:
-                out.append({**record, "_type": "team_user"})
+            elif record.get('seq') in legacy:
+                out.append({**record, '_type': 'team_user'})
         return out
 
     def get_metadata(self) -> Dict[str, Any]:
@@ -542,9 +604,9 @@ class SessionLog:
             prev = by_seq.get(int(record.get('seq', 0)) - 1)
             if not prev or prev.get('role') != 'user':
                 continue
-            if prev.get('_type') in (
-                    'team_user', 'team_receipt', 'team_reply', 'error',
-                    'permission', 'skill_invocation', 'loop_end'):
+            if prev.get('_type') in ('team_user', 'team_receipt', 'team_reply',
+                                     'error', 'permission', 'skill_invocation',
+                                     'loop_end'):
                 continue
             skip.add(prev.get('seq'))
         return skip
@@ -588,12 +650,7 @@ class SessionLog:
 
     def _write_meta(self, meta: Dict[str, Any]) -> None:
         """Atomically persist the sidecar (write temp + os.replace)."""
-        tmp = self._meta_path.parent / (self._meta_path.name + '.tmp')
-        with open(tmp, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(meta, ensure_ascii=False, indent=2))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._meta_path)
+        atomic_write_json(self._meta_path, meta, fsync=True)
         self._metadata = meta
 
     def _read_legacy_header(self) -> Optional[Dict[str, Any]]:
@@ -617,3 +674,42 @@ class SessionLog:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
             f.flush()
             os.fsync(f.fileno())
+
+
+def _merge_image_delivery(msgs: List[Dict[str, Any]],
+                          record: Dict[str, Any]) -> None:
+    """Fold an ``image_delivery`` record back onto the turn it describes.
+
+    Matches by workspace path against the most recent user row that carries
+    attachments. A path that no longer appears (an edited or compacted history)
+    is dropped: an outcome with nothing to attach to is not worth inventing a
+    home for.
+
+    ``delivered`` is terminal — a later record cannot downgrade it. The field
+    answers "has the model ever received this picture", and a model that has
+    seen something does not stop having seen it because a later turn ran on a
+    different model.
+    """
+    entries = record.get('entries') or []
+    if not entries:
+        return
+    by_path = {
+        str(e.get('path') or ''): str(e.get('state') or '')
+        for e in entries if isinstance(e, dict)
+    }
+    for row in reversed(msgs):
+        attachments = row.get('attachments') if isinstance(row, dict) else None
+        if not attachments:
+            continue
+        touched = False
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if attachment.get('delivery') == 'delivered':
+                continue  # once the model has seen it, nothing un-sees it
+            state = by_path.get(str(attachment.get('path') or ''))
+            if state:
+                attachment['delivery'] = state
+                touched = True
+        if touched:
+            return

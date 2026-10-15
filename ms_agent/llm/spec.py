@@ -52,6 +52,16 @@ class ProviderSpec:
     strip_reasoning_tags: bool = False
     # Generation-config defaults merged under the user's config.
     default_generation_config: Dict = field(default_factory=dict)
+    # Long-edge ceiling this endpoint accepts for inline images, when it is
+    # known to be HIGHER than the safe default (multimodal.VisionOptions.
+    # max_edge = 2048, the value every measured endpoint accepts).
+    #
+    # This table may only ever WIDEN the limit. That asymmetry is deliberate:
+    # a missing or stale entry costs a little resolution, while a table that
+    # could narrow it would turn "we forgot to update a provider" into failed
+    # requests — which is exactly the outage this whole area is recovering
+    # from. 0 means "use the default".
+    max_image_edge: int = 0
 
 
 class ProviderRegistry:
@@ -106,7 +116,20 @@ class ProviderRegistry:
         reasoning_caps = ProviderCapabilities.from_list(
             ['tool_call', 'streaming', 'reasoning', 'continue_gen'])
 
+        # This order is user-visible: the WebUI preserves registry order for
+        # both the provider rail and provider selectors. Keep ModelScope first
+        # as the product's preferred built-in provider.
         builtins = [
+            ProviderSpec(
+                name='modelscope',
+                display_name='ModelScope',
+                transport=TRANSPORT_OPENAI_COMPAT,
+                api_key_env=['MODELSCOPE_API_KEY'],
+                default_base_url='https://api-inference.modelscope.cn/v1',
+                base_url_env=['MODELSCOPE_BASE_URL'],
+                keywords=['qwen'],
+                capabilities=openai_cache_caps,
+            ),
             ProviderSpec(
                 name='openai',
                 display_name='OpenAI',
@@ -126,6 +149,11 @@ class ProviderRegistry:
                 base_url_env=['ANTHROPIC_BASE_URL'],
                 keywords=['claude-'],
                 capabilities=anthropic_caps,
+                # Anthropic DOWNSAMPLES oversized images instead of rejecting
+                # them, and Claude 4.7+ has a 2576 px high-resolution tier.
+                # Capping at the shared 2048 default would throw that tier's
+                # resolution away for nothing.
+                max_image_edge=2576,
             ),
             ProviderSpec(
                 name='google',
@@ -137,16 +165,6 @@ class ProviderRegistry:
                 base_url_env=['GOOGLE_BASE_URL'],
                 keywords=['gemini-', 'gemma-'],
                 capabilities=openai_caps,
-            ),
-            ProviderSpec(
-                name='modelscope',
-                display_name='ModelScope',
-                transport=TRANSPORT_OPENAI_COMPAT,
-                api_key_env=['MODELSCOPE_API_KEY'],
-                default_base_url='https://api-inference.modelscope.cn/v1',
-                base_url_env=['MODELSCOPE_BASE_URL'],
-                keywords=['qwen'],
-                capabilities=openai_cache_caps,
             ),
             ProviderSpec(
                 name='zhipu',
@@ -163,7 +181,7 @@ class ProviderRegistry:
             ),
             ProviderSpec(
                 name='kimi',
-                display_name='Moonshot Kimi',
+                display_name='Kimi (Moonshot AI)',
                 transport=TRANSPORT_OPENAI_COMPAT,
                 api_key_env=['KIMI_API_KEY', 'MOONSHOT_API_KEY'],
                 default_base_url='https://api.moonshot.cn/v1',
@@ -189,7 +207,7 @@ class ProviderRegistry:
             ),
             ProviderSpec(
                 name='dashscope',
-                display_name='Alibaba DashScope',
+                display_name='Alibaba (DashScope)',
                 transport=TRANSPORT_OPENAI_COMPAT,
                 api_key_env=['DASHSCOPE_API_KEY'],
                 default_base_url=

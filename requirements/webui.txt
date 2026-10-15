@@ -1,4 +1,13 @@
-aiohttp
-fastapi
-pandas
-uvicorn[standard]
+anthropic>=0.117.0
+beautifulsoup4
+exa-py>=2.16.0
+fastapi>=0.139.0
+httpx>=0.28.1
+lxml
+markdown>=3.10
+mem0ai>=2.0.12
+pydantic-settings>=2.14.2
+socksio>=1.0.0
+sse-starlette>=3.4.5
+uvicorn[standard]>=0.50.2
+watchfiles>=1.2.0
