@@ -645,7 +645,7 @@
     "openRail": "打开 Worker 轨",
     "workerRails": "Worker 轨",
     "noWorkerRails": "派工开始后，这里会留下 Lead / 每位 Worker 的子流，结束后也不会收走。",
-    "fleetSettings": "舰队与连接",
+    "fleetSettings": "连接我的本地agent",
     "resultOriginal": "原文",
     "askLead": "请 Lead 处理",
     "askLeadHint": "把这个问题交给 Lead 补全任务，不经过你中转。",

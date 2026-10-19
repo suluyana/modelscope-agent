@@ -645,7 +645,7 @@
     "openRail": "Open worker rail",
     "workerRails": "Worker rails",
     "noWorkerRails": "After dispatch starts, Lead and each worker keep a rail here — they stay after the run ends.",
-    "fleetSettings": "Fleet & connect",
+    "fleetSettings": "Connect my local agent",
     "resultOriginal": "Original",
     "askLead": "Ask Lead",
     "askLeadHint": "Hand this question to Lead to patch the task.",

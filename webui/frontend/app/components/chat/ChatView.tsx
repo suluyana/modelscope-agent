@@ -1,5 +1,5 @@
 import { Button } from 'antd'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router'
 import { ChatBackdrop } from '~/components/chat/ChatBackdrop'
 import { ChatPanel } from '~/components/chat/ChatPanel'
@@ -48,6 +48,8 @@ interface Props {
   /** Whether a turn is in flight for this session (background-continued):
    * triggers an immediate live re-attach on mount. */
   initialRunning?: boolean
+  /** Extra control in the top-right of the chat column (e.g. team connect). */
+  headerExtra?: ReactNode
 }
 
 export function ChatView({
@@ -60,7 +62,8 @@ export function ChatView({
   initialMessages,
   initialPlan,
   initialArtifacts,
-  initialRunning
+  initialRunning,
+  headerExtra
 }: Props) {
   const { t } = useT()
   const location = useLocation()
@@ -489,18 +492,23 @@ export function ChatView({
           }`}
         >
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-            {showWorkspace && !railOpen ? (
-              <Button
-                shape="round"
-                icon={<CollectionIcon className="h-5 w-5" />}
-                onClick={toggleRail}
-                className="absolute text-[13px] right-3 top-3 z-10 !rounded-full !border-msa-line-1 !bg-msa-bg-1 !text-msa-text-1 hover:!bg-msa-fill-2 shadow-none"
-                classNames={{
-                  icon: 'flex items-center justify-center leading-none'
-                }}
-              >
-                {t.session.workspaceTitle}
-              </Button>
+            {headerExtra || (showWorkspace && !railOpen) ? (
+              <div className="absolute right-3 top-3 z-10 flex items-center gap-2">
+                {headerExtra}
+                {showWorkspace && !railOpen ? (
+                  <Button
+                    shape="round"
+                    icon={<CollectionIcon className="h-5 w-5" />}
+                    onClick={toggleRail}
+                    className="text-[13px] !rounded-full !border-msa-line-1 !bg-msa-bg-1 !text-msa-text-1 hover:!bg-msa-fill-2 shadow-none"
+                    classNames={{
+                      icon: 'flex items-center justify-center leading-none'
+                    }}
+                  >
+                    {t.session.workspaceTitle}
+                  </Button>
+                ) : null}
+              </div>
             ) : null}
             {chatPanel}
           </div>
