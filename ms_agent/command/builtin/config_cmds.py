@@ -27,8 +27,7 @@ def _model_usage() -> str:
         '  /model list                    saved providers\n'
         '  /model list live [provider]    fetch chat model ids; preview only\n'
         '  /model <model>                 switch model, keep current provider\n'
-        '  /model <provider>/<model>      switch both; <provider> must be lowercase\n'
-        '  /model <provider> <model>      same; use when <model> contains /\n'
+        '  /model <provider> <model>      switch provider and model\n'
         '  /model provider add <provider> [key=] [url=] [protocol=openai|anthropic] [name=]\n'
         '                                 add a custom provider, or override a builtin\n'
         '  /model provider set <provider> [key=] [url=] [protocol=] [name=]\n'
@@ -45,7 +44,8 @@ def _model_usage() -> str:
         '                                 drop that pinned model id (drop is an alias)\n'
         '  /model catalog remove <model>  same, on the current provider\n'
         '<provider>  first column of /model list, e.g. dashscope\n'
-        '<model>     model id on that provider, e.g. qwen3.8-flash\n'
+        '<model>     model id on that provider. A "/" is part of the id,\n'
+        '             e.g. qwen3.8-flash or Qwen/Qwen3.8-Flash-Next\n'
         f'Saved in {ledger_file("settings.json")}.\n'
         'Example: /model dashscope qwen3.8-flash')
 
@@ -113,29 +113,29 @@ def _known_provider_ids() -> list[str]:
     return ids
 
 
-def _unknown_provider_prefix(arg: str) -> str | None:
-    """Lowercase ``provider/model`` head that is not a known provider.
-
-    ``MiniMax/MiniMax-M2.1`` stays a model id (the head is not lowercase).
-    ``dashcope/qwen-max`` looks like a provider typo and must not be saved
-    as the model name on the current provider.
-    """
+def _model_arg_parts(arg: str) -> list[str]:
+    import shlex
     text = (arg or '').strip()
-    if '/' not in text:
+    if not text:
+        return []
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def _unknown_provider_word(arg: str) -> str | None:
+    """First word of ``/model <provider> <model>`` when it is not a provider.
+
+    ``/model Qwen/Qwen3.8-Flash-Next`` is one model id. The slash is not a
+    separator, because many model ids contain one.
+    """
+    parts = _model_arg_parts(arg)
+    if len(parts) < 2:
         return None
-    head, rest = text.split('/', 1)
-    head, rest = head.strip(), rest.strip()
-    if not head or not rest or any(ch.isspace() for ch in head):
+    if _canonical_provider(parts[0]):
         return None
-    # A capitalized head is a model id when it case-folds to a real provider
-    # (MiniMax → minimax). A capitalized typo (Dashcope) does not.
-    if head != head.lower():
-        if _canonical_provider(head) is None:
-            return head
-        return None
-    if _canonical_provider(head):
-        return None
-    return head
+    return parts[0]
 
 
 def _canonical_provider(head: str) -> str | None:
@@ -155,34 +155,17 @@ def _canonical_provider(head: str) -> str | None:
 def _parse_model_arg(arg: str) -> tuple[str | None, str]:
     """Parse a switch argument into ``(provider or None, model)``.
 
-    Model ids from a gateway often contain ``/`` (``MiniMax/MiniMax-M2.1``)
-    and that prefix can collide with a builtin id (``minimax``). Rules:
-
-    * ``/model dashscope MiniMax/MiniMax-M2.1`` — space form; first token is
-      a known provider (any case).
-    * ``/model dashscope/MiniMax/MiniMax-M2.1`` — slash form; the provider
-      token must be a known id written in lowercase, matching how builtins
-      are registered. ``MiniMax/…`` therefore stays a model id.
-    * ``/model openai/gpt-4o`` — lowercase known id, model has no extra rule.
-    * anything else is a model id on the current provider.
+    * ``/model Qwen/Qwen3.8-Flash-Next`` — model id on the current provider.
+      A slash never selects the provider.
+    * ``/model dashscope Qwen/Qwen3.8-Flash-Next`` — first word is a known
+      provider, the rest is the model id.
     """
-    import shlex
     text = (arg or '').strip()
-    if not text:
-        return None, text
-    try:
-        parts = shlex.split(text)
-    except ValueError:
-        parts = text.split()
+    parts = _model_arg_parts(text)
     if len(parts) >= 2:
         canon = _canonical_provider(parts[0])
         if canon:
             return canon, text[len(parts[0]):].strip()
-    if '/' in text:
-        head, rest = text.split('/', 1)
-        head, rest = head.strip(), rest.strip()
-        if rest and head == head.lower() and _canonical_provider(head):
-            return _canonical_provider(head), rest
     return None, text
 
 
@@ -586,7 +569,7 @@ async def cmd_model(ctx: CommandContext) -> CommandResult:
 
 def _secret_model_error(ctx: CommandContext) -> CommandResult:
     return arg_error(
-        '/model <provider>/<model>',
+        '/model <model>',
         reason='That looks like an API key, not a model id',
         note='Set a key with /model provider key <provider> <key>',
         ctx=ctx,
@@ -713,11 +696,11 @@ def _finish_credential_write(ctx: CommandContext, pid: str, before: dict,
 
 
 def _cmd_model_switch(ctx: CommandContext, arg: str) -> CommandResult:
-    unknown = _unknown_provider_prefix(arg)
+    unknown = _unknown_provider_word(arg)
     if unknown:
         known = ', '.join(_known_provider_ids())
         return arg_error(
-            '/model <provider>/<model>',
+            '/model <provider> <model>',
             reason=f'No provider named {unknown}',
             note=f'Known: {known}'
             if known else 'Add one with /model provider add <provider>',
@@ -885,9 +868,12 @@ def _cmd_model_provider(ctx: CommandContext,
         if value.lower() in _CLEAR:
             mgr.patch_provider(pid, clear_api_key=True)
             note = _push_provider_to_runtime(ctx, pid)
+            from ms_agent.agent.llm_agent import reset_credential_notice
+            reset_credential_notice()
+            shown = _canonical_provider(pid) or pid
             return CommandResult(
                 type=CommandResultType.MESSAGE,
-                content=f'Cleared API key for {pid}.{note}',
+                content=f'已清除 {shown} 的密钥。{note}',
             )
         before = _provider_snapshot(pid)
         mgr.patch_provider(pid, api_key=value)

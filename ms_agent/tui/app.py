@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from omegaconf import OmegaConf
 from pathlib import Path
 from rich.console import Console
@@ -165,6 +166,7 @@ class TuiApp:
             self.theme,
             console=self.console,
             renderer=self.renderer)
+        self.input._sigint = self
         self.agent._input_source = self.input
 
         # Always inject the TUI handler — it is only *called* in interactive
@@ -184,6 +186,13 @@ class TuiApp:
         self._pending_switch: Optional[Tuple[str, Optional[str]]] = None
         # First chat collected while recovering from a missing API key.
         self._queued_query: Optional[str] = None
+        # Ctrl-C during a stream cancels this turn, not the whole TUI.
+        self._serve_task: Optional[asyncio.Task] = None
+        self._turn_task: Optional[asyncio.Task] = None
+        self._streaming = False
+        self._sigint_turn = False
+        self._sigint_exit = False
+        self._sigint_armed = False
         # Sessions this TUI process minted. Empty leftovers may be pruned;
         # WebUI (or another TUI) sessions must not.
         self._owned_session_ids: set[str] = set()
@@ -701,6 +710,72 @@ class TuiApp:
 
     # -- main loop (route A: one lifecycle per session) --
 
+    def _arm_turn_sigint(self) -> None:
+        """Ctrl-C cancels the running turn. A second one leaves the TUI.
+
+        prompt_toolkit replaces this handler while a line is being edited
+        and then removes it, so the prompt re-arms the handler on the way out.
+        An idle prompt (not streaming) ignores the signal.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(signal.SIGINT, self._on_turn_sigint)
+        except (NotImplementedError, RuntimeError, ValueError):
+            return
+        self._sigint_armed = True
+
+    def _disarm_turn_sigint(self) -> None:
+        if not getattr(self, '_sigint_armed', False):
+            return
+        try:
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+        self._sigint_armed = False
+
+    def _on_turn_sigint(self) -> None:
+        if not getattr(self, '_streaming', False):
+            return
+        turn = getattr(self, '_turn_task', None)
+        if turn is None or turn.done():
+            return
+        if getattr(self, '_sigint_turn', False):
+            self._sigint_exit = True
+            serve = getattr(self, '_serve_task', None)
+            if serve is not None and not serve.done():
+                serve.cancel()
+            return
+        self._sigint_turn = True
+        turn.cancel()
+
+    async def _run_one_turn(self, query):
+        """One session lifecycle. Ctrl-C resolves as ``'interrupted'``."""
+        self._streaming = True
+        try:
+            gen = await self.agent.run(query, stream=True)
+            if gen is None:
+                return None
+            async for _ in gen:
+                pass
+            return None
+        except KeyboardInterrupt:
+            return 'interrupted'
+        except asyncio.CancelledError:
+            if getattr(self, '_sigint_turn', False):
+                return 'interrupted'
+            raise
+
+    def _note_interrupted(self) -> None:
+        self.renderer.finalize()
+        self.console.print('[dim](interrupted — /quit to exit)[/]')
+        try:
+            self._sm.get_session_log(self.session).append({
+                'role': 'assistant',
+                'content': '(interrupted)',
+            })
+        except Exception:
+            pass
+
     async def _serve(self) -> None:
         self._banner()
         # Do not wipe empty sessions on startup: WebUI may have created a
@@ -710,83 +785,94 @@ class TuiApp:
         self._owned_session_ids.add(self.session.id)
         resume = False  # a fresh session reads a prompt; a resumed one restores
         self.renderer.rule(f'session {self.session.id}', 'green')
+        self._serve_task = asyncio.current_task()
+        self._sigint_turn = False
+        self._sigint_exit = False
+        self._streaming = False
+        self._arm_turn_sigint()
+        try:
+            await self._serve_loop(resume)
+        finally:
+            self._disarm_turn_sigint()
+        self.console.print('[dim]bye[/]')
+
+    async def _serve_loop(self, resume: bool) -> None:
         while True:
             self._pending_switch = None
             self._apply_session(self.session, resume=resume)
+            self._sigint_turn = False
+            query = self._queued_query
+            self._queued_query = None
+            self._turn_task = asyncio.create_task(self._run_one_turn(query))
             try:
-                query = self._queued_query
-                self._queued_query = None
-                gen = await self.agent.run(query, stream=True)
-                async for _ in gen:
-                    pass
-            except EOFError:
-                break  # Ctrl-D at the prompt exits
-            except asyncio.CancelledError:
-                task = asyncio.current_task()
-                quitting = bool(
-                    getattr(
-                        getattr(getattr(self, 'agent', None), 'runtime', None),
-                        'should_stop',
-                        False))
-                # A cancelled task (/quit teardown, or this task itself) leaves.
-                # Any other CancelledError stays in the session.
-                # Task.cancelling() exists on Python 3.11+.
-                cancelling = getattr(task, 'cancelling', None)
-                if callable(cancelling) and cancelling():
-                    raise
-                if quitting:
-                    break
-                self.renderer.finalize()
-                self.console.print(
-                    '[dim](turn failed — session still open, '
-                    '/model to switch, /quit to exit)[/]')
-                resume = True
-                continue
-            except KeyboardInterrupt:
-                # Ctrl-C interrupts the running turn but keeps the REPL alive.
-                # Cap the turn with an assistant marker so the resume below
-                # doesn't re-run the interrupted user prompt.
-                self.renderer.finalize()
-                self.console.print('[dim](interrupted — /quit to exit)[/]')
                 try:
-                    self._sm.get_session_log(self.session).append({
-                        'role':
-                        'assistant',
-                        'content':
-                        '(interrupted)'
-                    })
-                except Exception:
-                    pass
-                resume = True
-                continue
-            except Exception as e:  # noqa: BLE001 — surface, don't crash the REPL
-                # A leaked MCP cancel-scope error is teardown noise, not a
-                # request to leave. cleanup_tools already swallows it on
-                # /quit; if it still surfaces mid-turn, stay in the session.
-                self.renderer.finalize()
-                logger.warning('TUI turn error', exc_info=True)
-                # run_loop already emitted ErrorRaised; the renderer drew the
-                # panel. Reprinting it and then `break` looked like a crash
-                # (two identical errors, then "bye"). Keep the REPL so the
-                # user can /model switch or try again. resume=True restores
-                # the sealed failed turn instead of resending it.
-                from ms_agent.llm.model_discovery import (
-                    CHAT_UNSUPPORTED,
-                    MODEL_ID_REJECTED,
-                    chat_failed_because_unsupported,
-                    model_id_rejected,
-                )
-                model = self.state.model or ''
-                err = str(e)
-                if chat_failed_because_unsupported(model, err):
-                    self.console.print(CHAT_UNSUPPORTED)
-                if model_id_rejected(err):
-                    self.console.print(MODEL_ID_REJECTED)
-                self.console.print(
-                    '[dim](turn failed — session still open, '
-                    '/model to switch, /quit to exit)[/]')
-                resume = True
-                continue
+                    outcome = await self._turn_task
+                except EOFError:
+                    break  # Ctrl-D at the prompt exits
+                except asyncio.CancelledError:
+                    if getattr(self, '_sigint_exit', False):
+                        break
+                    task = asyncio.current_task()
+                    quitting = bool(
+                        getattr(
+                            getattr(
+                                getattr(self, 'agent', None), 'runtime',
+                                None),
+                            'should_stop',
+                            False))
+                    # A cancelled task (/quit teardown, or this task itself)
+                    # leaves. Any other CancelledError stays in the session.
+                    # Task.cancelling() exists on Python 3.11+.
+                    cancelling = getattr(task, 'cancelling', None)
+                    if callable(cancelling) and cancelling():
+                        raise
+                    if quitting:
+                        break
+                    self.renderer.finalize()
+                    self.console.print(
+                        '[dim](turn failed — session still open, '
+                        '/model to switch, /quit to exit)[/]')
+                    resume = True
+                    continue
+                except KeyboardInterrupt:
+                    # Ctrl-C interrupts the running turn but keeps the REPL.
+                    # Cap the turn so resume does not re-run the prompt.
+                    self._note_interrupted()
+                    resume = True
+                    continue
+                except Exception as e:  # noqa: BLE001 — stay in the REPL
+                    # A leaked MCP cancel-scope error is teardown noise, not a
+                    # request to leave. cleanup_tools already swallows it on
+                    # /quit; if it still surfaces mid-turn, stay in the session.
+                    self.renderer.finalize()
+                    logger.warning('TUI turn error', exc_info=True)
+                    # run_loop already emitted ErrorRaised; the renderer drew
+                    # the panel. Reprinting it and then leaving looked like a
+                    # crash. Keep the REPL so the user can /model or try again.
+                    from ms_agent.llm.model_discovery import (
+                        CHAT_UNSUPPORTED,
+                        MODEL_ID_REJECTED,
+                        chat_failed_because_unsupported,
+                        model_id_rejected,
+                    )
+                    model = self.state.model or ''
+                    err = str(e)
+                    if chat_failed_because_unsupported(model, err):
+                        self.console.print(CHAT_UNSUPPORTED)
+                    if model_id_rejected(err):
+                        self.console.print(MODEL_ID_REJECTED)
+                    self.console.print(
+                        '[dim](turn failed — session still open, '
+                        '/model to switch, /quit to exit)[/]')
+                    resume = True
+                    continue
+                if outcome == 'interrupted':
+                    self._note_interrupted()
+                    resume = True
+                    continue
+            finally:
+                self._turn_task = None
+                self._streaming = False
             self._name_session_from_log()
             # Resolve a resume target against the live list before pruning.
             switch = self._pending_switch
@@ -814,7 +900,6 @@ class TuiApp:
                     self.renderer.rule(f'resumed {resume_target.name}',
                                        'green')
                     self._render_history_tail(resume_target)
-        self.console.print('[dim]bye[/]')
 
     def run(self) -> None:
         self._quiet_logs()

@@ -187,18 +187,30 @@ class TestModel:
         assert 'Model:    MiniMax/MiniMax-M2.1' in result.content
 
     @pytest.mark.asyncio
-    async def test_known_provider_then_slashy_model(self, monkeypatch):
+    async def test_slash_does_not_select_a_provider(self, monkeypatch):
         runtime = MockRuntime()
         router = make_router()
-        _keyed('dashscope')
-        _catalog_ok(monkeypatch, ['MiniMax/MiniMax-M2.1'])
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['Qwen/Qwen3.8-Flash-Next'])
         result = await router.dispatch(
-            make_ctx(
-                '/model dashscope/MiniMax/MiniMax-M2.1', runtime=runtime))
-        assert runtime.llm.config.llm.service == 'dashscope'
-        assert runtime.llm.model == 'MiniMax/MiniMax-M2.1'
-        assert 'Provider: dashscope' in result.content
-        assert 'Switch:   /model dashscope MiniMax/MiniMax-M2.1' in result.content
+            make_ctx('/model Qwen/Qwen3.8-Flash-Next', runtime=runtime))
+        assert result.type == CommandResultType.MUTATE_STATE
+        assert runtime.llm.config.llm.service == 'openai'
+        assert runtime.llm.model == 'Qwen/Qwen3.8-Flash-Next'
+        assert 'No provider named' not in result.content
+
+    @pytest.mark.asyncio
+    async def test_provider_slash_model_is_not_a_provider_switch(
+            self, monkeypatch):
+        runtime = MockRuntime()
+        _keyed('openai')
+        _catalog_ok(monkeypatch, ['gpt-4o'])
+        result = await make_router().dispatch(
+            make_ctx('/model dashscope/qwen-max', runtime=runtime))
+        assert runtime.llm.config.llm.service == 'openai'
+        assert runtime.llm.model != 'qwen-max'
+        assert 'dashscope/qwen-max' in result.content
+        assert 'No provider named' not in result.content
 
     @pytest.mark.asyncio
     async def test_space_form_sets_provider_when_model_has_slash(
@@ -217,7 +229,7 @@ class TestModel:
         monkeypatch.delenv('MINIMAX_API_KEY', raising=False)
         runtime = MockRuntime()
         result = await make_router().dispatch(
-            make_ctx('/model minimax/MiniMax-M2.1', runtime=runtime))
+            make_ctx('/model minimax MiniMax-M2.1', runtime=runtime))
         assert result.type == CommandResultType.MESSAGE
         assert runtime.llm.config.llm.service == 'openai'
         assert runtime.llm.model == 'qwen3.7-plus'
@@ -265,7 +277,7 @@ class TestModel:
                 '/model provider add acme key=sk url=https://acme/v1 protocol=openai',
                 runtime=runtime))
         result = await router.dispatch(
-            make_ctx('/model minimax/MiniMax-M2.1', runtime=runtime))
+            make_ctx('/model minimax MiniMax-M2.1', runtime=runtime))
         assert 'Or switch to a keyed provider (acme):' in result.content
         assert '/model acme <model>' in result.content
         assert '{provider_id}' not in result.content
@@ -355,7 +367,7 @@ class TestModel:
         stub = SimpleNamespace(config=config, model='old', _setup_stub=True)
         runtime = MockRuntime(llm=stub)
         router = make_router()
-        ctx = make_ctx('/model dashscope/qwen3.8-flash', runtime=runtime)
+        ctx = make_ctx('/model dashscope qwen3.8-flash', runtime=runtime)
         _keyed('dashscope')
         _catalog_ok(monkeypatch, ['qwen3.8-flash'])
         result = await router.dispatch(ctx)
@@ -677,6 +689,7 @@ class TestModel:
         assert 'MiniMax' not in result.content
         assert '~/.ms_agent' not in result.content
         assert '<id>' not in result.content
+        assert '<provider>/<model>' not in result.content
 
     @pytest.mark.asyncio
     async def test_list_unknown_option_is_focused(self):
@@ -703,7 +716,7 @@ class TestModel:
     async def test_unknown_provider_prefix_is_rejected(self, tmp_path):
         runtime = MockRuntime()
         result = await make_router().dispatch(
-            make_ctx('/model dashcope/qwen-max', runtime=runtime))
+            make_ctx('/model dashcope qwen-max', runtime=runtime))
         assert result.type == CommandResultType.MESSAGE
         assert 'No provider named dashcope' in result.content
         assert 'Known:' in result.content
@@ -714,15 +727,16 @@ class TestModel:
             assert 'dashcope' not in settings.read_text()
 
     @pytest.mark.asyncio
-    async def test_capitalized_provider_typo_is_rejected(self, tmp_path):
+    async def test_provider_word_ignores_case(self, monkeypatch):
         runtime = MockRuntime()
+        _keyed('dashscope')
+        _catalog_ok(monkeypatch, ['qwen-max'])
         result = await make_router().dispatch(
-            make_ctx('/model Dashcope/qwen-max', runtime=runtime))
-        assert 'No provider named Dashcope' in result.content
-        assert runtime.llm.config.llm.model == 'qwen3.7-plus'
-        settings = tmp_path / 'ms_home' / 'settings.json'
-        if settings.exists():
-            assert 'Dashcope' not in settings.read_text()
+            make_ctx('/model DashScope qwen-max', runtime=runtime))
+        assert result.type == CommandResultType.MUTATE_STATE
+        assert runtime.llm.config.llm.service == 'dashscope'
+        assert runtime.llm.model == 'qwen-max'
+        assert 'No provider named' not in result.content
 
     @pytest.mark.asyncio
     async def test_runtime_only_key_still_checks_the_catalog(self, monkeypatch):
@@ -1185,11 +1199,27 @@ class TestModelProbe:
         result = await make_router().dispatch(
             make_ctx(
                 '/model provider key acme clear', runtime=MockRuntime()))
-        assert result.content.startswith('Cleared API key for acme.')
+        assert result.content.startswith('已清除 acme 的密钥。')
         assert '已生效' not in result.content
         assert 'Live credentials' not in result.content
         data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
         assert 'api_key' not in data['providers']['acme']
+
+    @pytest.mark.asyncio
+    async def test_clear_live_key_rearms_the_setup_notice(self, tmp_path):
+        import ms_agent.agent.llm_agent as mod
+        _keyed('openai')
+        mod._credential_notice_sent = True
+        try:
+            result = await make_router().dispatch(
+                make_ctx(
+                    '/model provider key openai clear', runtime=MockRuntime()))
+            assert result.content == '已清除 openai 的密钥。'
+            assert mod._credential_notice_sent is False
+        finally:
+            mod._credential_notice_sent = False
+        data = json.loads((tmp_path / 'ms_home' / 'settings.json').read_text())
+        assert 'api_key' not in data['providers']['openai']
 
     @pytest.mark.asyncio
     async def test_missing_id_does_not_change_the_default(self, monkeypatch):

@@ -3,6 +3,7 @@ from __future__ import annotations
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import base64
+import contextvars
 import copy
 import inspect
 import json
@@ -173,9 +174,11 @@ def _int_env(name: str, default: int) -> int:
 
 CONNECTION_TIMEOUT = _int_env('CONNECTION_TIMEOUT', 120)
 
-#: Per-server cap for the probe that runs before a turn. WebUI's health check
-#: uses the same 6 seconds (``mcp_health.filter_healthy``). A dead address must
-#: not sit on ``CONNECTION_TIMEOUT`` (120s) before the model is allowed to run.
+#: Cap for one remote MCP handshake. WebUI's health check uses the same 6
+#: seconds. A dead address must not sit on ``CONNECTION_TIMEOUT`` (120s).
+#: stdio does not use this as a death sentence: a local command keeps
+#: ``DEFAULT_SERVER_STARTUP_TIMEOUT`` in the background, and a turn only
+#: waits ``MCP_TURN_WAIT``.
 MCP_PROBE_TIMEOUT = 6
 
 #: How many servers may be started at once. Bounded because each stdio server
@@ -235,6 +238,37 @@ def stdio_child_env(config_env: Optional[dict]) -> dict:
     for key, value in (config_env or {}).items():
         env[str(key)] = str(value)
     return env
+
+
+# The stdio helper keeps the child private. This records it for the task
+# that is opening the server, so a later turn can read ``returncode``.
+_stdio_child: 'contextvars.ContextVar[list[Any] | None]' = (
+    contextvars.ContextVar('ms_agent_stdio_child', default=None))
+
+
+def _install_stdio_child_hook() -> None:
+    """Remember the process ``stdio_client`` just spawned.
+
+    The MCP helper does not return that process. Missing the private
+    function is safe: death is then noticed when the session itself drops.
+    """
+    try:
+        import mcp.client.stdio as stdio_mod
+    except ImportError:
+        return
+    current = getattr(stdio_mod, '_create_platform_compatible_process', None)
+    if current is None or getattr(current, '_ms_agent_stdio_hook', False):
+        return
+
+    async def hooked(*args, **kwargs):
+        process = await current(*args, **kwargs)
+        holder = _stdio_child.get()
+        if holder is not None:
+            holder.append(process)
+        return process
+
+    hooked._ms_agent_stdio_hook = True  # type: ignore[attr-defined]
+    stdio_mod._create_platform_compatible_process = hooked
 
 
 def resolve_stdio_command(command: str) -> str:
@@ -315,6 +349,9 @@ class MCPClient(ToolBase):
         # Every owner task, including ones already popped from ``_server_tasks``
         # while their teardown is still running.
         self._live_tasks: set['asyncio.Task'] = set()
+        # stdio children, so a later turn can see that the process exited
+        # while this session object is still registered.
+        self._stdio_children: Dict[str, Any] = {}
         self.exit_stack = AsyncExitStack()
         self.mcp_config: Dict[str, Dict[str, Any]] = {'mcpServers': {}}
         if config is not None:
@@ -507,6 +544,17 @@ class MCPClient(ToolBase):
     def is_connected(self, server_name: str) -> bool:
         return server_name in self.sessions
 
+    def stdio_process_exited(self, server_name: str) -> bool:
+        """Whether the stdio child has already exited.
+
+        The session can still be registered: the owner task is blocked
+        until something asks it to stop. ``returncode`` is the fact.
+        """
+        process = self._stdio_children.get(server_name)
+        if process is None:
+            return False
+        return getattr(process, 'returncode', None) is not None
+
     def _track_task(self, task: 'asyncio.Task') -> None:
         self._live_tasks.add(task)
         task.add_done_callback(self._live_tasks.discard)
@@ -651,8 +699,16 @@ class MCPClient(ToolBase):
                     'encoding_error_handler', DEFAULT_ENCODING_ERROR_HANDLER),
             )
 
-            stdio, write = await stack.enter_async_context(
-                stdio_client(server_params))
+            holder: list[Any] = []
+            token = _stdio_child.set(holder)
+            try:
+                _install_stdio_child_hook()
+                stdio, write = await stack.enter_async_context(
+                    stdio_client(server_params))
+            finally:
+                _stdio_child.reset(token)
+            if holder:
+                self._stdio_children[server_name] = holder[-1]
             session_kwargs = session_kwargs or {}
             read_timeout = max(
                 session_kwargs.pop('read_timeout_seconds', timeout), 1)
@@ -753,6 +809,7 @@ class MCPClient(ToolBase):
                            server_name: str,
                            graceful: bool = True) -> None:
         """Ask a server's owner task to close its transport, and wait for it."""
+        self._stdio_children.pop(server_name, None)
         shutdown = self._server_shutdown.pop(server_name, None)
         task = self._server_tasks.pop(server_name, None)
         ready = self._server_ready.pop(server_name, None)

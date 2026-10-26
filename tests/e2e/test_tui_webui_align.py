@@ -215,7 +215,7 @@ class TestModelLedger:
             'url=https://example.invalid/v1 protocol=openai',
             rt)
         run_slash('/model catalog add acme a-1', rt)
-        result = run_slash('/model acme/a-1', rt)
+        result = run_slash('/model acme a-1', rt)
         assert 'a-1' in result.content
         data = _settings(isolated_home)
         assert data.get('default_model') == 'acme/a-1'

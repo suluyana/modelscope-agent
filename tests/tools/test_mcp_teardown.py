@@ -175,6 +175,39 @@ async def test_quit_during_connect_does_not_leave_a_cancelled_future():
 
 
 @pytest.mark.asyncio
+async def test_stdio_hook_records_the_child_process():
+    import mcp.client.stdio as stdio_mod
+
+    from ms_agent.tools.mcp_client import _install_stdio_child_hook, _stdio_child
+
+    class _Proc:
+        returncode = None
+
+    async def fake_create(*args, **kwargs):
+        del args, kwargs
+        return _Proc()
+
+    previous = stdio_mod._create_platform_compatible_process
+    stdio_mod._create_platform_compatible_process = fake_create
+    try:
+        _install_stdio_child_hook()
+        hooked = stdio_mod._create_platform_compatible_process
+        holder: list = []
+        token = _stdio_child.set(holder)
+        try:
+            process = await hooked('npx', ['-y'])
+        finally:
+            _stdio_child.reset(token)
+        assert holder == [process]
+        process.returncode = 1
+        client = MCPClient({'mcpServers': {}})
+        client._stdio_children['box'] = process
+        assert client.stdio_process_exited('box')
+    finally:
+        stdio_mod._create_platform_compatible_process = previous
+
+
+@pytest.mark.asyncio
 async def test_kernel_session_stop_swallows_cancellederror():
     from ms_agent.tools.code.local_code_executor import LocalKernelSession
 

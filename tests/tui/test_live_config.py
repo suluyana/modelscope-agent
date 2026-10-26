@@ -299,7 +299,7 @@ async def test_failed_mcp_reconnect_is_said_once(tmp_path, monkeypatch):
     await apply_live_config(agent, None)
     await apply_live_config(agent, None)
     assert runtime.calls == 1
-    assert agent.notices == ['MCP 服务器 fetch 还是连不上。']
+    assert agent.notices == []
 
 
 @pytest.mark.asyncio
@@ -309,7 +309,7 @@ async def test_unreachable_server_is_skipped_before_the_turn(
     import json
 
     monkeypatch.setenv('MS_AGENT_HOME', str(tmp_path))
-    monkeypatch.setattr('ms_agent.mcp.runtime.MCP_PROBE_TIMEOUT', 0.05)
+    monkeypatch.setattr('ms_agent.mcp.runtime.MCP_TURN_WAIT', 0.05)
     (tmp_path / 'mcp.json').write_text(
         json.dumps({
             'mcpServers': {
@@ -351,19 +351,18 @@ async def test_unreachable_server_is_skipped_before_the_turn(
     )
     agent = _quiet_agent(tmp_path, mcp_runtime=runtime)
     started = asyncio.get_running_loop().time()
-    await apply_live_config(agent, None)
-    elapsed = asyncio.get_running_loop().time() - started
-    assert elapsed < 0.5
-    assert runtime.get_server('slow').status == 'error'
-    assert runtime.get_server('good').status == 'connected'
-    assert agent.notices == [
-        'MCP 服务器 slow 连不上（0.05秒内没有连上），本轮先不用。'
-    ]
-    await apply_live_config(agent, None)
-    assert client.connect_calls.count('slow') == 1
-    assert agent.notices == [
-        'MCP 服务器 slow 连不上（0.05秒内没有连上），本轮先不用。'
-    ]
+    try:
+        await apply_live_config(agent, None)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert elapsed < 0.5
+        assert runtime.get_server('slow').status == 'connecting'
+        assert runtime.get_server('good').status == 'connected'
+        assert agent.notices == []
+        await apply_live_config(agent, None)
+        assert client.connect_calls.count('slow') == 1
+        assert agent.notices == []
+    finally:
+        await runtime._cancel_probes()
 
 
 @pytest.mark.asyncio

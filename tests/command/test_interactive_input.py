@@ -377,6 +377,36 @@ class TestEnsureLlmReady:
         finally:
             mod._credential_notice_sent = False
 
+    def test_built_client_rearms_the_setup_notice(self, monkeypatch):
+        from types import SimpleNamespace
+        import ms_agent.agent.llm_agent as mod
+        mod._credential_notice_sent = True
+        agent = self._agent()
+        monkeypatch.setattr(
+            mod.LLM, 'from_config',
+            lambda config: SimpleNamespace(config=config, model='m'))
+        monkeypatch.setattr(
+            'ms_agent.llm.runtime_token.llm_runtime_token',
+            lambda config: 'tok')
+        try:
+            agent.prepare_llm()
+            assert mod._credential_notice_sent is False
+            seen = []
+
+            class _Sink:
+                def emit(self, event):
+                    seen.append(event.text)
+
+            agent._event_sink = _Sink()
+            err = ValueError('No API key found for provider "modelscope"')
+            agent._emit_credential_setup(err)
+            agent._emit_credential_setup(err)
+            assert seen == [(
+                '还没有 modelscope 的密钥。\n\n'
+                '  /model provider key modelscope <密钥>')]
+        finally:
+            mod._credential_notice_sent = False
+
     @pytest.mark.asyncio
     async def test_cleared_key_keeps_the_next_line_not_the_one_that_arrived(self):
         # Same wait as a session that never had a key: the line that found

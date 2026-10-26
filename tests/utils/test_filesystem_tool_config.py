@@ -117,7 +117,7 @@ def test_init_does_not_require_api_key(tmp_path, monkeypatch):
         'output_dir': str(tmp_path),
         'llm': {
             'service': 'modelscope',
-            'model': 'Qwen/Qwen3-235B-A22B-Instruct-2507',
+            'model': 'Qwen/Qwen3.8-Flash-Next',
             'use_provider_router': True,
         },
         'tools': {

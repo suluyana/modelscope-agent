@@ -13,6 +13,7 @@ falls back to blocking ``input()`` in an executor, so the TUI stays scriptable.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from typing import TYPE_CHECKING, Optional
 
@@ -31,6 +32,15 @@ _PASTE_MARKERS = (
     '^[[200~',
     '^[[201~',
 )
+# Cursor Position Report. A cooked terminal echoes it as text, so
+# ``^[[8;8R/mcp list`` would otherwise be sent to the model.
+_CPR_RE = re.compile(r'(?:\x1b\[\d+;\d+R|\^\[\[\d+;\d+R)')
+
+
+def _strip_terminal_noise(line: str) -> str:
+    for marker in _PASTE_MARKERS:
+        line = line.replace(marker, '')
+    return _CPR_RE.sub('', line)
 
 
 def split_prompt_lines(text: str) -> list:
@@ -38,18 +48,23 @@ def split_prompt_lines(text: str) -> list:
 
     prompt_toolkit returns a multiline paste as a single string. Fed through
     whole, ``/model`` treats the next line as part of the model id. A trailing
-    empty line (the paste ended on Enter) is not itself a command.
+    empty line (the paste ended on Enter) is not itself a command. A cursor
+    position report (``^[[8;8R``) is terminal noise, not part of the command.
     """
-    cleaned = text or ''
-    for marker in _PASTE_MARKERS:
-        cleaned = cleaned.replace(marker, '')
-    cleaned = cleaned.replace('\r\n', '\n').replace('\r', '\n')
+    cleaned = (text or '').replace('\r\n', '\n').replace('\r', '\n')
     if '\n' not in cleaned:
-        return [cleaned]
+        return [_strip_terminal_noise(cleaned)]
     lines = cleaned.split('\n')
     if lines and lines[-1] == '':
         lines.pop()
-    return lines or ['']
+    kept = []
+    for line in lines:
+        stripped = _strip_terminal_noise(line)
+        # A line that was only a cursor report must not be sent.
+        if stripped == '' and line != '':
+            continue
+        kept.append(stripped)
+    return kept or ['']
 
 
 def slash_matches(router, text: str):
@@ -197,7 +212,17 @@ class PromptToolkitInput:
             if self._console is not None:
                 from rich.rule import Rule
                 self._console.print(Rule(style='grey30'))
-            text = await self._session.prompt_async(self._message())
+            # prompt_toolkit owns Ctrl-C while the line is being edited.
+            # After it returns, the TUI handler covers the stream that follows.
+            sigint = getattr(self, '_sigint', None)
+            if sigint is not None:
+                sigint._streaming = False
+            try:
+                text = await self._session.prompt_async(self._message())
+            finally:
+                if sigint is not None:
+                    sigint._arm_turn_sigint()
+                    sigint._streaming = True
             lines = split_prompt_lines(text)
             if len(lines) > 1:
                 self._queued.extend(lines[1:])

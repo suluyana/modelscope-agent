@@ -174,7 +174,7 @@ class TestModelSwitchShadowsWebuiDefault:
             'url=https://example.invalid/v1 protocol=openai',
             rt)
         run_slash('/model catalog add acme pinned-in-tui', rt)
-        switched = run_slash('/model acme/pinned-in-tui', rt)
+        switched = run_slash('/model acme pinned-in-tui', rt)
         assert 'pinned-in-tui' in switched.content
         patch = work_dir / '.ms_agent' / 'config.yaml'
         assert not patch.is_file()
@@ -198,7 +198,7 @@ class TestModelSwitchShadowsWebuiDefault:
             'url=https://example.invalid/v1 protocol=openai',
             rt)
         run_slash('/model catalog add acme a-1', rt)
-        result = run_slash('/model acme/a-1', rt)
+        result = run_slash('/model acme a-1', rt)
         assert 'a-1' in result.content
         assert 'Saved as the default' not in result.content
         assert '下一条消息使用它' not in result.content
@@ -358,7 +358,7 @@ class TestDocZeroFiveIsUnreasonable:
             'url=https://example.invalid/v1 protocol=openai',
             rt)
         run_slash('/model catalog add acme pinned', rt)
-        run_slash('/model acme/pinned', rt)
+        run_slash('/model acme pinned', rt)
         assert not (work_dir / '.ms_agent' / 'config.yaml').exists()
         cfg2 = TuiApp._load_runtime_config(
             'unused.yaml', str(work_dir), explicit_config=False)

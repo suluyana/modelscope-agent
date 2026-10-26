@@ -72,9 +72,16 @@ _MISSING_ENABLE_SNAPSHOTS = object()
 # metadata (not this literal), so the placeholder never needs localization.
 INTERRUPTED_PLACEHOLDER = '[interrupted]'
 _INTERRUPTED_TOOL_RESULT = '[Interrupted: tool execution was cancelled]'
-# The missing-key paragraph is reached from startup and from the first
-# message. Print it once for the process.
+# One keyless episode prints the setup paragraph once. Startup and the
+# first message share that copy. Building a client, or clearing a key,
+# ends the episode so the next one can speak.
 _credential_notice_sent = False
+
+
+def reset_credential_notice() -> None:
+    """End the current keyless episode so the next one can speak once."""
+    global _credential_notice_sent
+    _credential_notice_sent = False
 
 
 def build_partial_round_records(
@@ -409,6 +416,16 @@ class LLMAgent(Agent):
         if getattr(self, '_plugin_runtime', None) is not None:
             self._plugin_runtime.skill_runtime = self._skill_runtime
             self._plugin_runtime._sync_skill_runtime(self.config)
+        self._publish_skill_runtime()
+
+    def _publish_skill_runtime(self) -> None:
+        """Slash commands see Runtime, the same way they see MCP.
+
+        Disk scan stays the fallback until a session has loaded skills.
+        """
+        session = getattr(self, 'runtime', None)
+        if session is not None and self._skill_runtime is not None:
+            session._skill_runtime = self._skill_runtime
 
         # Wire /skill-name slash commands. Without this the SkillCommandBridge
         # is never registered and `/skill-id args` falls through to the model as
@@ -1048,6 +1065,11 @@ class LLMAgent(Agent):
             # Slash commands only see this Runtime, not the agent. The failure
             # record /mcp list and /mcp get read lives on the MCP runtime.
             self.runtime._mcp_runtime = mcp_rt
+        # The TUI still has to show its prompt. Waiting here would put a
+        # cold npx in front of the first keystroke. That session waits on
+        # the first message instead. A one-shot run has no later message,
+        # so it waits now, and only for a few seconds.
+        wait_for_mcp = getattr(self, '_on_user_turn', None) is None
         if mcp_rt is not None and plugin_mcp_servers:
             from ms_agent.config.mcp_schema import ResolvedMCPConfig
             merged_servers = {
@@ -1056,7 +1078,9 @@ class LLMAgent(Agent):
             }
             merged_servers.update(plugin_mcp_servers)
             await mcp_rt.apply_config(
-                ResolvedMCPConfig(mcp_servers=merged_servers))
+                ResolvedMCPConfig(mcp_servers=merged_servers),
+                wait=wait_for_mcp,
+            )
 
         self.tool_manager = ToolManager(
             self.config,
@@ -1087,7 +1111,7 @@ class LLMAgent(Agent):
         if not self.runtime.session_id:
             self.runtime.session_id = hook_runtime.session_id
         if mcp_rt is not None and not mcp_rt.is_started:
-            await mcp_rt.start()
+            await mcp_rt.start(wait=wait_for_mcp)
         await self.tool_manager.connect()
         if self.runtime is not None:
             self.runtime.tool_manager = self.tool_manager
@@ -2468,10 +2492,10 @@ class LLMAgent(Agent):
         tool_name: str | None = None,
         exc: BaseException | None = None,
     ) -> None:
-        """Count an MCP failure and, the moment it becomes unusable, say so.
+        """Count an MCP failure and, once it is unusable, reconnect later.
 
-        Quit still cleans up quietly. The sentence belongs on the call that
-        finds the server gone, once per server.
+        The chat stays quiet. ``/mcp list`` shows the status. Quit still
+        cleans up quietly.
         """
         runtime = self.mcp_runtime
         if runtime is None:
@@ -2488,14 +2512,14 @@ class LLMAgent(Agent):
             pending = set()
             self._mcp_reconnect_names = pending
         pending.add(name)
-        from ms_agent.mcp.runtime import degraded_user_notice
-        self._emit_user_notice(degraded_user_notice(name, exc, message))
 
     def prepare_llm(self):
         """Initialize the LLM model from the configuration."""
         self.llm: LLM = LLM.from_config(self.config)
         from ms_agent.llm.runtime_token import llm_runtime_token
         self._llm_fp = llm_runtime_token(self.config)
+        # A client exists, so the next keyless episode may speak again.
+        reset_credential_notice()
 
     def _stub_llm_for_setup(self) -> None:
         """Placeholder so slash commands can run before a key exists."""
@@ -2506,7 +2530,7 @@ class LLMAgent(Agent):
             config=self.config, model=model, _setup_stub=True)
 
     def _emit_credential_setup(self, exc: BaseException) -> None:
-        # Startup and the first message both reach this. One process, one copy.
+        # Startup and the first message of one keyless episode share this copy.
         global _credential_notice_sent
         if _credential_notice_sent:
             return
@@ -2662,6 +2686,10 @@ class LLMAgent(Agent):
 
         config, _messages = read_history(self.output_dir, self.tag)
         if config is not None and _messages is not None:
+            # The yaml on disk has no keys. Fill them from settings / mcp.json
+            # so this legacy resume does not ask for the key again.
+            from ms_agent.utils.history_secrets import refill_history_config
+            refill_history_config(config, getattr(self, 'output_dir', None))
             if hasattr(config, 'runtime'):
                 runtime = Runtime(llm=self.llm)
                 runtime.from_dict(config.runtime)

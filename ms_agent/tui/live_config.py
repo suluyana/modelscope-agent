@@ -226,47 +226,6 @@ async def _sync_search(agent) -> None:
     agent._search_fp = token
 
 
-def _say_mcp_still_down(agent, names) -> None:
-    for name in names:
-        _emit_once(agent, f'mcp-down:{name}', f'MCP 服务器 {name} 还是连不上。')
-
-
-def _announce_unreachable(agent, runtime) -> set[str]:
-    """One line per server this process already failed to connect.
-
-    Reading the recorded error does not open a new connection.
-    """
-    list_servers = getattr(runtime, 'list_servers', None)
-    if list_servers is None:
-        return set()
-    try:
-        states = list(list_servers())
-    except Exception:
-        logger.debug('mcp skip notice skipped', exc_info=True)
-        return set()
-    from ms_agent.mcp.runtime import mcp_unreachable_notice
-    seen = getattr(agent, '_live_notice_keys', None)
-    announced: set[str] = set()
-    for state in states:
-        name = getattr(state, 'name', None)
-        if not name:
-            continue
-        if getattr(state, 'status', None) == 'connected' and seen is not None:
-            seen.discard(f'mcp-skip:{name}')
-            continue
-        if getattr(state, 'status', None) != 'error':
-            continue
-        if getattr(state, 'enabled', True) is False:
-            continue
-        reason = getattr(state, 'last_error', None)
-        if not reason:
-            continue
-        announced.add(name)
-        _emit_once(agent, f'mcp-skip:{name}',
-                   mcp_unreachable_notice(name, str(reason)))
-    return announced
-
-
 async def _sync_mcp(agent) -> None:
     runtime = getattr(agent, 'mcp_runtime', None)
     if runtime is None:
@@ -287,30 +246,23 @@ async def _sync_mcp(agent) -> None:
             servers.setdefault(name, entry)
     token = _token(servers)
     pending = set(getattr(agent, '_mcp_reconnect_names', None) or ())
+    # Config is unchanged. Still look at the live processes: a child may
+    # have exited, or a startup that began last turn may have finished.
+    # Neither of those is said in the chat. /mcp list carries the status.
     if getattr(agent, '_mcp_fp', None) == token and not pending:
+        refresh = getattr(runtime, 'refresh_for_turn', None)
+        if refresh is not None:
+            try:
+                await refresh()
+            except Exception:
+                logger.debug('live mcp refresh failed', exc_info=True)
         return
     try:
         await runtime.apply_config(ResolvedMCPConfig(mcp_servers=servers))
     except Exception:
         logger.debug('live mcp apply failed', exc_info=True)
-        announced = _announce_unreachable(agent, runtime)
-        if pending:
-            _say_mcp_still_down(
-                agent, [name for name in pending if name not in announced])
-            agent._mcp_reconnect_names = set()
-            agent._mcp_fp = token
-        return
-    announced = _announce_unreachable(agent, runtime)
-    still = []
-    for name in pending:
-        if name in announced:
-            continue
-        state = runtime.get_server(name) if hasattr(runtime, 'get_server') else None
-        if state is None or getattr(state, 'status', None) != 'connected':
-            still.append(name)
     if pending:
         agent._mcp_reconnect_names = set()
-        _say_mcp_still_down(agent, still)
     agent._mcp_fp = token
 
 

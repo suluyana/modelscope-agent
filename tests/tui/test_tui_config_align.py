@@ -545,3 +545,84 @@ async def test_serve_exits_when_quit_cancels_the_turn():
     assert runs['n'] == 1
     assert 'session still open' not in out
     assert 'bye' in out
+
+
+def _serve_app(buf):
+    from unittest.mock import MagicMock
+
+    app = TuiApp.__new__(TuiApp)
+    app.console = Console(file=buf, force_terminal=False, width=100)
+    app.renderer = MagicMock()
+    app._queued_query = None
+    app._pending_switch = None
+    app._model = 'm'
+    app.state = TuiState(model='m')
+    app._owned_session_ids = set()
+    session = SimpleNamespace(id='s1', name='Session 1')
+    app._sm = MagicMock()
+    app._sm.create.return_value = session
+    app.session = None
+    app._banner = lambda: None
+    app._apply_session = lambda sess, resume=False: setattr(app, 'session', sess)
+    app._name_session_from_log = lambda: None
+    app._prune_if_empty = lambda s: None
+    return app
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_during_stream_stays_in_repl():
+    """Ctrl-C while a turn is streaming stays in the REPL."""
+    buf = io.StringIO()
+    app = _serve_app(buf)
+    started = asyncio.Event()
+    runs = {'n': 0}
+
+    async def fake_run(query=None, stream=True):
+        runs['n'] += 1
+        if runs['n'] == 1:
+            started.set()
+            await asyncio.Event().wait()
+        raise EOFError()
+
+    app.agent = SimpleNamespace(
+        run=fake_run,
+        runtime=SimpleNamespace(should_stop=False),
+    )
+    serve = asyncio.create_task(app._serve())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    app._on_turn_sigint()
+    await asyncio.wait_for(serve, timeout=2)
+    out = buf.getvalue()
+    assert runs['n'] == 2
+    assert 'interrupted — /quit to exit' in out
+    assert 'bye' in out
+
+
+def test_idle_sigint_does_not_cancel_a_turn():
+    from unittest.mock import MagicMock
+
+    app = TuiApp.__new__(TuiApp)
+    app._streaming = False
+    app._sigint_turn = False
+    app._sigint_exit = False
+    app._turn_task = MagicMock()
+    app._turn_task.done.return_value = False
+    app._on_turn_sigint()
+    app._turn_task.cancel.assert_not_called()
+    assert app._sigint_exit is False
+
+
+def test_second_sigint_while_cancelling_leaves():
+    from unittest.mock import MagicMock
+
+    app = TuiApp.__new__(TuiApp)
+    app._streaming = True
+    app._sigint_turn = True
+    app._sigint_exit = False
+    app._turn_task = MagicMock()
+    app._turn_task.done.return_value = False
+    app._serve_task = MagicMock()
+    app._serve_task.done.return_value = False
+    app._on_turn_sigint()
+    assert app._sigint_exit is True
+    app._serve_task.cancel.assert_called_once()

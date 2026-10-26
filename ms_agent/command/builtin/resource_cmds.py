@@ -8,6 +8,9 @@ from ms_agent.command.types import (CommandContext, CommandDef, CommandResult,
                                     CommandResultType)
 from ms_agent.command.usage import (arg_error, ledger_dir, ledger_file,
                                     status_then_usage)
+from ms_agent.utils import get_logger
+
+logger = get_logger()
 
 CMD_MCP = CommandDef(
     name='mcp',
@@ -28,6 +31,7 @@ def _mcp_usage() -> str:
         'usage:\n'
         '  /mcp list [global|project]\n'
         '  /mcp get <name> [global|project]\n'
+        '  /mcp retry <name>\n'
         '  /mcp add <name> [global|project] command=<cmd>\n'
         '  /mcp add <name> [global|project] url=<url>\n'
         '  /mcp update <name> [global|project] command=<cmd>|url=<url>\n'
@@ -128,24 +132,41 @@ def _need_work(scope: str, work: str | None) -> CommandResult | None:
     return None
 
 
-def _connect_failure_reason(ctx, name: str) -> str | None:
-    """Short reason already recorded for ``name``. Does not open a connection."""
-    runtime = getattr(getattr(ctx, 'runtime', None), '_mcp_runtime', None)
-    if runtime is None:
-        return None
+def _mcp_runtime(ctx):
+    return getattr(getattr(ctx, 'runtime', None), '_mcp_runtime', None)
+
+
+def _server_state(ctx, name: str):
+    """Recorded runtime state. Does not open a connection."""
+    runtime = _mcp_runtime(ctx)
     getter = getattr(runtime, 'get_server', None)
     if getter is None:
         return None
-    state = getter(name)
-    if state is None or getattr(state, 'status', None) != 'error':
-        return None
-    reason = getattr(state, 'last_error', None)
-    if not reason:
-        return None
+    return getter(name)
+
+
+def _clip_reason(reason) -> str:
     text = ' '.join(str(reason).split())
     if len(text) > 80:
         text = text[:79] + '…'
     return text
+
+
+def _status_mark(state) -> str:
+    """Short status for /mcp list and /mcp get. Empty when unknown."""
+    if state is None:
+        return ''
+    status = getattr(state, 'status', None)
+    exited = bool(getattr(state, 'process_exited', False))
+    if status == 'connected':
+        return '已连接'
+    if status == 'connecting' and not exited:
+        return '启动中'
+    if exited:
+        return '进程已退出'
+    if status in ('error', 'degraded'):
+        return '未连接'
+    return ''
 
 
 def _mcp_list_text(mgr, scope: str, ctx=None) -> str:
@@ -156,11 +177,19 @@ def _mcp_list_text(mgr, scope: str, ctx=None) -> str:
     for name, entry in rows.items():
         on = 'on' if entry.get('enabled', True) is not False else 'off'
         how = entry.get('command') or entry.get('url') or '?'
-        reason = None
-        if ctx is not None:
-            reason = _connect_failure_reason(ctx, name)
-        if reason:
-            lines.append(f'  [{on}] {name}  {how}  {reason}')
+        state = _server_state(ctx, name) if ctx is not None else None
+        mark = _status_mark(state)
+        reason = ''
+        if mark not in ('', '已连接', '启动中'):
+            raw = getattr(state, 'last_error', None)
+            if raw:
+                reason = _clip_reason(raw)
+                if reason == mark:
+                    reason = ''
+        if mark and reason:
+            lines.append(f'  [{on}] {name}  {how}  {mark}  {reason}')
+        elif mark:
+            lines.append(f'  [{on}] {name}  {how}  {mark}')
         else:
             lines.append(f'  [{on}] {name}  {how}')
     return '\n'.join(lines)
@@ -235,8 +264,45 @@ def _mcp_get_lines(name: str, scope: str, entry: dict) -> list[str]:
     return lines
 
 
-def _mcp_get(ctx, tokens: list[str], mgr, work: str | None) -> CommandResult:
-    """One server's saved config. Both copies are shown when the name is in each."""
+async def _refresh_mcp_view(ctx) -> None:
+    """Read process state for /mcp. Does not wait out a cold startup."""
+    runtime = _mcp_runtime(ctx)
+    refresh = getattr(runtime, 'refresh_for_turn', None)
+    if refresh is None:
+        return
+    try:
+        await refresh(wait=False)
+    except Exception:
+        logger.debug('mcp view refresh failed', exc_info=True)
+
+
+def _mcp_runtime_note(state) -> list[str]:
+    """Tool count, last error, and whether a stdio child is alive."""
+    mark = _status_mark(state)
+    if not mark:
+        return []
+    lines = [f'  status: {mark}']
+    if hasattr(state, 'tool_count'):
+        lines.append(f'  tools: {getattr(state, "tool_count", 0)}')
+    err = getattr(state, 'last_error', None)
+    if err and mark != '已连接':
+        lines.append(f'  last_error: {_clip_reason(err)}')
+    config = getattr(state, 'config', None) or {}
+    if config.get('command') or getattr(state, 'process_exited', False):
+        alive = (
+            '在' if getattr(state, 'status', None) == 'connected' else '不在')
+        lines.append(f'  process: {alive}')
+    return lines
+
+
+async def _mcp_get(
+    ctx,
+    tokens: list[str],
+    mgr,
+    work: str | None,
+) -> CommandResult:
+    """One server's saved config. Both copies when the name is in each."""
+    await _refresh_mcp_view(ctx)
     scope, rest = parse_optional_scope(tokens)
     if not rest:
         return arg_error('/mcp get <name> [global|project]', ctx=ctx)
@@ -265,14 +331,53 @@ def _mcp_get(ctx, tokens: list[str], mgr, work: str | None) -> CommandResult:
             ctx=ctx,
         )
     content = '\n\n'.join(blocks)
-    reason = _connect_failure_reason(ctx, name)
-    if reason:
-        from ms_agent.mcp.runtime import mcp_unreachable_notice
-        content = content + '\n' + mcp_unreachable_notice(name, reason)
+    note = _mcp_runtime_note(_server_state(ctx, name))
+    if note:
+        content = content + '\n' + '\n'.join(note)
     return CommandResult(
         type=CommandResultType.MESSAGE,
         content=content,
     )
+
+
+async def _mcp_retry(ctx, tokens: list[str], mgr) -> CommandResult:
+    """Connect one server again. A cold startup stays in the background."""
+    if not tokens:
+        return arg_error('/mcp retry <name>', ctx=ctx)
+    name = ' '.join(tokens)
+    try:
+        rows = mgr.list('merged')
+    except Exception:  # noqa: BLE001 - missing root is an empty list
+        rows = {}
+    if name not in rows:
+        return arg_error(
+            '/mcp retry <name>',
+            reason=f'No MCP server named {name}',
+            ctx=ctx,
+        )
+    runtime = _mcp_runtime(ctx)
+    retry = getattr(runtime, 'retry_server', None)
+    if retry is None:
+        return CommandResult(
+            type=CommandResultType.MESSAGE,
+            content='当前没有会话。下一次运行会重新连接。',
+        )
+    try:
+        state = await retry(name)
+    except KeyError:
+        return CommandResult(
+            type=CommandResultType.MESSAGE,
+            content='当前会话还没有这台服务器。下一条消息会再试。',
+        )
+    except ValueError as exc:
+        return CommandResult(
+            type=CommandResultType.MESSAGE, content=str(exc))
+    mark = _status_mark(state) or getattr(state, 'status', '')
+    line = f'{name}: {mark}'
+    err = getattr(state, 'last_error', None)
+    if err and mark not in ('已连接', '启动中'):
+        line = f'{line}\n{_clip_reason(err)}'
+    return CommandResult(type=CommandResultType.MESSAGE, content=line)
 
 
 async def cmd_mcp(ctx: CommandContext) -> CommandResult:
@@ -320,13 +425,17 @@ async def cmd_mcp(ctx: CommandContext) -> CommandResult:
                 here, other_rows = {}, {}
             if scope not in here and scope in other_rows:
                 note = f'名叫 {scope} 的服务器不在这份清单里。\n'
+        await _refresh_mcp_view(ctx)
         return CommandResult(
             type=CommandResultType.MESSAGE,
             content=note + _mcp_list_text(mgr, scope, ctx),
         )
 
     if action == 'get':
-        return _mcp_get(ctx, tokens, mgr, work)
+        return await _mcp_get(ctx, tokens, mgr, work)
+
+    if action == 'retry':
+        return await _mcp_retry(ctx, tokens, mgr)
 
     if action == 'json':
         if not tokens:
@@ -411,7 +520,7 @@ async def cmd_mcp(ctx: CommandContext) -> CommandResult:
         )
 
     return arg_error(
-        '/mcp list|get|add|update|json|enable|disable|remove ...',
+        '/mcp list|get|retry|add|update|json|enable|disable|remove ...',
         reason=f'Unknown mcp action {action!r}',
         note='Type /mcp for all commands',
         ctx=ctx,

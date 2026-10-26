@@ -201,7 +201,8 @@ class TestMcpCommand:
                 '/mcp add slow global url=http://10.255.255.1/mcp',
                 runtime))
         listed = await router.dispatch(make_ctx('/mcp list', runtime))
-        assert '[on] slow  http://10.255.255.1/mcp  6秒内没有连上' in listed.content
+        assert ('[on] slow  http://10.255.255.1/mcp  未连接  '
+                '6秒内没有连上') in listed.content
         by_name = await router.dispatch(make_ctx('/mcp list slow', runtime))
         assert 'Unknown list option.' in by_name.content
         assert '6秒内没有连上' not in by_name.content
@@ -222,10 +223,56 @@ class TestMcpCommand:
         result = await make_router().dispatch(
             make_ctx('/mcp get slow', runtime))
         assert 'url: http://10.255.255.1/mcp' in result.content
-        sentence = 'MCP 服务器 slow 连不上（6秒内没有连上），本轮先不用。'
-        assert sentence in result.content
-        assert result.content.index(sentence) > result.content.index('url:')
+        assert 'status: 未连接' in result.content
+        assert 'last_error: 6秒内没有连上' in result.content
+        assert '本轮先不用' not in result.content
+        assert result.content.index('status:') > result.content.index('url:')
         assert runtime._mcp_runtime.connects == []
+
+    @pytest.mark.asyncio
+    async def test_list_and_get_show_a_dead_process(self, isolate_home):
+        state = _Failure('connecting', '进程已退出')
+        state.process_exited = True
+        state.tool_count = 0
+        state.config = {'command': 'npx'}
+        runtime = MockRuntime()
+        runtime._mcp_runtime = _FailureRuntime({'mem': state})
+        await make_router().dispatch(
+            make_ctx('/mcp add mem global command=npx', runtime))
+        listed = await make_router().dispatch(make_ctx('/mcp list', runtime))
+        assert '[on] mem  npx  进程已退出' in listed.content
+        assert '本轮先不用' not in listed.content
+        got = await make_router().dispatch(make_ctx('/mcp get mem', runtime))
+        assert 'status: 进程已退出' in got.content
+        assert 'tools: 0' in got.content
+        assert 'process: 不在' in got.content
+        assert '本轮先不用' not in got.content
+
+    @pytest.mark.asyncio
+    async def test_retry_reports_status_and_does_not_talk_in_chat(
+            self, isolate_home):
+        state = _Failure('error', '6秒内没有连上')
+        state.tool_count = 0
+
+        class _Retry(_FailureRuntime):
+
+            async def retry_server(self, name):
+                self.connects.append(name)
+                current = self._states[name]
+                current.status = 'connecting'
+                current.last_error = None
+                return current
+
+        runtime = MockRuntime()
+        runtime._mcp_runtime = _Retry({'slow': state})
+        await make_router().dispatch(
+            make_ctx(
+                '/mcp add slow global url=http://10.255.255.1/mcp',
+                runtime))
+        result = await make_router().dispatch(
+            make_ctx('/mcp retry slow', runtime))
+        assert result.content == 'slow: 启动中'
+        assert runtime._mcp_runtime.connects == ['slow']
 
     @pytest.mark.asyncio
     async def test_list_scope_word_names_the_other_copy(
@@ -361,6 +408,43 @@ class TestSkillsCommand:
         result = await make_router().dispatch(
             make_ctx('/skills remove ghost global', MockRuntime()))
         assert 'not a managed skill' in result.content
+
+    @pytest.mark.asyncio
+    async def test_list_uses_the_loaded_runtime_before_disk(self, isolate_home):
+        class Loaded:
+            def list_all(self):
+                return [{
+                    'skill_id': 'from-session',
+                    'name': 'Loaded',
+                    'enabled': True,
+                }]
+
+        runtime = MockRuntime(_skill_runtime=Loaded())
+        result = await make_router().dispatch(
+            make_ctx('/skills list', runtime))
+        assert '[on] from-session  Loaded' in result.content
+        assert 'No skills' not in result.content
+
+    @pytest.mark.asyncio
+    async def test_list_scans_disk_before_skills_are_loaded(self, isolate_home):
+        result = await make_router().dispatch(
+            make_ctx('/skills list', MockRuntime()))
+        assert 'from-session' not in result.content
+
+    def test_loaded_skills_are_published_on_the_session(self):
+        from types import SimpleNamespace
+
+        from ms_agent.agent.llm_agent import LLMAgent
+        agent = LLMAgent.__new__(LLMAgent)
+        agent.runtime = SimpleNamespace()
+        agent._skill_runtime = SimpleNamespace(marker=1)
+        agent._skill_catalog = SimpleNamespace()
+        agent._command_router = None
+        agent._plugin_runtime = None
+        agent._publish_skill_runtime()
+        assert agent.runtime._skill_runtime is agent._skill_runtime
+        agent.runtime = None
+        agent._publish_skill_runtime()
 
     @pytest.mark.asyncio
     async def test_disable_writes_skills_json_even_with_runtime(

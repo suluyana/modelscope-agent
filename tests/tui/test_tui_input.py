@@ -72,6 +72,19 @@ def test_split_prompt_lines_keeps_each_pasted_line():
     assert split_prompt_lines('^[[200~hello^[[201~') == ['hello']
 
 
+def test_cursor_report_does_not_become_the_command():
+    # Cooked echo and the raw CSI both have to come off the command.
+    assert split_prompt_lines('^[[8;8R/mcp list') == ['/mcp list']
+    assert split_prompt_lines('\x1b[8;8R/mcp list') == ['/mcp list']
+    assert split_prompt_lines('^[[8;8R\n/mcp list') == ['/mcp list']
+    assert split_prompt_lines('\x1b[200~^[[8;8R/mcp list\x1b[201~') == [
+        '/mcp list'
+    ]
+    # A report by itself is not a message. A real blank line in a paste stays.
+    assert split_prompt_lines('^[[8;8R') == ['']
+    assert split_prompt_lines('keep\n\nstill') == ['keep', '', 'still']
+
+
 def test_multiline_paste_is_one_prompt_then_queued_lines():
     """The second line of a paste must come back as its own read, so /model
     cannot swallow it into the model id. Live is released before the prompt
