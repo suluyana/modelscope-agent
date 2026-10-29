@@ -171,6 +171,12 @@ export function readFailure(
 // fresh, so mutations + refetches still see up-to-date data).
 const inflightGets = new Map<string, Promise<unknown>>()
 
+let readRequestCookie: (() => string) | null = null
+
+export function registerRequestCookieReader(reader: () => string): void {
+  readRequestCookie = reader
+}
+
 async function json<T>(
   input: RequestInfo,
   init?: RequestInit,
@@ -192,9 +198,8 @@ async function json<T>(
     try {
       // An explicit empty header object lets FormData supply its own boundary.
       const headers = new Headers(init?.headers ?? { 'Content-Type': 'application/json' })
-      if (import.meta.env.SSR) {
-        const { requestCookie } = await import('./auth.server')
-        const cookie = requestCookie()
+      if (typeof window === 'undefined') {
+        const cookie = readRequestCookie?.()
         if (cookie) headers.set('Cookie', cookie)
       }
       res = await fetch(resolve(input), {
@@ -277,7 +282,7 @@ const fp = (path: string) =>
  * useXChat (see app/lib/agentProvider.ts), not this module.
  */
 export const api = {
-  getAuthStatus: () => json<AuthStatus>('/api/auth/status'),
+  getAuthStatus: (opts?: JsonOpts) => json<AuthStatus>('/api/auth/status', undefined, opts),
   login: (username: string, password: string) => json<null>('/api/auth/login', {
     method: 'POST', body: JSON.stringify({ username, password })
   }, { silent: true }),
