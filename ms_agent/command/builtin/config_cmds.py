@@ -207,13 +207,27 @@ def _repair_runtime_model(config, llm=None):
 
 
 def _switch_cmd(service, model) -> str:
+    """Copyable ``/model`` line. Always ``/model <provider> <model>``.
+
+    A slash belongs to the model id (``Qwen/Qwen3.8-Flash-Next``). It is not
+    a provider separator, so a hint must not print ``provider/model``.
+    """
     service = str(service or '').strip()
     model = _strip_provider_prefix(service, model)
     if not service:
         return f'/model {model}'
-    if ('/' in model) or (' ' in model):
-        return f'/model {service} {model}'
-    return f'/model {service}/{model}'
+    return f'/model {service} {model}'
+
+
+def _default_switch_line(stored: str) -> str:
+    """``/model list`` default, as a command the user can paste back."""
+    text = str(stored or '').strip()
+    if not text:
+        return ''
+    if '/' not in text:
+        return f'/model {text}'
+    service, model = text.split('/', 1)
+    return _switch_cmd(service, model)
 
 
 def _format_pair(service, model) -> str:
@@ -264,7 +278,7 @@ def _current_model_text(service, model, llm=None) -> str:
         pass
     live_p, live_m, live_url = _live_identity(llm)
     if live_p or live_url:
-        lines.append(f'Live:     {live_p or "?"} / {live_m or model}')
+        lines.append(f'Live:     {live_p or "?"} {live_m or model}')
         if live_url:
             lines.append(f'Endpoint: {live_url}')
     if live_p and live_p.lower() != service.lower():
@@ -429,7 +443,7 @@ def _provider_status_lines(mgr,
         lines = ['Providers:']
     default = mgr.get_default_model()
     if default:
-        lines.append(f'Default: {default}')
+        lines.append(f'Default: {_default_switch_line(default)}')
     only_id = (only or '').strip().lower() or None
     for pid, provider, override in _iter_provider_rows(mgr):
         if only_id and pid.lower() != only_id:

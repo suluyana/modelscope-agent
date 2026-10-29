@@ -329,7 +329,8 @@ class TestModel:
             make_ctx('/model', runtime=runtime))
         assert 'Provider: minimax' in result.content
         assert 'Model:    MiniMax-M2.1' in result.content
-        assert 'minimax MiniMax-M2.1' not in result.content
+        assert 'Model:    minimax MiniMax-M2.1' not in result.content
+        assert 'Switch:   /model minimax MiniMax-M2.1' in result.content
         assert runtime.llm.model == 'MiniMax-M2.1'
         stored = ModelSettingsManager(global_home()).get_default_model()
         assert stored == 'minimax/MiniMax-M2.1'
@@ -347,6 +348,8 @@ class TestModel:
         assert 'WARNING' in result.content
         assert 'dashscope' in result.content
         assert 'https://dashscope.example/v1' in result.content
+        assert 'realign with /model dashscope MiniMax-M2.1.' in result.content
+        assert 'dashscope/MiniMax-M2.1' not in result.content
 
     @pytest.mark.asyncio
     async def test_show_current_separates_provider_and_model(self):
@@ -372,7 +375,8 @@ class TestModel:
         _catalog_ok(monkeypatch, ['qwen3.8-flash'])
         result = await router.dispatch(ctx)
         assert result.type == CommandResultType.MUTATE_STATE
-        assert 'qwen3.8-flash' in result.content
+        assert 'Switch:   /model dashscope qwen3.8-flash' in result.content
+        assert '/model dashscope/qwen3.8-flash' not in result.content
         assert runtime.llm.model == 'qwen3.8-flash'
         assert config.llm.service == 'dashscope'
 
@@ -491,9 +495,22 @@ class TestModel:
         router = make_router()
         ctx = make_ctx('/model list', runtime=MockRuntime())
         result = await router.dispatch(ctx)
-        assert 'Default: acme/a-1' in result.content
+        assert 'Default: /model acme a-1' in result.content
+        assert 'acme/a-1' not in result.content
         assert 'Providers:' in result.content
         assert 'WebUI' not in result.content
+
+    @pytest.mark.asyncio
+    async def test_model_list_default_keeps_slash_inside_the_model_id(self):
+        from ms_agent.config.model_settings import ModelSettingsManager
+        from ms_agent.project.paths import global_home
+        ModelSettingsManager(global_home()).set_default_model(
+            'Qwen/Qwen3.8-Flash-Next', provider='modelscope')
+        result = await make_router().dispatch(
+            make_ctx('/model list', runtime=MockRuntime()))
+        assert ('Default: /model modelscope Qwen/Qwen3.8-Flash-Next'
+                in result.content)
+        assert 'modelscope/Qwen/' not in result.content
 
     @pytest.mark.asyncio
     async def test_model_list_does_not_fetch(self, monkeypatch):

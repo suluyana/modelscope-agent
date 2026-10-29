@@ -594,7 +594,7 @@ async def test_ctrl_c_during_stream_stays_in_repl():
     await asyncio.wait_for(serve, timeout=2)
     out = buf.getvalue()
     assert runs['n'] == 2
-    assert 'interrupted — /quit to exit' in out
+    assert 'interrupted — Ctrl-C or /quit to exit' in out
     assert 'bye' in out
 
 
@@ -612,7 +612,12 @@ def test_idle_sigint_does_not_cancel_a_turn():
     assert app._sigint_exit is False
 
 
-def test_second_sigint_while_cancelling_leaves():
+def test_second_sigint_while_cancelling_returns_to_the_prompt():
+    """A second Ctrl-C during the same turn does not quit.
+
+    The turn is already cancelling. It returns to the input line, and
+    Ctrl-C there quits the TUI.
+    """
     from unittest.mock import MagicMock
 
     app = TuiApp.__new__(TuiApp)
@@ -624,5 +629,6 @@ def test_second_sigint_while_cancelling_leaves():
     app._serve_task = MagicMock()
     app._serve_task.done.return_value = False
     app._on_turn_sigint()
-    assert app._sigint_exit is True
-    app._serve_task.cancel.assert_called_once()
+    assert app._sigint_exit is False
+    app._serve_task.cancel.assert_not_called()
+    app._turn_task.cancel.assert_not_called()

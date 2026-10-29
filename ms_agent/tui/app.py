@@ -167,6 +167,8 @@ class TuiApp:
             console=self.console,
             renderer=self.renderer)
         self.input._sigint = self
+        from ms_agent.tui.select import bind_sigint_rearm
+        bind_sigint_rearm(self._arm_turn_sigint)
         self.agent._input_source = self.input
 
         # Always inject the TUI handler — it is only *called* in interactive
@@ -711,11 +713,12 @@ class TuiApp:
     # -- main loop (route A: one lifecycle per session) --
 
     def _arm_turn_sigint(self) -> None:
-        """Ctrl-C cancels the running turn. A second one leaves the TUI.
+        """Ctrl-C during a running turn cancels that turn and returns to the prompt.
 
-        prompt_toolkit replaces this handler while a line is being edited
-        and then removes it, so the prompt re-arms the handler on the way out.
-        An idle prompt (not streaming) ignores the signal.
+        prompt_toolkit owns Ctrl-C while a line is being edited. That
+        KeyboardInterrupt quits the TUI, because nothing is running. It also
+        removes this handler, so the prompt and any arrow menu re-arm it
+        on the way out.
         """
         try:
             loop = asyncio.get_running_loop()
@@ -740,10 +743,8 @@ class TuiApp:
         if turn is None or turn.done():
             return
         if getattr(self, '_sigint_turn', False):
-            self._sigint_exit = True
-            serve = getattr(self, '_serve_task', None)
-            if serve is not None and not serve.done():
-                serve.cancel()
+            # Already cancelling this turn. Stay on that path and return to
+            # the prompt; the next Ctrl-C, at the prompt, quits the TUI.
             return
         self._sigint_turn = True
         turn.cancel()
@@ -767,7 +768,7 @@ class TuiApp:
 
     def _note_interrupted(self) -> None:
         self.renderer.finalize()
-        self.console.print('[dim](interrupted — /quit to exit)[/]')
+        self.console.print('[dim](interrupted — Ctrl-C or /quit to exit)[/]')
         try:
             self._sm.get_session_log(self.session).append({
                 'role': 'assistant',
