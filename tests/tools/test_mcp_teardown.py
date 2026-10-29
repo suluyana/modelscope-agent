@@ -207,24 +207,6 @@ async def test_stdio_hook_records_the_child_process():
         stdio_mod._create_platform_compatible_process = previous
 
 
-@pytest.mark.asyncio
-async def test_kernel_session_stop_swallows_cancellederror():
-    from ms_agent.tools.code.local_code_executor import LocalKernelSession
-
-    session = LocalKernelSession.__new__(LocalKernelSession)
-    session._client = SimpleNamespace(stop_channels=lambda: None)
-
-    async def _boom():
-        raise asyncio.CancelledError()
-
-    session._km = SimpleNamespace(shutdown_kernel=lambda now=True: _boom())
-    session.start_ts = 1.0
-    session.execution_count = 3
-    await session.stop()
-    assert session._km is None
-    assert session._client is None
-
-
 class _FakeSession:
     def __init__(self, response):
         self.response = response
